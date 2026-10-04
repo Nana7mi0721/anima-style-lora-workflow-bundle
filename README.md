@@ -16,12 +16,19 @@ DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 →
 
 ## 安装
 
+安装走 GitHub（与其他自研插件一致），在 DSH 里执行：
+
 ```bash
 # 在 DSH 里（需要 danger-full-access 或批准）
-plugin_manager install_bundle  target = "link:E:/Study/github program/anima style lora workflow bundle"
+dsh plugin --profile desktop add github:Nana7mi0721/anima-style-lora-workflow-bundle
 ```
 
-安装后新建一个 agent，预设选「Anima风格LoRA全流程」。
+也可以用桌面端 设置 → 插件 的图形界面安装。安装后新建一个 agent，预设选「Anima风格LoRA全流程」。
+
+源码工作区在 `E:\Study\github program\for dsh\anima style lora workflow bundle`，
+只用于修改源码；改动后 commit + push 到 GitHub，再用
+`dsh plugin --profile desktop update dsh-anima-style-lora` 更新安装副本。
+详见 `E:\Study\github program\for dsh\AGENTS.md`。
 
 ### ⚠️ 装完必须重启 DSH
 
@@ -43,7 +50,7 @@ dsh-anima-style-lora (dsh-anima-style-lora): failed to import
 ### 本地自测（不需要 DSH）
 
 ```bash
-cd "E:/Study/github program/anima style lora workflow bundle"
+cd "E:/Study/github program/for dsh/anima style lora workflow bundle"
 npm test              # 契约 + 四个工具真跑一遍（只读/干跑）
 npm run test:live     # 额外跑 text 干跑（慢，要 torch）
 npm run test:client   # 设置页浏览器半侧：假 React 渲染 + 断言发出的请求
@@ -84,16 +91,19 @@ npm run test:all      # check:patch + client + route + smoke
 - 为什么不用 DSH 自己的设置 RPC：它不给第三方命名空间提供配置读写
   （`dsh-better-sidebar` 的源码注释也是这么写的），第三方插件必须自建路由。
 
-### 挪动 bundle 位置时
+### skills 挂载路径
 
-`cordis.patch.yml` 里预设的 `skill-filesystem` 行写死了 skill 目录：
+`cordis.patch.yml` 里预设的 `skill-filesystem` 行用 `customSkillDirs` 挂载本包的 `skills/`。
+`customSkillDirs` 只认绝对路径（skill-filesystem 用 `resolve(root)` 解析，相对路径按
+host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置：
 
 ```yaml
 - name: "@deepseek-ai/dsh-skill-filesystem"
-  config: { customSkillDirs: ["E:/Study/github program/anima style lora workflow bundle/skills"] }
+  config: { customSkillDirs: ["C:/Users/REISEN/.dsh/profiles/desktop/node_modules/dsh-anima-style-lora/skills"] }
 ```
 
-换位置要么改这一行，要么把 `skills/` 复制进 `$DSH_HOME/skills`（user-dsh 根，rank 400，自动扫描）。
+安装副本由 pnpm 管理，插件更新后该路径依然有效；源码工作区挪到哪都不影响。
+若 DSH 主目录不是 `%USERPROFILE%\.dsh`，才需要改这一行。
 
 ## 配置
 
