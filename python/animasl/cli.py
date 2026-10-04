@@ -467,6 +467,27 @@ def _mark(ds, stage: str, applied: bool = True, **info) -> None:
     m.save()
 
 
+def _ml_hint(ml_py: str, stderr: str) -> None:
+    """ML 解释器缺依赖时给可执行的修法 —— 直接贴 traceback 头等于没说。"""
+    lines = [l for l in stderr.strip().splitlines() if l.strip()]
+    last = lines[-1] if lines else "(没有输出)"
+    venv = cfgmod.runtime_dir() / "venv"
+    print(f"  ML 依赖         失败 {last[:150]}")
+    print("                  「文字检测与修补」阶段会起不来。修法（任选）：")
+    if "No module named 'rfdetr'" in last:
+        print(f"                    1) 已有能 import rfdetr 的 venv：整个目录搬到 {venv}，")
+        print("                       或把设置项 ml_python 指过去")
+        print(f"                    2) 新建：uv venv --python <带 torch 的解释器> {venv}")
+        print(f"                       再往 {venv / 'Lib' / 'site-packages' / '_ref.pth'} 写一行")
+        print("                       <那个解释器的 Lib/site-packages 绝对路径>（这样 torch 复用现成的）")
+        print(f"                       再 uv pip install --python {venv / 'Scripts' / 'python.exe'} rfdetr supervision")
+    elif "No module named 'torch'" in last:
+        print("                    该解释器里没有 torch：先按 anima_lora 的说明装 torch(cu13x)，")
+        print("                    或把设置项 ml_python 指向训练用的 anima_lora venv。")
+    else:
+        print("                    把设置项 ml_python 指向带 torch+rfdetr 的解释器，见 README「ML 依赖」。")
+
+
 def _doctor(home: str | None = None) -> None:
     cfg = cfgmod.Config.load(home=home)
     print(f"animasl {__import__('animasl').__version__}")
@@ -491,9 +512,11 @@ def _doctor(home: str | None = None) -> None:
     try:
         out = subprocess.run([ml_py, "-c", code], capture_output=True, text=True, timeout=180,
                              encoding="utf-8", errors="replace")
-        line = (out.stdout or "").strip().splitlines()
-        line = line[-1] if line else (out.stderr or "").strip()[:160]
-        print(f"  ML 依赖         {line}")
+        ok = [l for l in (out.stdout or "").strip().splitlines() if l.strip()]
+        if ok:
+            print(f"  ML 依赖         {ok[-1]}")
+        else:
+            _ml_hint(ml_py, out.stderr or "")
     except Exception as exc:
         print(f"  ML 依赖         探测失败 {exc}")
     proxies = cfg.get("proxy_candidates") or [""]

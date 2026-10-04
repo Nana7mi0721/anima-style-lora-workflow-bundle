@@ -61,7 +61,7 @@ npm run test:all      # check:patch + client + route + smoke
 ```
 
 `npm run test:py` 需要带 `requests` 的解释器（本机是
-`E:/LoRA_Train/anima_lora/.venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
+`E:/LoRA_Train/.animasl/venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
 `SKIP` 并返回 0）：
 
 `test/smoke.mjs` 把插件装进一个假 ctx（`test/stub/` 用 ESM loader 钩子把
@@ -234,7 +234,19 @@ datasets/<name>/
 ## 环境要求
 
 - DSH ≥ 0.2.0-rc.1（`@deepseek-ai/dsh-tools` peer）
-- Python 3.13 venv，装 `torch(cu13x) + torchvision + rfdetr==1.7.0 + pillow + numpy`（`python/.venv`，或用 `mlPython` 指过去）
+- **ML venv（torch + rfdetr）**：只有「文字检测与修补」阶段用得到，**bundle 里不自带**。
+  解释器按 `ml_python` 设置项 → `<home>/.animasl/venv` → `<bundle>/python/.venv` → 数据集解释器
+  的顺序找，第一个存在的即中选。推荐放 `<home>/.animasl/venv`（放 bundle 里重装会被覆盖）：
+
+  ```bat
+  uv venv --python E:/LoRA_Train/anima_lora/.venv/Scripts/python.exe E:/LoRA_Train/.animasl/venv
+  :: 复用现成的 torch：写一行 .pth 指向那个解释器的 site-packages
+  echo E:\LoRA_Train\anima_lora\.venv\Lib\site-packages > E:\LoRA_Train\.animasl\venv\Lib\site-packages\_ref.pth
+  uv pip install --python E:/LoRA_Train/.animasl/venv/Scripts/python.exe rfdetr==1.7.0 supervision
+  ```
+
+  `anima_doctor` 的「ML 依赖」一行报的是 `torch 版本 / CUDA / rfdetr 版本`；缺哪一样它直接给修法。
+  也可以什么都不建，把 `ml_python` 指向任意一个 `import torch, rfdetr` 都能过的解释器。
 - 词典：`tags.json` + `danbooru_dataset_general.csv`（合并后 383,196 条）
 - 下载：danbooru 用设置页的「凭据」分组填用户名 + API key（或 `DANBOORU_LOGIN`/`DANBOORU_API_KEY`）；pawchive/exhentai 需要 cookie，且 **pawchive CDN 必须走代理**（直连被 reset）
 

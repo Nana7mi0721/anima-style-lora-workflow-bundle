@@ -7,8 +7,9 @@ bundle stays self-contained):
                     -> 8-bit mask at the ORIGINAL resolution (255 = patch me)
     ml/inpaint.py   LaMa-manga -> repaint the masked pixels in place
 
-They run under the ML interpreter (``<bundle>/python/.venv``), never under the
-toolchain interpreter, because only that one has torch+rfdetr.
+They run under the ML interpreter (``ml_python`` setting -> ``<runtime>/venv`` ->
+``<bundle>/python/.venv`` -> the dataset interpreter), never under the toolchain
+interpreter, because only that one has torch+rfdetr.
 
 Policy (all thresholds live in ``animasl.config.json`` so they are tunable):
 

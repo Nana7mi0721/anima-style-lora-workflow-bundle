@@ -106,7 +106,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 | 现象 | 处理 |
 |---|---|
-| `anima_doctor` 说找不到 ML 解释器 | 文字检测阶段需要 torch+rfdetr 的 venv；先用 `anima_stage(stage:"text", ...)` 的报错确认，装到 `<home>/.animasl/venv` 或 `anima_lora/.venv` |
+| `anima_doctor` 的「ML 依赖」失败 | 文字检测/修补阶段要 torch+rfdetr，**bundle 里不带 venv**。放一个 `import torch, rfdetr` 都过的解释器到 `<home>/.animasl/venv`（doctor 会打印具体命令），或把设置项 `ml_python` 指过去。装在 bundle 目录里重装即丢 |
 | fetch 报代理错误 / ConnectionReset | 该源需要代理，在**设置页「网络」分组**改 `proxy_candidates`（或 bundle 的 `animasl.config.json`）；`prefer_proxy_hosts` 里的主机会优先走代理 |
 | danbooru 报 403 / `Just a moment...` / 只有单标签能查 | ① 多标签查询要凭据：设置页「凭据」分组填用户名 + API key；② 403 挑战页由 **curl 兜底**自动绕过（`requests` 直发 403 属正常）；③ 若日志显示 `proxy=直连` + `ConnectTimeout`，重跑一次 |
 | exhentai 报「需要 cookies.txt 或 EXHENTAI_*」 | 设置页「凭据」分组填 `ipb_member_id`/`ipb_pass_hash`/`igneous`，或 `cookies:"<cookies.txt>"`；`igneous` 过期就重新登录一次再抄 |
