@@ -237,7 +237,9 @@ def fetch_danbooru(cfg, ds, tags: str, limit: int, dry_run: bool = False) -> dic
     print(f"[fetch] danbooru  tags={tags!r}  limit={limit}  auth={'yes' if authed else 'ANONYMOUS'}  "
           f"proxy={net.proxy_label()}")
     if not authed:
-        print("  ! 未设置 DANBOORU_LOGIN / DANBOORU_API_KEY：匿名只能看 safe 内容且最多 2 个标签")
+        print("  ! 未配置 danbooru 凭据：匿名只能看 safe 内容且最多 2 个标签。"
+              "去 danbooru 个人设置页拿 API key，填进设置页（danbooru 账号 / API key）"
+              "或设环境变量 DANBOORU_LOGIN + DANBOORU_API_KEY")
     posts: list[dict] = []
     page = 1
     while len(posts) < limit and page <= 50:
@@ -311,7 +313,7 @@ def pawchive_session(cfg, cookies_file: str = "", user_agent: str = "") -> Any:
     if user_agent:
         s.headers["User-Agent"] = user_agent
     if cookies_file:
-        jar = net.load_cookies(cookies_file)
+        jar = net.load_cookie_jar(cookies_file)
         s.cookies.update(jar)
         print(f"  cookies: {len(jar)} 条 from {cookies_file}")
     return s
@@ -413,18 +415,21 @@ def fetch_exhentai(cfg, ds, gallery: str, limit: int = 0, dry_run: bool = False,
     """`gallery` = full gallery URL or 'gid/token' pair."""
     s = net.session(cfg, "https://exhentai.org/", referer="https://exhentai.org/")
     if cookies_file:
-        s.cookies.update(net.load_cookies(cookies_file))
-        print(f"  cookies loaded from {cookies_file}")
+        jar = net.load_cookie_jar(cookies_file)
+        s.cookies.update(jar)
+        print(f"  cookies loaded from {cookies_file}（{len(jar)} 条）")
     else:
-        for key, env in (("ipb_member_id", "EXHENTAI_MEMBER_ID"),
-                         ("ipb_pass_hash", "EXHENTAI_PASS_HASH"),
-                         ("igneous", "EXHENTAI_IGNEOUS")):
-            val = os.environ.get(env)
+        # 配置层（设置页填的 exhentai 三项）优先，其次环境变量
+        for key, cfg_key, env in (("ipb_member_id", "exhentai_member_id", "EXHENTAI_MEMBER_ID"),
+                                  ("ipb_pass_hash", "exhentai_pass_hash", "EXHENTAI_PASS_HASH"),
+                                  ("igneous", "exhentai_igneous", "EXHENTAI_IGNEOUS")):
+            val = str(cfg.get(cfg_key) or "").strip() or os.environ.get(env, "")
             if val:
                 s.cookies.set(key, val, domain=".exhentai.org")
         if not s.cookies.get("ipb_member_id"):
-            raise SystemExit("[fetch] exhentai 需要 cookies.txt 或 "
-                             "EXHENTAI_MEMBER_ID / EXHENTAI_PASS_HASH / EXHENTAI_IGNEOUS 环境变量")
+            raise SystemExit("[fetch] exhentai 需要登录态：在设置页填 exhentai 三项"
+                             "（ipb_member_id / ipb_pass_hash / igneous）、给一个 cookies.txt，"
+                             "或设 EXHENTAI_MEMBER_ID / EXHENTAI_PASS_HASH / EXHENTAI_IGNEOUS 环境变量")
     m = re.search(r"/(?:g|mpv)/(\d+)/([0-9a-f]{10})", gallery)
     gid, token = (m.group(1), m.group(2)) if m else tuple((gallery.split("/") + [""])[:2])
     if not gid or not token:

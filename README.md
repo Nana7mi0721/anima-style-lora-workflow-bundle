@@ -56,8 +56,13 @@ npm run test:live     # 额外跑 text 干跑（慢，要 torch）
 npm run test:client   # 设置页浏览器半侧：假 React 渲染 + 断言发出的请求
 npm run test:route    # 设置页宿主路由：真起 http server + 真 Python CLI（含信任栅栏）
 npm run test:route:doctor  # 上面那条再加一次真 doctor（慢约 1 分钟）
+npm run test:py       # 离线：Cloudflare 挑战识别 + curl 参数 + cookie 域隔离 + 凭据优先级
 npm run test:all      # check:patch + client + route + smoke
 ```
+
+`npm run test:py` 需要带 `requests` 的解释器（本机是
+`E:/LoRA_Train/anima_lora/.venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
+`SKIP` 并返回 0）：
 
 `test/smoke.mjs` 把插件装进一个假 ctx（`test/stub/` 用 ESM loader 钩子把
 `@deepseek-ai/dsh-tools` 指到替身），校验注册数量、返回值无 `undefined`、
@@ -78,9 +83,13 @@ npm run test:all      # check:patch + client + route + smoke
 `<home>/.animasl/animasl.config.json`（运行时层），下一次 `anima_*` 调用即生效，
 不用重启：
 
-- 分组：`paths` / `runtime` / `dict` / `net` / `screen` / `dedup` / `wash`，
+- 分组：`paths` / `runtime` / `dict` / `creds` / `net` / `screen` / `dedup` / `wash`，
   每个键都标出来源（`bundle` / `defaults` / 本机覆盖），改动过的键可以一键
   「恢复默认」（= 从 runtime 层删掉这个键，回落到 bundle/内置默认）。
+- `creds` 是**凭据分组**：danbooru 用户名 + API key、exhentai 三项
+  （`ipb_member_id` / `ipb_pass_hash` / `igneous`）、curl 兜底 UA。密钥类字段是
+  密码框，旁边有「显示」开关。它们只落进你本机的运行时配置（不在仓库里），
+  与 `cookies.txt` 二选一即可 —— 优先级是 **设置页 > 环境变量 > cookies.txt**。
 - 只读两行：`home`（由 profile 的 `cordis.patch.yml` 行配置决定）与运行时目录。
   路径类字段旁边有「存在 / 不存在」标记，点「跑一次体检」能在页面里看
   `anima_doctor` 的完整输出。
@@ -227,18 +236,46 @@ datasets/<name>/
 - DSH ≥ 0.2.0-rc.1（`@deepseek-ai/dsh-tools` peer）
 - Python 3.13 venv，装 `torch(cu13x) + torchvision + rfdetr==1.7.0 + pillow + numpy`（`python/.venv`，或用 `mlPython` 指过去）
 - 词典：`tags.json` + `danbooru_dataset_general.csv`（合并后 383,196 条）
-- 下载：`DANBOORU_LOGIN`/`DANBOORU_API_KEY`；pawchive/exhentai 需要 cookie，且 **pawchive CDN 必须走代理**（直连被 reset）
+- 下载：danbooru 用设置页的「凭据」分组填用户名 + API key（或 `DANBOORU_LOGIN`/`DANBOORU_API_KEY`）；pawchive/exhentai 需要 cookie，且 **pawchive CDN 必须走代理**（直连被 reset）
 
 跑 `anima_doctor` 可以一次性体检上述每一项（含下面这张表的"凭据配没配"）。
+
+### danbooru 的 Cloudflare：为什么需要 curl 兜底
+
+danbooru 在 Cloudflare 后面，而它的规则大致是「**Chrome UA + 非浏览器 TLS 指纹 = 机器人**」。
+实测（同一代理、同一 URL、带 API key）：
+
+| 请求方 | UA | 结果 |
+|---|---|---|
+| `requests` | 任意 | **403** `<title>Just a moment...</title>` |
+| `curl` | 默认 UA | **200** 真 JSON |
+| `curl` | `animasl/0.1 (+curl)` | **200** 真 JSON |
+| `curl` | `Chrome/126 …` | **403** 挑战页 |
+
+所以：`net.py` 在 `requests` 拿到 403/503 且正文像挑战页时，**自动改用 curl 子进程重放**
+（代理、`-u login:key`、Referer、按主机过滤的 cookie 都跟着转过去；图片下载同理，
+`cdn.donmai.us` 也是 requests 403 / curl 200）。curl 侧**一律用自报家门的 UA**
+（`curl_user_agent` 配置项，默认 `animasl/0.1 (+curl)`）——**别填浏览器 UA**，
+那正好触发拦截。可用 `ANIMASL_NO_CURL=1` 关掉兜底、`ANIMASL_CURL` / `ANIMASL_CURL_UA` 覆盖。
+
+直连 danbooru 是连不上的（GFW，`ConnectTimeout`），所以它和 `cdn.donmai.us` 都写进了
+`prefer_proxy_hosts`，探测时把代理候选提前、直连降级为最后一档。
 
 ### 各图源需要什么账号
 
 | 图源 | 要账号吗 | 怎么配 | 不配会怎样 |
 |---|---|---|---|
 | **yande.re** | **不需要** | 什么都不用 | —（公开 `post.json`，代理只在被 reset 时才用） |
-| **danbooru** | 单标签不用，**多标签要用** | `DANBOORU_LOGIN` + `DANBOORU_API_KEY`（用户名 + 个人设置页的 API key） | 匿名只能查**单标签**且限速极严。`anima_doctor` 里那行 `danbooru.donmai.us HTTP 403` 是首页拒绝匿名 UA，**不代表 API 不可用** |
+| **danbooru** | 单标签不用，**多标签要用** | 设置页「凭据」分组填用户名 + API key（或 `DANBOORU_LOGIN` + `DANBOORU_API_KEY`） | 匿名只能查**单标签**且限速极严。`anima_doctor` 里那行 `danbooru.donmai.us HTTP 403` 是 Cloudflare 挑战页，**不代表 API 不可用**（curl 兜底会正常拿到 JSON） |
 | **pawchive.pw** | 公开接口不用 | 受限帖才需要：`cookies` 参数或 `cookies_file` 配置（Netscape `cookies.txt`） | 公开帖照抓；受限帖拿不到。**CDN 域名必须走代理**（直连被 reset） |
-| **exhentai** | **必须** | `EXHENTAI_MEMBER_ID` / `EXHENTAI_PASS_HASH` / `EXHENTAI_IGNEOUS`，或 `cookies` 指向 `cookies.txt` | 直接报 `[fetch] exhentai 需要 cookies.txt 或 EXHENTAI_* 环境变量`。这条链路只做到"可调用"，第一次用先 `limit:5` 验证拿到的是原图而不是 `-thumb` |
+| **exhentai** | **必须** | 设置页「凭据」分组填 `ipb_member_id` / `ipb_pass_hash` / `igneous`，或 `cookies` 指向 `cookies.txt`（或 `EXHENTAI_*` 环境变量） | 直接报 `[fetch] exhentai 需要 cookies.txt 或 EXHENTAI_* 环境变量`。这条链路只做到"可调用"，第一次用先 `limit:5` 验证拿到的是原图而不是 `-thumb` |
 | **gelbooru** | — | **未实现**（当前只支持上面四个源） | `source` 传 `gelbooru` 会报未知来源 |
 
-凭据一律走环境变量或 `cookies.txt`，**不写进配置文件、不进仓库**；`anima_doctor` 只报告"配没配"，不打印密钥内容。
+凭据的优先级是 **设置页（运行时配置） > 环境变量 > `cookies.txt`**；设置页那份落在
+`<home>/.animasl/animasl.config.json`，和 `cookies.txt` 一样**不进仓库**；
+`anima_doctor` 只报告"配没配、从哪读到的"，不打印密钥内容。
+
+`cookies.txt` 是 Netscape 格式，一个文件里可以放多个站点 —— 读取时**按 domain 列区分**
+（`net.load_cookie_jar`）：第 2 列 `TRUE` = 域级 cookie（补前导点，子域也发），
+`FALSE` = Host-Only。别再用旧的"裸 `{name: value}` 字典"加载方式，那会把 exhentai 的
+登录 cookie 发给 pawchive（空域 = 任何主机都收到）。

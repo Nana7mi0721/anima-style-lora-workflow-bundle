@@ -41,10 +41,11 @@ anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", li
 ## §3 danbooru
 
 - 接口：`GET https://danbooru.donmai.us/posts.json?tags=<tag>&limit=200&page=N`。
-- 认证：环境变量 `DANBOORU_LOGIN` + `DANBOORU_API_KEY`（用户名 + API key，danbooru 个人设置页拿）。**匿名只能查单标签且限速极严**，多标签查询必须带认证。
+- 认证：**设置页 →「Anima 风格 LoRA」→「凭据」分组**填用户名 + API key（写进 `<home>/.animasl/animasl.config.json`）；也可以继续用环境变量 `DANBOORU_LOGIN` + `DANBOORU_API_KEY`。优先级：**设置页 > 环境变量**。**匿名只能查单标签且限速极严**，多标签查询必须带认证。
 - 标签：同样下划线形式；`artist_name` 之外常用 `order:score` 之类过滤，但不要用它筛掉低分图（风格 LoRA 要的是风格覆盖，不是人气）。
 - 页面 URL 拼 `https://danbooru.donmai.us/posts/<id>`，写进 `rename_map.csv` 的 `post_id`，方便人工回查。
 - 免费账号有每日上限；limit 一次 200，工具已做 429/Retry-After 退避。
+- **Cloudflare 与 curl 兜底（别误判成"凭据没配"）**：danbooru 的拦截规则 ≈「Chrome UA + 非浏览器 TLS 指纹 = 机器人」，`requests` 直发**一律 403** `<title>Just a moment...</title>`。工具在识别到挑战页后会自动改用 **curl 子进程**重放（代理 / `-u login:key` / Referer / 按主机过滤的 cookie 都跟着转），curl 侧用自报家门的 UA（`curl_user_agent`，默认 `animasl/0.1 (+curl)`）。⇒ **千万别把浏览器 UA 填进 `curl_user_agent`**，那反而必被拦。`anima_doctor` 里那行 `danbooru.donmai.us HTTP 403` 是挑战页，不代表 API 不可用。直连 danbooru 是连不上的（GFW `ConnectTimeout`），它和 `cdn.donmai.us` 都在 `prefer_proxy_hosts` 里；若某次日志显示 `proxy=直连` 并 `ConnectTimeout`，**先重跑一次**（一次性抖动）。
 
 ## §4 pawchive.pw
 
@@ -61,7 +62,8 @@ anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", li
 
 ## §5 exhentai
 
-- 需要登录态：环境变量 `EXHENTAI_MEMBER_ID` / `EXHENTAI_PASS_HASH` / `EXHENTAI_IGNEOUS`，或 `cookies:"<cookies.txt>"`。
+- 需要登录态：**设置页「凭据」分组**填 `ipb_member_id` / `ipb_pass_hash` / `igneous`（优先级最高），或环境变量 `EXHENTAI_MEMBER_ID` / `EXHENTAI_PASS_HASH` / `EXHENTAI_IGNEOUS`，或 `cookies:"<cookies.txt>"`。
+- 一个 `cookies.txt` 里可以同时放 exhentai 与 pawchive 的 cookie：工具按 **domain 列**区分（`TRUE` = 域级、补前导点；`FALSE` = Host-Only），不会串站。
 - 调用：`anima_stage(stage:"fetch", dataset:"X", source:"exhentai", gallery:"https://exhentai.org/g/<gid>/<token>/", limit:200)`。
 - 流程：`POST https://exhentai.org/api.php`（`{"method":"gdata","gidlist":[[gid,token]],"namespace":1}`）取元数据 → 翻 `/g/<gid>/<token>/?p=N` 收集 `/s/<pagekey>/<gid>-<n>` → 逐页解析 `<img id="img" src>` 拿原图。
 - **注意**：这条链路只做到「可调用」，没有在真实 cookie 下端到端验证过。第一次用先 `limit:5` 跑一遍，确认拿到的是原图分辨率而不是 `-thumb`。失败就直接让用户给 cookies.txt，别硬猜。
@@ -69,16 +71,20 @@ anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", li
 
 ## §6 代理配置
 
-配置文件优先级：bundle 的 `animasl.config.json` → `<home>/.animasl/animasl.config.json` → 环境变量 `ANIMASL_*` → 命令行。
+配置优先级：命令行 > 环境变量 `ANIMASL_*` > `<home>/.animasl/animasl.config.json`（**设置页写的就是这一层**）> bundle 的 `animasl.config.json`。
 
 ```json
 {
-  "proxy_candidates": ["", "http://127.0.0.1:7897", "http://127.0.0.1:7890", "socks5://127.0.0.1:10809"],
-  "prefer_proxy_hosts": ["pawchive.pw", "n2.pawchive.pw", "exhentai.org", "e-hentai.org"]
+  "proxy_candidates": ["", "http://127.0.0.1:7897", "http://127.0.0.1:7890", "socks5://127.0.0.1:10809", "socks5://127.0.0.1:1080"],
+  "prefer_proxy_hosts": ["pawchive.pw", "exhentai.org", "e-hentai.org", "n2.pawchive.pw", "danbooru.donmai.us", "cdn.donmai.us"],
+  "curl_user_agent": ""
 }
 ```
 
-注意：本机 shell 里的 `HTTPS_PROXY`（曾是 `127.0.0.1:1590`）是**坏的**，外网一律 `CONNECT 502`。工具的 session 一律 `trust_env=False`，只看上面的候选表。用户换代理端口就改这个文件，别改代码。
+- 探测顺序：候选表**直连优先**；`prefer_proxy_hosts` 命中的主机把带协议的候选提前、直连降为最后一档。命中判据是 `status_code < 500`（所以 Cloudflare 的 403 也算"这个出口通"）。
+- 实测本机只有 `http://127.0.0.1:7897` 可用：直连 danbooru `ConnectTimeout`、`7890` `ProxyError`、`socks5://…` `InvalidSchema`（没装 pysocks）。
+- `curl_user_agent`：curl 兜底用的 UA，**留空/自报家门就行，别填浏览器 UA**（见 §3）。
+- 注意：本机 shell 里的 `HTTPS_PROXY`（曾是 `127.0.0.1:1590`）是**坏的**，外网一律 `CONNECT 502`。工具的 session 一律 `trust_env=False`，只看上面的候选表。用户换代理端口就在**设置页「网络」分组**改，别改代码。
 
 ## §7 下载后第一件事
 

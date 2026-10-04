@@ -29,6 +29,7 @@
     "test:client": "node test/client-smoke.mjs",
     "test:route": "node test/settings-route.mjs",
     "test:route:doctor": "node test/settings-route.mjs --doctor",
+    "test:py": "python test/net-offline.py",
     "test:all": "npm run check:patch && npm run test:client && npm run test:route && npm test",
     "check:patch": "node test/check-patch.mjs",
     "doctor": "node -e \"import('./lib/run.js').then(()=>console.log('ok'))\""

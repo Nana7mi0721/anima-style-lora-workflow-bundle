@@ -513,28 +513,50 @@ def _doctor(home: str | None = None) -> None:
         print(f"  词典            加载失败 {exc}")
 
     # 各图源的账号：yande.re 完全不需要；danbooru 只有多标签查询需要；pawchive 公开接口不需要
-    # （受限帖要 cookie）；exhentai 必须有登录态。这里只报告"有没有配"，不打印密钥本身。
-    login = os.environ.get("DANBOORU_LOGIN")
-    key = os.environ.get("DANBOORU_API_KEY")
+    # （受限帖要 cookie）；exhentai 必须有登录态。这里只报告"有没有配、配在哪一层"，
+    # 不打印密钥本身。取值顺序与运行期一致：设置页写的配置层 > 环境变量。
+    login, key = net.danbooru_auth(cfg)
     if login and key:
-        print(f"  凭据 danbooru    OK  DANBOORU_LOGIN={str(login)[:2]}***（多标签查询可用）")
+        src = "设置页" if str(cfg.get("danbooru_login") or "").strip() else "环境变量"
+        print(f"  凭据 danbooru    OK  {src}：{login[:2]}*** + API key（多标签查询可用）")
     else:
         print("  凭据 danbooru    未配置：匿名只能单标签且限速极严；多标签要在 danbooru 个人设置页"
-              "拿 API key，设 DANBOORU_LOGIN + DANBOORU_API_KEY")
-    exh = [k for k in ("EXHENTAI_MEMBER_ID", "EXHENTAI_PASS_HASH", "EXHENTAI_IGNEOUS")
-           if os.environ.get(k)]
-    print("  凭据 exhentai    " + ("OK  " + ", ".join(exh) if exh else
-          "未配置（exhentai 必须登录态：EXHENTAI_* 环境变量或 cookies.txt）"))
+              "拿 API key，填进设置页或设 DANBOORU_LOGIN + DANBOORU_API_KEY")
+
     ck = str(cfg.get("cookies_file") or "")
+    jar_domains: dict[str, int] = {}
+    if ck and Path(ck).is_file():
+        try:
+            jar = net.load_cookie_jar(ck)
+            for c in jar:
+                jar_domains[(c.domain or "(空)")] = jar_domains.get((c.domain or "(空)"), 0) + 1
+        except Exception:
+            jar_domains = {}
+
+    exh_cfg = [k for k in ("exhentai_member_id", "exhentai_pass_hash", "exhentai_igneous")
+               if str(cfg.get(k) or "").strip()]
+    exh_env = [k for k in ("EXHENTAI_MEMBER_ID", "EXHENTAI_PASS_HASH", "EXHENTAI_IGNEOUS")
+               if os.environ.get(k)]
+    if exh_cfg:
+        print(f"  凭据 exhentai    OK  设置页：{len(exh_cfg)}/3 项（ipb_member_id / ipb_pass_hash / igneous）")
+    elif exh_env:
+        print(f"  凭据 exhentai    OK  环境变量：{', '.join(exh_env)}")
+    elif any("exhentai" in d for d in jar_domains):
+        print(f"  凭据 exhentai    OK  cookies.txt（{sum(v for k, v in jar_domains.items() if 'exhentai' in k)} 条 .exhentai.org）")
+    else:
+        print("  凭据 exhentai    未配置（exhentai 必须登录态：设置页填三项 / cookies.txt / EXHENTAI_* 环境变量）")
+
     if ck and Path(ck).is_file():
         st = Path(ck).stat()
+        domains = "、".join(f"{d}×{n}" for d, n in sorted(jar_domains.items())) or "解析不到 cookie 行"
         print(f"  凭据 cookies     OK  {ck}（{st.st_size} B，"
-              f"{time.strftime('%Y-%m-%d', time.localtime(st.st_mtime))}）")
+              f"{time.strftime('%Y-%m-%d', time.localtime(st.st_mtime))}；{domains}）")
     elif ck:
         print(f"  凭据 cookies     路径不存在 {ck}")
     else:
         print("  凭据 cookies     未配置（pawchive 公开接口不需要；受限帖 / exhentai 需要；"
-              "fetch 的 cookies= 参数可临时指定 Netscape cookies.txt）")
+              "设置页填 cookies_file，或用 fetch 的 cookies= 临时指定 Netscape cookies.txt）")
+
 
 
 if __name__ == "__main__":

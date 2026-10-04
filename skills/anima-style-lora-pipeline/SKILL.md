@@ -107,7 +107,9 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | 现象 | 处理 |
 |---|---|
 | `anima_doctor` 说找不到 ML 解释器 | 文字检测阶段需要 torch+rfdetr 的 venv；先用 `anima_stage(stage:"text", ...)` 的报错确认，装到 `<home>/.animasl/venv` 或 `anima_lora/.venv` |
-| fetch 报代理错误 / ConnectionReset | 该源需要代理，改 `proxy_candidates`（bundle 的 `animasl.config.json` 或 `<home>/.animasl/animasl.config.json`） |
+| fetch 报代理错误 / ConnectionReset | 该源需要代理，在**设置页「网络」分组**改 `proxy_candidates`（或 bundle 的 `animasl.config.json`）；`prefer_proxy_hosts` 里的主机会优先走代理 |
+| danbooru 报 403 / `Just a moment...` / 只有单标签能查 | ① 多标签查询要凭据：设置页「凭据」分组填用户名 + API key；② 403 挑战页由 **curl 兜底**自动绕过（`requests` 直发 403 属正常）；③ 若日志显示 `proxy=直连` + `ConnectTimeout`，重跑一次 |
+| exhentai 报「需要 cookies.txt 或 EXHENTAI_*」 | 设置页「凭据」分组填 `ipb_member_id`/`ipb_pass_hash`/`igneous`，或 `cookies:"<cookies.txt>"`；`igneous` 过期就重新登录一次再抄 |
 | caption 数 ≠ 图片数 | wash 只对 `images/` 下的图写 caption；缺的那些多半是 wash 判弃或看图待补，看 wash_report.csv |
 | 图片很小/被拉伸 | 检查 screen 的 min_short_side 与 makecfg 的 bucket_no_upscale；resize 不创造信息 |
 | 训练 OOM | 不在本流程内，但先确认 resolution：8GB 建议 1024 |

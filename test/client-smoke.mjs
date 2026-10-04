@@ -285,6 +285,34 @@ check('发出 doctor 请求', calls.some((call) => call.method === 'doctor'))
 view = lite.render(entry.component)
 check('展示体检输出', allText(view).includes('[doctor] OK'))
 
+console.log('[client-smoke] 凭据分组')
+const findRow = (root, needle) =>
+  collect(root, (item) => {
+    const text = allText(item)
+    return String(item.props.className || '').includes('asl-row') && text.includes(needle)
+  })[0]
+view = lite.render(entry.component)
+const keyRow = findRow(view, 'danbooru_api_key')
+check('渲染出凭据分组（danbooru_api_key 行）', Boolean(keyRow), keyRow ? '' : '未渲染出该行')
+const keyInput = collect(keyRow, (item) => item.type === 'input')[0]
+check('密钥默认是密码框', Boolean(keyInput) && keyInput.props.type === 'password', JSON.stringify(keyInput && keyInput.props.type))
+const eye = collect(keyRow, (item) => item.type === 'button' && String(item.props.className).includes('asl-eye'))[0]
+check('有显示/隐藏开关', Boolean(eye))
+eye.props.onClick()
+view = lite.render(entry.component)
+const keyInput2 = collect(findRow(view, 'danbooru_api_key'), (item) => item.type === 'input')[0]
+check('点开后变成明文框', Boolean(keyInput2) && keyInput2.props.type === 'text', JSON.stringify(keyInput2 && keyInput2.props.type))
+keyInput2.props.onInput({ target: { value: 'kq-test-key' } })
+view = lite.render(entry.component)
+const credSave = collect(view, (item) => item.type === 'button' && String(item.props.className).includes('asl-save'))[0]
+await credSave.props.onClick()
+const credWrite = calls.filter((call) => call.method === 'write').pop()
+check(
+  '凭据走同一条 write 通路',
+  credWrite && JSON.stringify(credWrite.payload.set) === JSON.stringify({ danbooru_api_key: 'kq-test-key' }),
+  JSON.stringify(credWrite && credWrite.payload),
+)
+
 console.log('')
 if (failures.length === 0) {
   console.log('[client-smoke] ALL OK')

@@ -65,6 +65,16 @@ DEFAULTS: dict[str, Any] = {
                          "http://127.0.0.1:10809", "http://127.0.0.1:1080"],
     "prefer_proxy_hosts": ["pawchive.pw", "n1.pawchive.pw", "n2.pawchive.pw", "exhentai.org", "e-hentai.org"],
     "cookies_file": "",          # netscape cookies.txt used by gallery-dl style sources
+    # curl 兜底（Cloudflare 挑战 requests 时改走 curl）用的 UA；空 = 内置的
+    # "animasl/0.1 (+curl)"。千万别填浏览器 UA：那正好会触发 danbooru 的挑战。
+    "curl_user_agent": "",
+    # 凭据（设置页可填；填了就不必设环境变量。danbooru 走 HTTP basic auth，
+    # exhentai 走三个 cookie。只写进 <home>/.animasl/animasl.config.json，不会进仓库）
+    "danbooru_login": "",
+    "danbooru_api_key": "",
+    "exhentai_member_id": "",
+    "exhentai_pass_hash": "",
+    "exhentai_igneous": "",
     # model weights for the text-removal stage
     "layout_model": "",          # empty -> auto-detect under koharu_dir/store
     "inpaint_model": "",
