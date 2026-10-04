@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import config as cfgmod
@@ -449,6 +451,30 @@ def _doctor(home: str | None = None) -> None:
         print(f"  词典            {td.size()} 个标签")
     except Exception as exc:
         print(f"  词典            加载失败 {exc}")
+
+    # 各图源的账号：yande.re 完全不需要；danbooru 只有多标签查询需要；pawchive 公开接口不需要
+    # （受限帖要 cookie）；exhentai 必须有登录态。这里只报告"有没有配"，不打印密钥本身。
+    login = os.environ.get("DANBOORU_LOGIN")
+    key = os.environ.get("DANBOORU_API_KEY")
+    if login and key:
+        print(f"  凭据 danbooru    OK  DANBOORU_LOGIN={str(login)[:2]}***（多标签查询可用）")
+    else:
+        print("  凭据 danbooru    未配置：匿名只能单标签且限速极严；多标签要在 danbooru 个人设置页"
+              "拿 API key，设 DANBOORU_LOGIN + DANBOORU_API_KEY")
+    exh = [k for k in ("EXHENTAI_MEMBER_ID", "EXHENTAI_PASS_HASH", "EXHENTAI_IGNEOUS")
+           if os.environ.get(k)]
+    print("  凭据 exhentai    " + ("OK  " + ", ".join(exh) if exh else
+          "未配置（exhentai 必须登录态：EXHENTAI_* 环境变量或 cookies.txt）"))
+    ck = str(cfg.get("cookies_file") or "")
+    if ck and Path(ck).is_file():
+        st = Path(ck).stat()
+        print(f"  凭据 cookies     OK  {ck}（{st.st_size} B，"
+              f"{time.strftime('%Y-%m-%d', time.localtime(st.st_mtime))}）")
+    elif ck:
+        print(f"  凭据 cookies     路径不存在 {ck}")
+    else:
+        print("  凭据 cookies     未配置（pawchive 公开接口不需要；受限帖 / exhentai 需要；"
+              "fetch 的 cookies= 参数可临时指定 Netscape cookies.txt）")
 
 
 if __name__ == "__main__":

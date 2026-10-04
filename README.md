@@ -189,4 +189,16 @@ datasets/<name>/
 - 词典：`tags.json` + `danbooru_dataset_general.csv`（合并后 383,196 条）
 - 下载：`DANBOORU_LOGIN`/`DANBOORU_API_KEY`；pawchive/exhentai 需要 cookie，且 **pawchive CDN 必须走代理**（直连被 reset）
 
-跑 `anima_doctor` 可以一次性体检上述每一项。
+跑 `anima_doctor` 可以一次性体检上述每一项（含下面这张表的"凭据配没配"）。
+
+### 各图源需要什么账号
+
+| 图源 | 要账号吗 | 怎么配 | 不配会怎样 |
+|---|---|---|---|
+| **yande.re** | **不需要** | 什么都不用 | —（公开 `post.json`，代理只在被 reset 时才用） |
+| **danbooru** | 单标签不用，**多标签要用** | `DANBOORU_LOGIN` + `DANBOORU_API_KEY`（用户名 + 个人设置页的 API key） | 匿名只能查**单标签**且限速极严。`anima_doctor` 里那行 `danbooru.donmai.us HTTP 403` 是首页拒绝匿名 UA，**不代表 API 不可用** |
+| **pawchive.pw** | 公开接口不用 | 受限帖才需要：`cookies` 参数或 `cookies_file` 配置（Netscape `cookies.txt`） | 公开帖照抓；受限帖拿不到。**CDN 域名必须走代理**（直连被 reset） |
+| **exhentai** | **必须** | `EXHENTAI_MEMBER_ID` / `EXHENTAI_PASS_HASH` / `EXHENTAI_IGNEOUS`，或 `cookies` 指向 `cookies.txt` | 直接报 `[fetch] exhentai 需要 cookies.txt 或 EXHENTAI_* 环境变量`。这条链路只做到"可调用"，第一次用先 `limit:5` 验证拿到的是原图而不是 `-thumb` |
+| **gelbooru** | — | **未实现**（当前只支持上面四个源） | `source` 传 `gelbooru` 会报未知来源 |
+
+凭据一律走环境变量或 `cookies.txt`，**不写进配置文件、不进仓库**；`anima_doctor` 只报告"配没配"，不打印密钥内容。
