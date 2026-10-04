@@ -224,7 +224,7 @@ const ctx = {
 mod.apply(ctx)
 check('注册了 settings.section', registrations.some((item) => item.name === 'settings.section'))
 const entry = registrations.find((item) => item.name === 'settings.section')
-check('槽位 id/order/label 齐备', Boolean(entry && entry.definition.id === 'anima-style-lora' && entry.definition.order === 60 && typeof entry.definition.label() === 'string'))
+check('槽位 id/order/label 齐备', Boolean(entry && entry.definition.id === 'anima-style-lora' && entry.definition.order === 100 && typeof entry.definition.label() === 'string'))
 check('注册了样式与字典两个 effect', effects.length >= 2, `${effects.length}`)
 for (const effect of effects) effect.fn()
 
