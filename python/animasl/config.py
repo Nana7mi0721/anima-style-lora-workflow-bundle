@@ -28,6 +28,19 @@ def runtime_dir() -> Path:
     return Path(home) / ".animasl"
 
 
+def runtime_config_file() -> Path:
+    """The per-user config the settings page writes (`<runtime>/animasl.config.json`)."""
+    return runtime_dir() / "animasl.config.json"
+
+
+# Top-level keys that also honour an `ANIMASL_<KEY>` environment variable.
+# Nested tables (screen / dedup / wash) have no environment form -- edit them in
+# the runtime config file (the settings page does exactly that).
+ENV_KEYS = ("home", "datasets_dir", "configs_dir", "output_dir", "python", "ml_python",
+            "models_dir", "anima_lora_dir", "trainer_dir", "koharu_dir", "cookies_file",
+            "layout_model", "inpaint_model", "tag_dict")
+
+
 DEFAULTS: dict[str, Any] = {
     # workspace roots
     "home": "E:/LoRA_Train",
@@ -105,21 +118,42 @@ def _deep_merge(base: dict, over: dict) -> dict:
     return out
 
 
+def env_layer() -> dict:
+    """The `ANIMASL_*` overrides actually present in this process environment."""
+    over: dict[str, Any] = {}
+    for key in ENV_KEYS:
+        value = os.environ.get("ANIMASL_" + key.upper())
+        if value:
+            over[key] = value
+    return over
+
+
+def layers(cli: dict | None = None) -> dict:
+    """Every configuration layer separately, plus what the merge produces.
+
+    The settings page shows the runtime layer as the editable one and uses this
+    to explain where an effective value comes from (default / bundle / runtime /
+    environment / CLI). Keys are the raw file contents, so nothing is invented.
+    """
+    defaults = json.loads(json.dumps(DEFAULTS))
+    bundle = _read_json(CONFIG_FILE)
+    runtime = _read_json(runtime_config_file())
+    env = env_layer()
+    data = _deep_merge(defaults, bundle)
+    data = _deep_merge(data, runtime)
+    data = _deep_merge(data, env)
+    data = _deep_merge(data, {k: v for k, v in (cli or {}).items() if v not in (None, "")})
+    return {"defaults": defaults, "bundle": bundle, "runtime": runtime, "env": env, "merged": data}
+
+
 class Config:
     """Merged configuration for one animasl invocation."""
 
     def __init__(self, cli: dict | None = None) -> None:
         data = dict(DEFAULTS)
         data = _deep_merge(data, _read_json(CONFIG_FILE))
-        data = _deep_merge(data, _read_json(runtime_dir() / "animasl.config.json"))
-        env_over = {}
-        for key in ("home", "datasets_dir", "configs_dir", "output_dir", "python", "ml_python",
-                    "models_dir", "anima_lora_dir", "trainer_dir", "koharu_dir", "cookies_file",
-                    "layout_model", "inpaint_model", "tag_dict"):
-            env_key = "ANIMASL_" + key.upper()
-            if os.environ.get(env_key):
-                env_over[key] = os.environ[env_key]
-        data = _deep_merge(data, env_over)
+        data = _deep_merge(data, _read_json(runtime_config_file()))
+        data = _deep_merge(data, env_layer())
         data = _deep_merge(data, {k: v for k, v in (cli or {}).items() if v not in (None, "")})
         self.data = data
 
@@ -128,6 +162,10 @@ class Config:
     def load(cls, **cli: Any) -> "Config":
         """Convenience constructor: Config.load(home=...) ignores empty cli values."""
         return cls({k: v for k, v in cli.items() if v not in (None, "")})
+
+    def as_dict(self) -> dict:
+        """A detached copy of the merged data (safe to serialise)."""
+        return json.loads(json.dumps(self.data))
 
     def __getitem__(self, key: str) -> Any:
         return self.data[key]

@@ -143,6 +143,8 @@ def build_parser() -> argparse.ArgumentParser:
     _apply(sp)
 
     sp = add("doctor", "检查环境：python / torch / rfdetr / 模型 / 代理 / 词典", required=False)
+    sp = add("config", "查看配置分层与每个键的来源（设置页读写的就是 runtime 层）", required=False)
+    sp.add_argument("--json", action="store_true", help="输出 JSON（设置页用）")
     sub.add_parser("dict", help="词典缓存信息")
     return p
 
@@ -169,6 +171,61 @@ def _list_datasets(cfg: cfgmod.Config) -> int:
     return 0
 
 
+def _walk_leaves(node, prefix: str = "") -> list[tuple[str, object]]:
+    """Flatten a config tree into (dotted key, leaf value) rows."""
+    rows: list[tuple[str, object]] = []
+    for key, value in (node or {}).items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict):
+            rows.extend(_walk_leaves(value, path + "."))
+        else:
+            rows.append((path, value))
+    return rows
+
+
+def _origin_of(path: str, layers: dict) -> str:
+    """Which layer supplies a dotted key (later layers win)."""
+    def has(layer: dict) -> bool:
+        node = layer
+        for part in path.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return False
+            node = node[part]
+        return True
+
+    for name in ("env", "runtime", "bundle"):
+        if has(layers[name]):
+            return name
+    return "defaults"
+
+
+def _config_report(home: str | None, as_json: bool) -> int:
+    layers = cfgmod.layers({"home": home} if home else None)
+    paths = {
+        "home": layers["merged"].get("home"),
+        "bundle_config": str(cfgmod.CONFIG_FILE),
+        "runtime_config": str(cfgmod.runtime_config_file()),
+        "runtime_dir_exists": cfgmod.runtime_config_file().parent.is_dir(),
+        "runtime_config_exists": cfgmod.runtime_config_file().is_file(),
+    }
+    if as_json:
+        print(json.dumps({"paths": paths, "layers": layers}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"[config] home            {paths['home']}")
+    print(f"[config] bundle 层       {paths['bundle_config']}")
+    print(f"[config] runtime 层      {paths['runtime_config']}"
+          f"{'' if paths['runtime_config_exists'] else '（还没有这个文件，设置页保存时才创建）'}")
+    if layers["env"]:
+        print(f"[config] 环境覆盖        {', '.join(sorted(layers['env']))}")
+    print(f"{'键':<34}{'来源':<10}值")
+    for key, value in _walk_leaves(layers["merged"]):
+        shown = json.dumps(value, ensure_ascii=False)
+        if len(shown) > 72:
+            shown = shown[:69] + "..."
+        print(f"{key:<34}{_origin_of(key, layers):<10}{shown}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cmd = args.cmd
@@ -182,6 +239,9 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "doctor":
         _doctor(getattr(args, "home", None))
         return 0
+
+    if cmd == "config":
+        return _config_report(getattr(args, "home", None), bool(getattr(args, "json", False)))
 
     if cmd == "status" and not getattr(args, "dataset", None):
         return _list_datasets(cfgmod.Config.load(home=getattr(args, "home", None)))

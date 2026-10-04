@@ -47,10 +47,36 @@ const sctx = {
   },
 }
 
+// webServer 半侧的假 ctx：只记录注册了什么路由
+const wctx = {
+  routes: [],
+  webServer: {
+    register(route) {
+      if (wctx.routes.some((item) => item.kind === route.kind && item.path === route.path)) {
+        throw new Error(`duplicate ${route.kind} route "${route.path}"`)
+      }
+      wctx.routes.push(route)
+      return () => {
+        wctx.routes = wctx.routes.filter((item) => item !== route)
+      }
+    },
+  },
+  effect(fn) {
+    return fn()
+  },
+}
+
 const ctx = {
   inject(keys, fn) {
-    if (!keys.includes('tools')) throw new Error('unexpected inject: ' + keys.join(','))
-    fn(sctx)
+    const known = ['tools', 'webServer']
+    for (const key of keys) {
+      if (!known.includes(key)) throw new Error('unexpected inject: ' + keys.join(','))
+    }
+    if (keys.includes('tools')) fn(sctx)
+    if (keys.includes('webServer')) fn(wctx)
+  },
+  get() {
+    return undefined
   },
   logger: { info: (message) => logs.push(message) },
 }
@@ -62,7 +88,15 @@ apply(ctx, { home, animaLoraDir: path.join(home, 'anima_lora') })
 const EXPECTED = ['anima_status', 'anima_stage', 'anima_job', 'anima_doctor']
 check(defs.size === EXPECTED.length, `registered ${defs.size} tools (expect ${EXPECTED.length})`)
 for (const tool of EXPECTED) check(defs.has(tool), `tool ${tool} present`)
-check(logs.length === 1, `apply logged once: ${logs[0] ?? '(none)'}`)
+check(
+  logs.some((line) => line.includes('registered 4 tools')),
+  `apply logged the tool registration: ${logs.join(' | ') || '(none)'}`,
+)
+
+// 设置路由：恰好一条 prefix 路由，路径与浏览器半侧一致
+check(wctx.routes.length === 1, `registered ${wctx.routes.length} web route (expect 1)`)
+check(wctx.routes[0]?.kind === 'prefix' && wctx.routes[0]?.path === '/anima-lora/api', `route path: ${wctx.routes[0]?.kind} ${wctx.routes[0]?.path}`)
+check(typeof wctx.routes[0]?.handler === 'function', 'route handler is a function')
 
 function scanUndefined(value, where) {
   if (value === undefined) return [`${where}: undefined`]

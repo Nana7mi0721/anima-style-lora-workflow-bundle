@@ -44,8 +44,12 @@ dsh-anima-style-lora (dsh-anima-style-lora): failed to import
 
 ```bash
 cd "E:/Study/github program/anima style lora workflow bundle"
-npm test          # 契约 + 四个工具真跑一遍（只读/干跑）
-npm run test:live # 额外跑 text 干跑（慢，要 torch）
+npm test              # 契约 + 四个工具真跑一遍（只读/干跑）
+npm run test:live     # 额外跑 text 干跑（慢，要 torch）
+npm run test:client   # 设置页浏览器半侧：假 React 渲染 + 断言发出的请求
+npm run test:route    # 设置页宿主路由：真起 http server + 真 Python CLI（含信任栅栏）
+npm run test:route:doctor  # 上面那条再加一次真 doctor（慢约 1 分钟）
+npm run test:all      # check:patch + client + route + smoke
 ```
 
 `test/smoke.mjs` 把插件装进一个假 ctx（`test/stub/` 用 ESM loader 钩子把
@@ -53,6 +57,32 @@ npm run test:live # 额外跑 text 干跑（慢，要 torch）
 返回值满足自己声明的 `output.schema`、`render()` 有非空正文、disposer 能卸干净。
 它抓到过三个真 bug：`require()` 用在 ESM 里导致报告行数恒为 0、`stageOf()` 认不出
 无 `--dataset` 的 doctor、`collect()` 把报告数组塞进声明为 string 的字段。
+
+`test/client-smoke.mjs` 用一个极简 React 替身（本机没有 react，它由 web shell
+的平台模块表提供）把设置页真的渲染出来，再模拟输入与点击，断言发出去的 HTTP
+请求（只写被编辑的键、保存后重读、体检输出上屏）。`test/settings-route.mjs`
+用真的 `http` server 加真的 Python CLI 跑通 read/write/probe/doctor，并逐条
+验证信任栅栏（非 loopback Host、跨站 Origin、`sec-fetch-site: cross-site`、
+超长 body 413）。
+
+### 设置页（图形界面改配置）
+
+设置 → 左侧导航「Anima 风格 LoRA」。它**不是**另存一份配置，而是直接读写
+`<home>/.animasl/animasl.config.json`（运行时层），下一次 `anima_*` 调用即生效，
+不用重启：
+
+- 分组：`paths` / `runtime` / `dict` / `net` / `screen` / `dedup` / `wash`，
+  每个键都标出来源（`bundle` / `defaults` / 本机覆盖），改动过的键可以一键
+  「恢复默认」（= 从 runtime 层删掉这个键，回落到 bundle/内置默认）。
+- 只读两行：`home`（由 profile 的 `cordis.patch.yml` 行配置决定）与运行时目录。
+  路径类字段旁边有「存在 / 不存在」标记，点「跑一次体检」能在页面里看
+  `anima_doctor` 的完整输出。
+- 通路：宿主半侧 `lib/settings.js` 在 `/anima-lora/api` 上注册 prefix 路由
+  （`read` / `write` / `probe` / `doctor`），浏览器半侧 `lib/client.js` 手写、
+  只 require 平台 seed 里的 `react`，样式只用宿主的 `--dsw-*` token，
+  所以明暗主题都跟着走。写盘是「临时文件 + rename」的原子替换。
+- 为什么不用 DSH 自己的设置 RPC：它不给第三方命名空间提供配置读写
+  （`dsh-better-sidebar` 的源码注释也是这么写的），第三方插件必须自建路由。
 
 ### 挪动 bundle 位置时
 

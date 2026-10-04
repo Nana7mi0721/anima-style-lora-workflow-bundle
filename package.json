@@ -10,6 +10,7 @@
   },
   "exports": {
     ".": "./lib/index.js",
+    "./client": "./lib/client.js",
     "./lib/*": "./lib/*",
     "./package.json": "./package.json"
   },
@@ -25,6 +26,10 @@
   "scripts": {
     "test": "node --import ./test/stub/register.mjs test/smoke.mjs",
     "test:live": "node --import ./test/stub/register.mjs test/smoke.mjs --live",
+    "test:client": "node test/client-smoke.mjs",
+    "test:route": "node test/settings-route.mjs",
+    "test:route:doctor": "node test/settings-route.mjs --doctor",
+    "test:all": "npm run check:patch && npm run test:client && npm run test:route && npm test",
     "check:patch": "node test/check-patch.mjs",
     "doctor": "node -e \"import('./lib/run.js').then(()=>console.log('ok'))\""
   },
@@ -43,6 +48,11 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    }
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    },
+    "manifestVersion": 1
   }
 }
