@@ -1,0 +1,5 @@
+# 打包时排除的东西（bundle 平时以 link: 安装，这些只影响 npm pack / 发 tgz）
+python/.venv
+python/**/__pycache__
+python/models/*.pt
+test/**/*.log

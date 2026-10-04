@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 本机 ML 环境：pyvenv.cfg 指向 uv 的 CPython，torch/rfdetr 由共享 site-packages 提供
+# （见 python/.venv/Lib/site-packages/_ref_anima_lora.pth），不进仓库
+python/.venv/
+# rfdetr 权重缓存（154MB，首次跑 text 阶段会重新下载）
+python/models/*.pt
+
+# Node
+node_modules/
+
+# 运行时与日志
+*.log
+.animasl/
+test/**/*.log

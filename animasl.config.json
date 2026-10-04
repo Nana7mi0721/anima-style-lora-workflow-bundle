@@ -1,0 +1,45 @@
+{
+  "home": "E:/LoRA_Train",
+  "anima_lora_dir": "E:/LoRA_Train/anima_lora",
+  "trainer_dir": "E:/LoRA_Train/Anima-Standalone-Trainer",
+  "koharu_dir": "D:/Program/koharu",
+  "models_dir": "E:/LoRA_Train/anima_lora/models",
+  "python": "",
+  "ml_python": "",
+  "proxy_candidates": [
+    "",
+    "http://127.0.0.1:7897",
+    "http://127.0.0.1:7890",
+    "socks5://127.0.0.1:10809",
+    "socks5://127.0.0.1:1080"
+  ],
+  "prefer_proxy_hosts": [
+    "pawchive.pw",
+    "exhentai.org",
+    "e-hentai.org",
+    "n2.pawchive.pw"
+  ],
+  "screen": {
+    "min_short_side": 512,
+    "min_bytes": 102400,
+    "earliest_date": "2015-01-01",
+    "text_warn_ratio": 0.08,
+    "text_drop_ratio": 0.3
+  },
+  "dedup": {
+    "phash_distance": 4,
+    "ssim_threshold": 0.995
+  },
+  "wash": {
+    "min_tags": 20,
+    "max_tags": 45,
+    "character_min_images": 0,
+    "category_drop": [
+      1,
+      3,
+      5
+    ],
+    "category_keep": [],
+    "keep_parent_tags": []
+  }
+}

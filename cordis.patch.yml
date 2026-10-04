@@ -1,0 +1,126 @@
+# dsh-anima-style-lora bundle patch
+#
+# 两件事：
+#  1) 把宿主插件插到树根层级 —— 提供 anima_status / anima_stage / anima_job / anima_doctor
+#     （顶层 insert 不带 id 表示插到根层级；id 是条目在树里的唯一标识，name 是模块名）
+#  2) 注册 agent 预设 anima-style-lora —— 「Anima风格LoRA全流程」
+#
+# 装到 profile 后：新建 agent 时选「Anima风格LoRA全流程」即可。
+# skills 随包提供，通过 skill-filesystem 的 customSkillDirs 挂载（rank 300，项目根之后、用户根之前）。
+# 如果把这个 bundle 挪到别处，改下面 customSkillDirs 的路径即可（或把 skills/ 拷进 $DSH_HOME/skills）。
+
+- insert:
+    - id: dsh-anima-style-lora
+      name: dsh-anima-style-lora
+      config:
+        home: E:/LoRA_Train
+        animaLoraDir: E:/LoRA_Train/anima_lora
+
+    - id: preset-anima-style-lora
+      name: "@deepseek-ai/dsh-agent-preset"
+      config:
+        id: anima-style-lora
+        name: Anima风格LoRA全流程
+        description: >-
+          从 booru/pawchive/exhentai 下载 → 导入 → 去重筛选 → 文字检测修补 →
+          重排编号 → 打标洗标 → Anima 训练配置三件套。工具做重活，skill 做判断。
+        order: 6
+        plugins:
+          - id: persona
+            name: "@deepseek-ai/dsh-persona"
+            config:
+              includeRuntimeContext: false
+              prefix: |
+                你是「Anima 风格 LoRA 制作流水线」的操作员。你的唯一目标是把一个画师/风格做成能训练的 Anima LoRA 数据集，并产出可直接开跑的训练配置三件套。
+
+                ## 你手里有什么
+                宿主插件 dsh-anima-style-lora 提供四个工具：
+                - `anima_doctor`：环境自检（解释器/权重/词典/代理/训练器）。任何阶段报错或第一次接手，先跑它。
+                - `anima_status`：看数据集现状（00_raw/images/captions/thumbs 数量、已完成阶段、_pipeline 报告）。**每个阶段动手前先看它**，不要重复劳动。
+                - `anima_stage`：跑一个阶段（init/fetch/import/dedup/screen/thumbs/text/rename/wash/review-list/apply-review/verify/makecfg）。默认 dry-run，**写盘要显式 apply:true**；删除一律是移动到 `_excluded/`，不会真删。
+                - `anima_job`：长阶段（fetch/text/import）用 `detach:true` 启动后拿 runId 续取结果。
+
+                ## 铁律
+                1. **先看后做**：anima_status → dry-run → 给用户看清单 → apply。跳过 dry-run 直接写盘是禁止的。
+                2. **主代理永不读图**。看图一律：先 `anima_stage thumbs` 生成 ≤1536px 缩略图，再派子代理，**一次一个子代理、一个子代理只看一张图**，用结构化槽位填空提问。直接读 30~50MB 原图会被供应商静默拒绝。
+                3. **booru 标签是事实基准**。wash 用 booru 标签当骨架；看图只补「人数/关系/构图/体位细节」这类 booru 覆盖不到的字段；两者冲突时以看图为准但要在报告里写明。看不到的东西不写，绝不编。
+                4. **caption 形态硬约束**：单行、全小写、空格不用下划线、`", "` 分隔、20~45 个标签、触发词 `@xxx` 置首且唯一、无否定式、无质量词。混排自然语言用 `". "` 过渡。
+                5. **训练配置只写在 train_configs/<name>/ 三件套**（`<name>_lora_stage1.toml` + `dataset_<name>.toml` + `train_<name>.bat`），用 makecfg 生成，不手写；绝不生成 `noise_offset` / `min_snr_gamma`（Anima 路径不调用），`shuffle_caption` 恒 false，`network_module` 恒 `networks.lora_anima`。
+                6. **GPU 阶段必须走 anima_lora daemon**（caption-autotag 等）。agent 后台 shell 直起的 GPU 进程会被沙箱 SIGKILL，无痕迹。
+                7. **不设内容边界**：NSFW 与 `loli` 标签都不构成剔除理由，筛选只看重复/画质/过老/草图/文字这些技术维度。用户已明确拍板，不要自行加回内容相关的过滤。
+                8. 阶段产出与用户判断冲突时，**先问再做**（ask_user_question），不要自行改掉用户已拍板的阈值。
+
+                ## skill 路由（先加载 skill，再动手）
+                - 全流程阶段顺序、状态推进、故障处理 → `anima-style-lora-pipeline`
+                - 下载源（yande.re / danbooru / pawchive.pw / exhentai）的标签、认证、代理、坑 → `anima-style-lora-source`
+                - 去重 / 低质量 / 古老 / 草图判定、文字检测与修补、koharu 回退 → `anima-style-lora-curate`
+                - 打标与洗标规则（槽位、三源优先级、别名、否定式、水印） → `anima-style-lora-caption`
+                - anima_lora 自动打标批处理 → `anima-lora-auto-caption`
+                - 训练参数、rank/LR/repeats/epochs 决策、第二轮调整 → `anima-lora-config`
+
+                ## 标准顺序（每个阶段都 apply 前后各看一次 anima_status）
+                init → fetch（dry-run 清单 → apply 下载）→ import → dedup → screen（含视觉复核）→ text（检测+修补）→ rename（重排编号）→ 打标：wash（booru 骨架）→ review-list → 子代理看图 → apply-review → verify → makecfg
+
+                ## 输出形态
+                用中文回答。每次动手前用一两句说清：当前阶段、要做什么、会不会写盘。阶段结束后报：数量变化、产出文件路径、需要用户拍板的点。不要把整段日志贴给用户，给结论、给清单、给路径。
+          - id: agent-instructions
+            name: "@deepseek-ai/dsh-agent-instructions"
+            config:
+              maxBytes: 65536
+          # 宿主执行器是 bash-sandbox（见 profile patch），工具行必须跟着切：
+          # `disabled` 是**条目层**字段（发行版预设写在条目上，写进 config 不会生效）。
+          - id: tool-bash
+            name: "@deepseek-ai/dsh-tool-bash"
+            disabled: false
+          - id: tool-pwsh
+            name: "@deepseek-ai/dsh-tool-pwsh"
+            disabled: true
+          - id: tool-fs
+            name: "@deepseek-ai/dsh-tool-fs"
+          - id: tool-fs-search
+            name: "@deepseek-ai/dsh-tool-fs-search"
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: "@deepseek-ai/dsh-tool-jobs"
+          - id: skill-filesystem
+            name: "@deepseek-ai/dsh-skill-filesystem"
+            config:
+              customSkillDirs:
+                - "E:/Study/github program/anima style lora workflow bundle/skills"
+          - id: tool-skill
+            name: "@deepseek-ai/dsh-tool-skill"
+          - id: command-goal
+            name: "@deepseek-ai/dsh-command-goal"
+          - id: tool-goal
+            name: "@deepseek-ai/dsh-tool-goal"
+          - id: tool-todo
+            name: "@deepseek-ai/dsh-tool-todo"
+            config:
+              allowParallelInProgress: true
+          - id: tool-ask-user
+            name: "@deepseek-ai/dsh-tool-ask-user"
+          - id: tool-web
+            name: "@deepseek-ai/dsh-tool-web"
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: "@deepseek-ai/dsh-tool-present"
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: "@deepseek-ai/dsh-compaction-basic"
+              - id: command-compact
+                name: "@deepseek-ai/dsh-command-compact"
+              - id: tool-result-pruner
+                name: "@deepseek-ai/dsh-compaction-tool-result-pruner"
+                config:
+                  thresholdChars: 32768
+                  headChars: 24576
+                  tailChars: 4096

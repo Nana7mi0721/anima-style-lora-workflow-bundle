@@ -1,0 +1,48 @@
+{
+  "name": "dsh-anima-style-lora",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH bundle: Anima 风格 LoRA 全流程预设（下载 → 筛选 → 去重/去文字 → 打标洗标 → 训练配置三件套）",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./lib/*": "./lib/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "python",
+    "skills",
+    "test",
+    "cordis.patch.yml",
+    "animasl.config.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --import ./test/stub/register.mjs test/smoke.mjs",
+    "test:live": "node --import ./test/stub/register.mjs test/smoke.mjs --live",
+    "check:patch": "node test/check-patch.mjs",
+    "doctor": "node -e \"import('./lib/run.js').then(()=>console.log('ok'))\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/dsh-tools": ">=0.2.0-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
