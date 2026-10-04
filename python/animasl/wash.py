@@ -882,7 +882,8 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
     emptied_why: dict[str, int] = {}
     for f in files:
         tags_a, text_c, origin = sources[f.name]
-        if not tags_a and not text_c.strip():
+        had_source = bool(tags_a) or bool(text_c.strip())
+        if not had_source:
             no_source += 1
         tags_c, nlp_c = parse_caption(text_c)
         rep: dict = {}
@@ -894,8 +895,8 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
             prose_dropped += 1
         line = assemble(merged, nlp_c, rules)
         issues = validate(line, rules, rep.get("tag_count", 0), td)
-        if not [t for t in merged if not t.startswith("@")]:
-            emptied.append(f.name)
+        if not [t for t in merged if not t.startswith("@")] and had_source:
+            emptied.append(f.name)      # 只算"本来有标签、被规则丢光"的；本来就没标签的走上面那条报警
             for d in rep.get("dropped", []):
                 k = str(d.get("why"))
                 emptied_why[k] = emptied_why.get(k, 0) + 1
@@ -934,8 +935,9 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
     if emptied:
         why_top = "、".join(f"{w}×{n}" for w, n in sorted(emptied_why.items(),
                                                           key=lambda kv: -kv[1])[:3])
+        why_clause = f"（主要原因：{why_top}）" if why_top else "（标签本来就只有画师/系列名几个）"
         print(f"[wash] ! {len(emptied)}/{len(rows)} 张 caption 洗完只剩下触发词：来源标签**有**数据，"
-              f"但被规则整类丢掉了（主要原因：{why_top}）。"
+              f"但被规则整类丢掉了{why_clause}。"
               f"\n        这就是「画师标签由触发词承载 / IP 系列名永不添加」的必然后果——"
               f"单画师图源（yande.re 一类）的 booru 标签往往只有画师+角色几个，洗完就空了。"
               f"\n        这批图必须补内容：跑 anima-lora-auto-caption 自动打标，或按 review-list 走看图补全，"
