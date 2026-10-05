@@ -7,9 +7,12 @@
 #
 # 装到 profile 后：新建 agent 时选「Anima风格LoRA全流程」即可。
 # skills 随包提供，通过 skill-filesystem 的 customSkillDirs 挂载（rank 300，项目根之后、用户根之前）。
-# customSkillDirs 只认绝对路径（相对路径按 host 进程 CWD 解析，不可用），所以这里指向
-# profile 的 pnpm 安装副本 —— 插件从 GitHub 安装/更新后该路径始终有效，无需跟源码工作区走。
-# 若 DSH 主目录不是默认的 %USERPROFILE%\.dsh，改成本机 profile 的实际路径即可。
+# customSkillDirs 只认绝对路径（相对路径按 host 进程 CWD 解析，不可用）。下面填的是
+# **源码工作区**路径（本机开发时改仓库文件即刻生效）。若从 GitHub 装到 profile、想让 skill
+# 跟着装机副本走，把这一行换成 profile 里的安装副本路径：
+#   C:/Users/REISEN/.dsh/profiles/desktop/node_modules/dsh-anima-style-lora/skills
+# （两条都写会扫到两份同名 skill，所以只留一条。）若 DSH 主目录不是默认 %USERPROFILE%\.dsh，
+# 把上面 profile 段换成实际路径。
 
 - insert:
     - id: dsh-anima-style-lora
@@ -89,7 +92,7 @@
             name: "@deepseek-ai/dsh-skill-filesystem"
             config:
               customSkillDirs:
-                - "C:/Users/REISEN/.dsh/profiles/desktop/node_modules/dsh-anima-style-lora/skills"
+                - "E:/Study/github program/for dsh/anima style lora workflow bundle/skills"
           - id: tool-skill
             name: "@deepseek-ai/dsh-tool-skill"
           - id: command-goal

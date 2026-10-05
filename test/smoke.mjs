@@ -166,8 +166,8 @@ await run('anima_job', {}, 'job(list)')
 if (hasDataset) {
   await run('anima_status', { dataset: testDataset }, `status(${testDataset})`)
   await run('anima_stage', { stage: 'screen', dataset: testDataset }, 'stage(screen dry-run)')
-  await run('anima_stage', { stage: 'review-list', dataset: testDataset, force: true }, 'stage(review-list, force 应被忽略)')
-  await run('anima_stage', { stage: 'makecfg', dataset: testDataset, kind: 'style', trigger: '@smoketest' }, 'stage(makecfg dry-run)')
+  await run('anima_stage', { stage: 'review-list', dataset: testDataset }, 'stage(review-list)')
+  await run('anima_stage', { stage: 'makecfg', dataset: testDataset, kind: 'style', trigger: '@smoketest', lr: 0.0001 }, 'stage(makecfg dry-run)')
   if (live) {
     await run('anima_stage', { stage: 'text', dataset: testDataset, device: 'cuda' }, 'stage(text dry-run)')
   }
@@ -183,6 +183,15 @@ try {
   threw = error.message
 }
 check(threw === 'dataset is required', `stage without dataset throws (${threw || 'no error'})`)
+
+// 负例：阶段不支持的参数必须在 spawn 之前被拒（不再靠子进程 argparse 报错）
+threw = ''
+try {
+  await defs.get('anima_stage').execute({ stage: 'review-list', dataset: testDataset, force: true }, {})
+} catch (error) {
+  threw = error.message
+}
+check(/不支持参数/.test(threw) && /force/.test(threw), `stage unsupported param throws (${(threw || 'no error').split('\n')[0]})`)
 
 // ---- 卸载：effect 的清理函数必须能摘掉全部工具 --------------------------------
 
