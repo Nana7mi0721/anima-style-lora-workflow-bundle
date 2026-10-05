@@ -18,10 +18,13 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import net
+from . import net, state
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif"}
 ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".tar", ".gz"}
+
+# 数据集自己的保留目录：import 不会递归进去（它们是流水线的产物，不是素材）
+RESERVED_DIRS = {"00_raw", "images", "_pipeline", "_excluded", "thumbs", "masks"}
 
 try:
     from PIL import Image, ImageOps
@@ -176,6 +179,20 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
         raise SystemExit(f"[import] 路径不存在: {src_path}")
     ds.ensure_dirs()
 
+    # src 红线（真实使用踩过）：src 传成数据集根目录，rglob 会把 images/、thumbs/、
+    # masks/ 全部当成"新图"再导一份进 00_raw —— 200 张里有 139 张是这么来的。
+    root = ds.root.resolve()
+    src_res = src_path.resolve()
+    if src_res == root or root.is_relative_to(src_res):
+        raise SystemExit(
+            f"[import] 拒绝执行：src 是数据集目录本身或它的上级\n"
+            f"         src   = {src_res}\n"
+            f"         数据集 = {root}\n"
+            f"         import 只收「素材目录 / 压缩包」，请指向图片所在的源目录，\n"
+            f"         例如 <数据集>/00_raw 之外的一个新目录；数据集内的 images/、\n"
+            f"         thumbs/ 由 rename/thumbs 阶段维护，不需要再导入。"
+        )
+
     staging = ds.pipe_dir / "_import_staging"
     items: list[Path] = []
 
@@ -183,6 +200,13 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
         if p.is_dir():
             if unpack and p.suffix.lower() in ARCHIVE_EXTS:
                 return
+            # 数据集自己的保留目录不再递归（只对数据集内的路径生效，
+            # 别把外部素材目录里恰好叫 images/ 的文件夹也跳过）
+            try:
+                if p.resolve().is_relative_to(root) and p.name in RESERVED_DIRS:
+                    return
+            except Exception:
+                pass
             it = p.rglob("*") if recurse else p.glob("*")
             for child in it:
                 if child.is_file():
@@ -205,10 +229,25 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
                     items.append(child)
 
     images = [p for p in items if p.suffix.lower() in IMG_EXTS]
-    print(f"[import] 候选文件 {len(items)}，其中图片 {len(images)}")
+    others = [p for p in items if p.suffix.lower() not in IMG_EXTS]
+    print(f"[import] 候选文件 {len(items)}，其中图片 {len(images)}，非图 {len(others)}")
+    if others:
+        # 早先这里是个静默黑洞：zip/mp4/txt 既不进 00_raw 也不进任何报告，
+        # 于是"我明明导入了 30 个文件"没法核对。现在逐个列出来。
+        by_ext: dict[str, int] = {}
+        for p in others:
+            by_ext[p.suffix.lower() or "(无后缀)"] = by_ext.get(p.suffix.lower() or "(无后缀)", 0) + 1
+        print("         非图文件不计入 00_raw（解包后的图会收）："
+              + "，".join(f"{ext}×{n}" for ext, n in sorted(by_ext.items(), key=lambda kv: -kv[1])))
+        for p in others[:5]:
+            print(f"         · {p.name}")
+        if len(others) > 5:
+            print(f"         · … 另有 {len(others) - 5} 个")
 
     used = {p.name for p in ds.raw_dir.iterdir()} if ds.raw_dir.exists() else set()
-    rows: list[dict] = []
+    rows: list[dict] = [{"source": "import", "origin": str(p), "filename": p.name,
+                         "ext": p.suffix.lower(), "bytes": p.stat().st_size,
+                         "status": "skipped-non-image"} for p in sorted(others)]
     copied = 0
     for p in sorted(images):
         if p.is_relative_to(ds.raw_dir) if hasattr(p, "is_relative_to") else str(p).startswith(str(ds.raw_dir)):
@@ -237,12 +276,16 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
     if rows and not dry_run:
         existing = net.read_jsonl(ds.pipe_dir / "raw_posts.jsonl")
         known = {(r.get("filename"), r.get("origin")) for r in existing}
-        merged = existing + [r for r in rows if (r.get("filename"), r.get("origin")) not in known]
+        merged = existing + [r for r in rows
+                             if r.get("status") != "skipped-non-image"
+                             and (r.get("filename"), r.get("origin")) not in known]
         net.write_jsonl(ds.pipe_dir / "raw_posts.jsonl", merged)
     if staging.exists():
         shutil.rmtree(staging, ignore_errors=True)
     print(f"[import] 导入 {copied} 张 -> {ds.raw_dir}")
-    return {"rows": rows, "count": copied}
+    if others:
+        print(f"         跳过非图 {len(others)} 个（已在报告里逐条列出）")
+    return {"rows": rows, "count": copied, "skipped": len(others)}
 
 
 # --------------------------------------------------------------------------
@@ -542,14 +585,40 @@ def cmd_screen(ds, rules: dict | None = None, apply: bool = False,
 # thumbs (for the vision subagents -- never let them read 30MB originals)
 # --------------------------------------------------------------------------
 def cmd_thumbs(ds, max_side: int = 1536, max_bytes: int = 2_000_000,
-               include_images: bool = False) -> dict:
+               include_images: bool = False, prune: bool = False,
+               force: bool = False) -> dict:
+    """生成缩略图（视觉子代理只能看这个）。
+
+    真实使用踩过的坑：thumbs 默认读 00_raw，而 rename 之后 00_raw 已经空了 ⇒
+    第二次 thumbs 打印「0 张」，agent 只能自己拿 Pillow 造缩略图。现在：
+      * 工作集 = images/（有内容就用它）否则 00_raw —— 与 working_dir() 一致；
+      * 已存在且比原图新、长边也不超标的缩略图跳过（重跑不再白算几百张）；
+      * --prune 清掉没有对应图的陈旧缩略图（改名后残留的旧编号）。
+    """
     ds.ensure_dirs()
     ds.thumbs_dir.mkdir(parents=True, exist_ok=True)
-    files = ds.images() if include_images else ds.raw_images()
+    files = ds.images() if include_images else working_dir(ds).iterdir()
+    files = sorted(p for p in files if p.is_file() and p.suffix.lower() in IMG_EXTS)
+    if not files:
+        print("[thumbs] 工作集是空的：00_raw 与 images/ 都没有图。"
+              "先 fetch/import，或 rename 之后再跑 thumbs。")
+        return {"count": 0, "skipped": 0, "pruned": 0, "dir": str(ds.thumbs_dir)}
+
     written = 0
+    skipped = 0
     total = 0
     for f in files:
         out = ds.thumbs_dir / (f.stem + ".jpg")
+        if out.exists() and not force:
+            try:
+                fresh = out.stat().st_mtime >= f.stat().st_mtime
+                with Image.open(out) as old:
+                    fits = max(old.size) <= max_side
+                if fresh and fits:
+                    skipped += 1
+                    continue
+            except Exception:
+                pass
         try:
             with Image.open(f) as im:
                 im = ImageOps.exif_transpose(im).convert("RGB")
@@ -564,9 +633,23 @@ def cmd_thumbs(ds, max_side: int = 1536, max_bytes: int = 2_000_000,
             total += out.stat().st_size
         except Exception as exc:
             print(f"  ! thumb failed {f.name}: {exc}")
-    print(f"[thumbs] {written} 张 -> {ds.thumbs_dir}"
-          f"（平均 {total // max(written, 1) // 1024} KB，长边≤{max_side}）")
-    return {"count": written, "dir": str(ds.thumbs_dir)}
+
+    pruned = 0
+    if prune:
+        keep = {f.stem for f in files}
+        for out in sorted(ds.thumbs_dir.glob("*.jpg")):
+            if out.stem in keep:
+                continue
+            try:
+                out.unlink()
+                pruned += 1
+            except Exception:
+                pass
+
+    print(f"[thumbs] 新写 {written} 张、跳过 {skipped} 张"
+          + (f"、清理陈旧 {pruned} 张" if prune else "")
+          + f" -> {ds.thumbs_dir}（平均 {total // max(written, 1) // 1024} KB，长边≤{max_side}）")
+    return {"count": written, "skipped": skipped, "pruned": pruned, "dir": str(ds.thumbs_dir)}
 
 
 # --------------------------------------------------------------------------
@@ -590,6 +673,7 @@ def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
 
     files = sorted(files, key=sort_key)
     rows: list[dict] = []
+    sidecars = 0
     for idx, f in enumerate(files):
         n = start + idx
         new_name = f"{n:0{digits}d}{f.suffix.lower()}"
@@ -611,20 +695,91 @@ def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
                 shutil.move(str(f), str(dest))
             else:
                 shutil.copy2(f, dest)
+            # 原图旁边的 .txt（早期手工补的 / import 带进来的）跟着搬，别留在 00_raw 里成孤儿
+            side = f.with_suffix(".txt")
+            if side.exists():
+                target = dest.with_suffix(".txt")
+                if not target.exists():
+                    try:
+                        shutil.move(str(side), str(target)) if move else shutil.copy2(side, target)
+                        sidecars += 1
+                    except Exception:
+                        pass
 
-    write_csv(ds.pipe_dir / "rename_map.csv", rows)
-    if apply:
-        print(f"[rename] {len(rows)} 张已重排为 {start:0{digits}d}…{start + len(rows) - 1:0{digits}d}"
-              f" -> {ds.images_dir}")
-    else:
-        print(f"[rename] 预演：{len(rows)} 张将重排；对照表 {ds.pipe_dir / 'rename_map.csv'}"
-              f"（加 --apply 执行）")
-    return {"count": len(rows), "map": str(ds.pipe_dir / "rename_map.csv")}
+    total_rows = len(rows)
+    first, last = start, start + total_rows - 1
+    if not apply:
+        # 预演不碰权威对照表（load_rename_map 读的就是它，别让预演污染下游的标签来源）
+        preview = ds.pipe_dir / "rename_map.preview.csv"
+        write_csv(preview, rows)
+        print(f"[rename] 预演：{total_rows} 张将重排为 {first:0{digits}d}…{last:0{digits}d}"
+              f"；对照表 {preview}（加 --apply 执行；权威表 rename_map.csv 不动）")
+        return {"count": total_rows, "map": str(preview), "applied": False}
+
+    # 只追加（真实使用踩过）：早先这里直接覆盖 rename_map.csv，第二批 rename
+    # （--start 27）一跑，第一批 26 行的 post_id/tags_full 就没了。
+    map_path = ds.pipe_dir / "rename_map.csv"
+    merged: list[dict] = []
+    seen_old: set[str] = set()
+    if map_path.exists():
+        with open(map_path, encoding="utf-8", newline="") as fh:
+            for old_row in csv.DictReader(fh):
+                key = old_row.get("old_name", "")
+                if key and key in {r["old_name"] for r in rows}:
+                    continue          # 同一张图重排过：以本次为准
+                if key and key in seen_old:
+                    continue
+                seen_old.add(key)
+                merged.append(old_row)
+    merged.extend(rows)
+    write_csv(map_path, merged)
+    batch_path = ds.pipe_dir / f"rename_map.{first:0{digits}d}-{last:0{digits}d}.csv"
+    write_csv(batch_path, rows)
+
+    st = state.load(ds)
+    for row in rows:
+        st.link_rename(
+            row["new_name"], row["old_name"],
+            post_id=row["post_id"], source=row["source"], created_at=row["created_at"],
+            width=row["width"], height=row["height"], url=row["url"],
+            origin="A+booru" if row["tags_full"] else "A=none",
+            history={"what": "rename", "from": row["old_name"]},
+        )
+    st.add_batch(first, last, total_rows, batch_path.name)
+    st.save()
+
+    print(f"[rename] {total_rows} 张已重排为 {first:0{digits}d}…{last:0{digits}d} -> {ds.images_dir}")
+    print(f"         对照表 {map_path}（累计 {len(merged)} 行，只追加）　本批快照 {batch_path.name}")
+    if sidecars:
+        print(f"         随图搬运的 .txt 边车：{sidecars} 个")
+    print(f"         状态 {st.path.name}（per_image.json：编号/来源/post_id/旧名的唯一事实来源）")
+    return {"count": total_rows, "map": str(map_path), "batch": str(batch_path),
+            "rows": len(merged), "state": str(st.path), "applied": True}
 
 
 def load_rename_map(ds) -> dict[str, dict]:
+    """new_name -> 对照行。
+
+    表是**只追加**的（每个批次都往里加，见 cmd_rename），同一 new_name 出现多次时
+    以最后一行（最新批次）为准。
+    """
     path = ds.pipe_dir / "rename_map.csv"
     if not path.exists():
         return {}
+    out: dict[str, dict] = {}
     with open(path, encoding="utf-8", newline="") as fh:
-        return {r["new_name"]: r for r in csv.DictReader(fh)}
+        for row in csv.DictReader(fh):
+            key = row.get("new_name") or ""
+            if key:
+                out[key] = row
+    return out
+
+
+def load_rename_by_old(ds) -> dict[str, dict]:
+    """old_name -> 对照行（反查：wash 需要从当前编号找回下载时的文件名与 post_id）。"""
+    out: dict[str, dict] = {}
+    for row in load_rename_map(ds).values():
+        old = row.get("old_name") or ""
+        if old:
+            out[old] = row
+    return out

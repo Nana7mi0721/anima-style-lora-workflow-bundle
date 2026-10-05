@@ -15,3 +15,7 @@ node_modules/
 *.log
 .animasl/
 test/**/*.log
+
+# 复盘素材（本机保留，不进仓库）：那次真实使用的 session 日志（含完整对话与 60 张图）与总结
+dsh-session-session-*/
+实际任务总结.md

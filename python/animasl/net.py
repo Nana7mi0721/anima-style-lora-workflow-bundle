@@ -150,6 +150,27 @@ def curl_available() -> bool:
     return _curl_ok
 
 
+def curl_status(proxy: str, url: str, timeout: float = 8.0) -> int:
+    """Bare reachability probe for the doctor matrix: proxy + url -> HTTP code (0 = failed).
+
+    不设 UA/认证，只回答「这个出口能不能到」；socks5 在 curl 侧原生可用（requests 需要 pysocks）。
+    """
+    if not curl_available():
+        return 0
+    args = [CURL_BIN, "-sS", "-o", os.devnull, "-w", "%{http_code}", "-L",
+            "--max-time", str(int(max(1, timeout)))]
+    if proxy:
+        args += ["-x", proxy]
+    args.append(url)
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 10,
+                             encoding="utf-8", errors="replace")
+        code = (out.stdout or "").strip()
+        return int(code) if code.isdigit() else 0
+    except Exception:
+        return 0
+
+
 def _curl_args(s: Any, timeout: int, url: str = "") -> list[str]:
     args = [CURL_BIN, "-sS", "-L", "--max-time", str(int(timeout)), "--retry", "2"]
     proxy = getattr(s, "_animasl_proxy", "") or ""

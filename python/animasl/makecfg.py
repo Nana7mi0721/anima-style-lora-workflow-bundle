@@ -18,7 +18,7 @@ import math
 import time
 from pathlib import Path
 
-from . import curate
+from . import curate, dicts, state, wash
 
 KINDS = {
     "style": {"name": "画师风格", "rank_band": {16: (8e-5, 1.5e-4), 32: (5e-5, 1e-4),
@@ -85,7 +85,8 @@ def collect_subsets(ds, subdirs: list[str] | None, base: Path | None = None) -> 
 def plan(ds, subsets: list[dict], kind: str = "style", trigger: str = "",
          dim: int | None = None, lr: float | None = None, epochs: int | None = None,
          resolution: int = 1280, batch: int = 1, grad_accum: int = 1,
-         repeats: dict[str, int] | None = None) -> dict:
+         repeats: dict[str, int] | None = None,
+         allow_out_of_band: bool = False) -> dict:
     kind = kind if kind in KINDS else "style"
     k = KINDS[kind]
     total = sum(s["count"] for s in subsets)
@@ -126,9 +127,15 @@ def plan(ds, subsets: list[dict], kind: str = "style", trigger: str = "",
     if band:
         lo, hi = band
         if not (lo <= lr_use <= hi):
-            warn = (f"LR {lr_use:g} 不在 Rank {rk} 的允许区间 {lo:g}~{hi:g}；"
-                    f"已按区间下限收紧为 {lo:g}")
-            lr_use = lo
+            # 真实使用里这条被静默收紧成区间下限（5e-05 -> 8e-05），用户根本没看见。
+            # 现在改成报错：要么按区间取值，要么显式 --allow-out-of-band 说明你知道自己在干什么。
+            if not allow_out_of_band:
+                raise SystemExit(
+                    f"[makecfg] LR {lr_use:g} 不在 Rank {rk}（{k['name']}）的建议区间 {lo:g}~{hi:g}。\n"
+                    f"          直接用区间内的值（如 {lo:g}~{hi:g}，或按类型默认 {k['lr']:g}），\n"
+                    f"          或加 --allow-out-of-band 明确表示「我知道，照写」。")
+            warn = (f"LR {lr_use:g} 超出 Rank {rk} 的建议区间 {lo:g}~{hi:g}"
+                    f"（--allow-out-of-band 已放行，未改动）")
     return {
         "kind": kind, "kind_name": k["name"], "trigger": trigger,
         "count": total, "subsets": subsets, "repeats": reps,
@@ -269,12 +276,107 @@ def _rationale(p: dict, name: str, cfg_dir: Path) -> str:
 """
 
 
+def _toml_kv(text: str) -> dict[str, str]:
+    """Flat `key = value` map of a toml file (enough to diff two configs)."""
+    out: dict[str, str] = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "[")) or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _preflight(ds, p: dict, cfg_dir: Path, name: str, stage1_text: str,
+               old_stage1: str = "") -> str:
+    """C2：写盘前把「这次配置的依据」落成 preflight.txt —— 图片数、caption 合规率、
+    词典外标签、rank/LR/epoch/steps 推导、与上一版配置的差异。
+
+    为什么需要：makecfg 会静默决定 rank/LR/epoch，真实使用里 LR 被悄悄改了而没人看见。
+    """
+    lines = [f"# makecfg preflight — {name}",
+             f"# {time.strftime('%Y-%m-%d %H:%M:%S')}   kind={p['kind']}({p['kind_name']})",
+             ""]
+    lines.append(f"图片      {p['count']} 张")
+    for s in p["subsets"]:
+        lines.append(f"          {s['name']:<14} {s['count']:>5} 张 × {p['repeats'].get(s['name'], 1)}")
+    health: dict = {}
+    unknown: list[str] = []
+    zombie: list[str] = []
+    try:
+        rules = wash.load_rules(ds)
+        health = state.caption_health(ds, trigger=p.get("trigger") or "",
+                                      min_tags=int(rules.get("min_tags") or 20),
+                                      max_tags=int(rules.get("max_tags") or 45))
+        lines.append(f"caption   有 txt {health['captions']} / 图 {health['images']}"
+                     f"；缺 txt {health['missing_txt']}；空 {health['empty']}"
+                     f"；孤立 txt {health['orphan_txt']}")
+        lines.append(f"          标签数 min {health['min_tags']} / avg {health['avg_tags']}"
+                     f" / max {health['max_tags']}；低于下限 {health['under_min']}"
+                     f"；高于上限 {health['over_max']}")
+        lines.append(f"          触发词不在首位 {health['trigger_not_first']}"
+                     f"；出现两次以上 {health.get('trigger_twice', 0)}")
+        td = dicts.load(ds.cfg)
+        seen: set[str] = set()
+        for f in (ds.images() or ds.raw_images()):
+            txt = f.with_suffix(".txt")
+            if not txt.exists():
+                continue
+            for tag in txt.read_text(encoding="utf-8", errors="replace").split(","):
+                tag = tag.strip()
+                if tag and not tag.startswith("@"):
+                    seen.add(tag)
+        for tag in sorted(seen):
+            key = wash.lookup_key(tag)
+            rec = td.meta.get(key)
+            if rec is None:
+                unknown.append(tag)
+            elif int(rec.get("post_count") or 0) <= 0:
+                zombie.append(tag)
+        lines.append(f"标签       {len(seen)} 个不同；词典里没有 {len(unknown)}"
+                     f"；post_count=0（幻觉）{len(zombie)}")
+        if unknown:
+            lines.append("          词典里没有：" + ", ".join(unknown[:12])
+                         + (" …" if len(unknown) > 12 else ""))
+        if zombie:
+            lines.append("          post_count=0：" + ", ".join(zombie[:12])
+                         + (" …" if len(zombie) > 12 else ""))
+    except Exception as exc:                      # 体检归体检，别挡住出配置
+        lines.append(f"（caption/标签体检跳过：{exc}）")
+
+    lines += ["",
+              f"rank      {p['network_dim']} / alpha {p['network_alpha']}"
+              f"（由图片数 {p['count']} + kind 决定）",
+              f"LR        {p['learning_rate']:g}"
+              + (f"  ⚠️ {p['lr_warn']}" if p["lr_warn"] else "（在 Rank 建议区间内）"),
+              f"epochs    {p['max_train_epochs']}（目标曝光 {p['target_exposure']:g}/图）"
+              f" -> ~{p['steps_per_epoch']} steps/epoch，共 ~{p['total_steps']} steps",
+              f"保存      save_every_n_epochs = {p['save_every_n_epochs']}",
+              f"分辨率    {p['resolution']}  batch {p['batch_size']}"
+              f" × grad-accum {p['gradient_accumulation_steps']}"]
+    if health.get("under_min") or health.get("over_max") or unknown or zombie:
+        lines += ["", "⚠️ 上面有需要你拍板的项：标签数越界 / 词典里查不到的标签。"
+                      "训练前建议先 wash + dict-check 收拾干净。"]
+
+    old_toml = cfg_dir / f"{name}_lora_stage1.toml"
+    if old_stage1 or old_toml.exists():
+        old = _toml_kv(old_stage1 or old_toml.read_text(encoding="utf-8", errors="replace"))
+        new = _toml_kv(stage1_text)
+        diff = [f"  {k}: {old.get(k, '(无)')} -> {new[k]}"
+                for k in sorted(new) if k in old and old[k] != new[k]]
+        lines += ["", "与上一版配置的差异：" + ("（无）" if not diff else "")]
+        lines += diff
+    return "\n".join(lines) + "\n"
+
+
 def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "style",
                 subdirs: list[str] | None = None, dim: int | None = None,
                 lr: float | None = None, epochs: int | None = None,
                 resolution: int = 1280, batch: int = 1, grad_accum: int = 1,
                 repeats: dict[str, int] | None = None, apply: bool = False,
-                dataset_dir: str | None = None, force: bool = False) -> dict:
+                dataset_dir: str | None = None, force: bool = False,
+                allow_out_of_band: bool = False) -> dict:
     name = name or ds.name
     cfg = ds.cfg
     base = Path(dataset_dir) if dataset_dir else ds.root
@@ -288,7 +390,8 @@ def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "sty
         raise SystemExit(f"[makecfg] 子目录不存在: {missing}")
 
     p = plan(ds, subsets, kind=kind, trigger=trigger, dim=dim, lr=lr, epochs=epochs,
-             resolution=resolution, batch=batch, grad_accum=grad_accum, repeats=repeats)
+             resolution=resolution, batch=batch, grad_accum=grad_accum, repeats=repeats,
+             allow_out_of_band=allow_out_of_band)
 
     models = Path(cfg.models_dir)
     paths = {
@@ -310,6 +413,11 @@ def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "sty
     dataset_toml = _toml_dataset(p, cfg_dir, name)
     bat = _bat(p, paths, cfg_dir, name)
     rationale = _rationale(p, name, cfg_dir)
+    old_stage1 = ""
+    old_path = cfg_dir / f"{name}_lora_stage1.toml"
+    if old_path.exists():
+        old_stage1 = old_path.read_text(encoding="utf-8", errors="replace")
+    preflight = _preflight(ds, p, cfg_dir, name, stage1, old_stage1)
 
     print(f"[makecfg] {name}  {p['kind_name']}  {p['count']} 张  "
           f"rank {p['network_dim']}  lr {p['learning_rate']:g}  "
@@ -321,7 +429,8 @@ def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "sty
 
     if not apply:
         print(f"[makecfg] 预演模式（加 --apply 写盘）-> {cfg_dir}")
-        return {"plan": p, "written": []}
+        print(preflight.rstrip())
+        return {"plan": p, "written": [], "preflight": preflight}
 
     cfg_dir.mkdir(parents=True, exist_ok=True)
     targets = {
@@ -329,6 +438,7 @@ def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "sty
         cfg_dir / f"dataset_{name}.toml": dataset_toml,
         cfg_dir / f"train_{name}.bat": bat,
         cfg_dir / "rationale.md": rationale,
+        cfg_dir / "preflight.txt": preflight,
     }
     for path, text in targets.items():
         if path.exists() and not force:
@@ -336,5 +446,6 @@ def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "sty
             path.rename(backup)
             print(f"    (已备份旧文件 -> {backup.name})")
         path.write_text(text, encoding="utf-8", newline="\n")
-    print(f"[makecfg] 已写入 4 个文件 -> {cfg_dir}")
-    return {"plan": p, "written": [str(t) for t in targets]}
+    print(f"[makecfg] 已写入 {len(targets)} 个文件 -> {cfg_dir}")
+    print(f"[makecfg] 依据与差异见 {cfg_dir / 'preflight.txt'}")
+    return {"plan": p, "written": [str(t) for t in targets], "preflight": preflight}

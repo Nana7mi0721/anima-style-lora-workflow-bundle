@@ -1,6 +1,6 @@
 ---
 name: anima-style-lora-curate
-description: Anima 风格 LoRA 训练集的筛选与清理指南：md5/pHash/SSIM 三级去重阈值、"低质量/过老/草图/非完整制作"的判定规则与视觉复核协议、图片文字与拟声词的检测（RF-DETR-Seg）与修补（LaMa-manga）流程、koharu GUI 半自动回退、剔除清单的写法。用户要求"筛选数据集/去重/删掉低质量或草图/去掉图里的文字/清理训练集"时使用。
+description: Anima 风格 LoRA 训练集的筛选与清理指南：导入素材的 src 红线、md5/pHash/SSIM 三级去重阈值、"低质量/过老/草图/非完整制作"的判定规则与视觉复核协议、图片文字与拟声词的检测（RF-DETR-Seg）与修补（LaMa-manga）流程、koharu GUI 半自动回退、单张改 caption（fix-caption）与查标签是否真实存在（dict-check）、剔除清单的写法。用户要求"筛选数据集/去重/删掉低质量或草图/去掉图里的文字/清理训练集/改某张图的标签/查这个标签有没有"时使用。
 ---
 
 # SKILL：数据集筛选与清理
@@ -10,6 +10,18 @@ description: Anima 风格 LoRA 训练集的筛选与清理指南：md5/pHash/SSI
 1. **只移动，不删除**。所有被剔除的图移到 `_excluded/<reason>/`，并写 `_EXCLUDED_MANIFEST.json`（记录原文件名、来源、命中规则、判定依据）。用户复核后要能一键找回。
 2. **主观项必须给用户看清单再动手**。"古老""草图"是判断而非事实，dry-run 的清单是给用户拍板的，不是给自己看的。
 3. **风格 LoRA 要覆盖不要纯净**。同一画师的早期/近期/不同题材都要留（这正是子文件夹 `before/latest/present` 的意义）；剔的是「不是完整作品」和「有文字噪声」，不是「画得一般」。
+
+## §0.5 导入（import）的 src 红线
+
+```
+anima_stage(stage:"import", dataset:"X", src:"D:/下载/某画师")      # 默认就导入（不是 apply）
+anima_stage(stage:"import", dataset:"X", src:"D:/下载/某画师", dryRun:true)   # 只看清单
+```
+
+- **`src` 只能是素材目录或压缩包**。传数据集目录本身、或它的上级目录，会被**直接拒绝**——真实使用里传过一次数据集根，结果 `images/`+`thumbs/`+`masks/` 共 139 个文件被卷进 `00_raw`，只能手工捞回来。已经卷进去的：看 `_excluded/_import_overflow/`，或按文件名把非素材图从 `00_raw` 移走。
+- 递归时会跳过**数据集内**的保留目录（`00_raw` / `images` / `thumbs` / `masks` / `_pipeline` / `_excluded`）；数据集**外面**的同名目录不跳（那是正常的素材目录）。
+- 非图文件（zip 之外的 mp4/psd 等）不再静默：会打印「跳过非图 N 个」并列前几个扩展名，也不写进 `raw_posts.jsonl`。
+- `fetch` 同样是「默认就下载」，预演用 `dryRun:true`；`import`/`fetch` 都**没有 `apply`**。
 
 ## §1 去重（dedup）
 
@@ -101,6 +113,33 @@ koharu 0.83.1 是 **GUI-only**（CLI 只有 `-h/-V`，旧的 `--port 7331 --head
 - 自动管线失败（模型加载不了、显存不够、结果明显不可用）时，回退：让用户手动打开 `D:\Program\koharu\koharu.exe`，在 GUI 里对失败的那批图跑「检测 + 修补」，导出结果。
 - skill 负责：**准备输入**（把待处理图/掩膜清单整理好，给出明确的操作步骤）、**回收校验**（对返回值重跑检测，确认文字面积占比已降到阈值下、分辨率与原图一致）。
 - 不要试图脚本化 koharu：它的资产存在内容寻址的 `.khrproj` 里，没有对外接口。
+
+## §3.5 改 caption 与查标签（fix-caption / dict-check）
+
+看图补标之后、或者你觉得某个标签写错了，**不要手工编辑 `images/*.txt`**——`wash` 是整条重建的，你的改动会被冲掉（真实使用里为此刻意绕开插件、自己写了 `_trim2.py`/`_add_vision.py` 三个脚本）。
+
+用 `fix-caption` 点名单张图增量修：
+
+```
+anima_stage(stage:"fix-caption", dataset:"X", name:"0007", remove:"solo")                      # dry-run 看新旧对照
+anima_stage(stage:"fix-caption", dataset:"X", name:"0007", add:"multiple views", apply:true)   # 补一个标签
+anima_stage(stage:"fix-caption", dataset:"X", name:"0007", set:"@artist, 1girl, ...", apply:true)  # 整条替换
+```
+
+- 三个参数至少给一个；`set` 优先（给了它 `add`/`remove` 会被忽略）。
+- 改完仍会过一遍洗标 + 形态校验（§9 闸门）；`remove` 掉的标签会记进 `per_image.json` 的人工删除名单，**之后重跑 `wash` 也不会自己回来**。
+- 图名可以用 `0007`、`0007.jpg`、或重排前的旧文件名（会按 `per_image.json` 的 `old_names` 找）。
+
+**补标签前先查词典**（这条是"模型编造标签"的根治手段）：
+
+```
+anima_stage(stage:"dict-check", dataset:"X")                 # 检查现有 caption 里所有标签
+anima_stage(stage:"dict-check", tags:"kimono, obi, wide sleeves")   # 查你打算写的几个词（不用 dataset）
+```
+
+输出分四类：`✓ 存在(名字/类别/出现帖数)`、`↪ 别名可归一`（词典里没有这个写法，但洗标引擎的别名表会把它换成现行形，照写没问题）、`! post_count=0`（danbooru 上**没有这张图** ⇒ 按指南 §7.7 属幻觉标签，**禁止写**）、`! 词典里没有`（拼错或已不是现行形，会给形近候选；多词标签被拆开时会直说"整条不存在，但每个词单独存在"）。从 `--dataset` 收集时每个问题标签还会带上"出现在几张图里"，最普遍的问题排在最前。
+
+实测过的那三条（用户问过）：`see through` → 归一成 **`transparent`**（danbooru 把 see-through 并进了它，词典里只剩 `see-through_hat` 这类派生）；`fate` → 归一成 **`fate (series)`**，随后被"IP 系列名永不添加"整类丢掉（正解：IP 根本不该写）；`erect nipples` → **不存在这种标签**，归一成 `nipples` 保留可见特征。**注意 `--tags` 只按逗号切**，多词标签请照 caption 的空格形整条写（`amiya (arknights)` 而不是 `amiya`+`(arknights)`）。
 
 ## §4 不设内容边界
 

@@ -30,9 +30,11 @@
     "test:route": "node test/settings-route.mjs",
     "test:route:doctor": "node test/settings-route.mjs --doctor",
     "test:py": "python test/net-offline.py",
-    "test:all": "npm run check:patch && npm run test:client && npm run test:route && npm test",
+    "test:all": "npm run check:patch && npm run test:params && npm run test:client && npm run test:route && npm run test:py && npm run test:pipeline && npm test",
     "check:patch": "node test/check-patch.mjs",
-    "doctor": "node -e \"import('./lib/run.js').then(()=>console.log('ok'))\""
+    "doctor": "node -e \"import('./lib/run.js').then(()=>console.log('ok'))\"",
+    "test:params": "node --import ./test/stub/register.mjs test/params.mjs",
+    "test:pipeline": "python test/pipeline-offline.py"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.0",

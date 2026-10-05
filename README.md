@@ -12,7 +12,8 @@ DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 →
 | 宿主插件 `dsh-anima-style-lora` | 4 个工具：`anima_status` / `anima_stage` / `anima_job` / `anima_doctor`，插在插件树根层级，对所有 agent 可见 |
 | agent 预设 `anima-style-lora`（显示名「Anima风格LoRA全流程」） | 带专属 persona 的 agent 组合；`skill-filesystem` 通过 `customSkillDirs` 挂载本包的 `skills/` |
 | 3 个 skill | `anima-style-lora-pipeline`（总纲）/ `-source`（选源下载）/ `-curate`（筛选 + 文字修补 + 视觉复核） |
-| Python 工具箱 `python/animasl/` | 确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
+| 设置页（浏览器半侧 + 宿主路由 `/anima-lora/api`） | 在 DSH 设置里直接改全部配置项（含凭据），写进 `<home>/.animasl/animasl.config.json`，下次调用即生效 |
+| Python 工具箱 `python/animasl/` | 15 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
 
 ## 安装
 
@@ -57,18 +58,32 @@ npm run test:client   # 设置页浏览器半侧：假 React 渲染 + 断言发�
 npm run test:route    # 设置页宿主路由：真起 http server + 真 Python CLI（含信任栅栏）
 npm run test:route:doctor  # 上面那条再加一次真 doctor（慢约 1 分钟）
 npm run test:py       # 离线：Cloudflare 挑战识别 + curl 参数 + cookie 域隔离 + 凭据优先级
-npm run test:all      # check:patch + client + route + smoke
+npm run test:params   # 离线：参数矩阵（哪些阶段不吃 apply）+ 两个工具的返回 schema 一致
+npm run test:pipeline # 离线端到端：init→…→verify→dict-check→makecfg（临时数据集，跑完自删）
+npm run test:all      # 上面全部（check:patch + params + client + route + py + pipeline + smoke）
 ```
 
-`npm run test:py` 需要带 `requests` 的解释器（本机是
+`npm run test:py` / `test:pipeline` 需要带 `requests` / `Pillow` 的解释器（本机是
 `E:/LoRA_Train/.animasl/venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
-`SKIP` 并返回 0）：
+`SKIP` 并返回 0）。
+
+`test/pipeline-offline.py` 是**唯一一条把 15 个阶段串起来跑**的回归：在 `<home>/datasets`
+下建 `_pipeoff_*` 临时现场（`_` 前缀，`anima_status` 看不见），用真 CLI 走
+init → import（含"跳过非图"与"拒绝 src=数据集根"）→ rename → thumbs（重排之后仍出图）
+→ 第二批 import + rename（验证对照表只追加）→ wash（触发词置首、并入图源标签、
+**人工删掉的标签不复活**、`refreshSource` 才整体重洗）→ fix-caption 三种用法 →
+verify → dict-check → makecfg（LR 超区间报错、`allowOutOfBand` 放行、`preflight.txt` 的
+差异段），共 34 条断言，跑完删现场（`--keep` 保留）。它抓到过：`import`/`fetch` 其实没有
+`apply`、wash 会把标签规范成空格形、缩略图落在 `_pipeline/thumbs` 而不是数据集根。
 
 `test/smoke.mjs` 把插件装进一个假 ctx（`test/stub/` 用 ESM loader 钩子把
 `@deepseek-ai/dsh-tools` 指到替身），校验注册数量、返回值无 `undefined`、
 返回值满足自己声明的 `output.schema`、`render()` 有非空正文、disposer 能卸干净。
 它抓到过三个真 bug：`require()` 用在 ESM 里导致报告行数恒为 0、`stageOf()` 认不出
 无 `--dataset` 的 doctor、`collect()` 把报告数组塞进声明为 string 的字段。
+`test/params.mjs` 就是为最后一个类目补的闸门：它断言 `anima_stage` 与 `anima_job`
+**共用同一份返回 schema**（曾经 `anima_job` 少声明 5 个键，宿主直接判
+`"value.command" is not a declared property`，导致 detach 的后台结果永远取不回来）。
 
 `test/client-smoke.mjs` 用一个极简 React 替身（本机没有 react，它由 web shell
 的平台模块表提供）把设置页真的渲染出来，再模拟输入与点击，断言发出去的 HTTP
@@ -121,28 +136,50 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 
 插件的 `config`（在 profile 的 `cordis.patch.yml` 里改）：`home` / `pythonDir` / `python` / `mlPython` / `runtimeDir` / `animaLoraDir` / `timeoutMs` / `longTimeoutMs`。
 
-## 十三个阶段
+## 十五个阶段
 
 | stage | 工具参数要点 | 产出 |
 |---|---|---|
-| `init` | `--trigger @xx` | `_pipeline/manifest.json` |
-| `fetch` | `source=yandere\|danbooru\|pawchive\|exhentai`、`tags`/`creator`/`gallery`、`limit`、`cookies` | `00_raw/` + `raw_posts.jsonl` |
-| `import` | `src=<目录>`、`move` | 解包/收编进 `00_raw/` |
-| `dedup` | `phashDistance`(4)、`ssim`(0.97) | `dedup_report.csv`，`apply` 时移入 `_excluded/duplicates/` |
+| `init` | `trigger`、`kind`、`force`、`reset`+`yes` | `_pipeline/manifest.json` |
+| `fetch` | `source=yandere\|danbooru\|pawchive\|exhentai`、`tags`/`creator`/`gallery`、`limit`、`cookies`；`dryRun` 预演 | `00_raw/` + `raw_posts.jsonl` |
+| `import` | `src=<素材目录或压缩包>`、`move`、`noUnpack`；`dryRun` 预演 | 解包/收编进 `00_raw/` |
+| `dedup` | `phashDistance`(4)、`ssim`(0.995)、`includeImages` | `dedup_report.csv`，`apply` 时移入 `_excluded/duplicates/` |
 | `screen` | `minShortSide`(512)、`minBytes`(102400)、`earliest`(2015-01-01) | `screen_report.csv` + `review_queue.csv` |
-| `thumbs` | `maxSide`(1536) | `_pipeline/thumbs/`（视觉子代理只能看这个） |
+| `thumbs` | `maxSide`(1536)、`prune`、`includeImages` | `_pipeline/thumbs/`（视觉子代理只能看这个） |
 | `text` | `warnRatio`(0.08)、`dropRatio`(0.30)、`patchSmall`、`thresholds`、`dilate`(6) | `masks/`、`text_report.csv`；修补后自动把 `wash` 标 stale |
-| `rename` | `start`(1)、`digits`(4) | `images/0001.ext` + `rename_map.csv` |
-| `wash` | `trigger`、`rules` | `images/NNNN.txt` + `wash_report.csv` + `review_todo.csv` |
+| `rename` | `start`(1)、`digits`(4)、`move` | `images/0001.ext` + `rename_map.csv`（只追加）+ `per_image.json` |
+| `wash` | `trigger`、`rules`、`refreshSource`、`noImages` | `images/NNNN.txt` + `wash_report.csv` + `review_todo.csv` |
 | `review-list` / `apply-review` | `payload` | 看图必答字段的往返 |
-| `verify` | `online` | `wash_verify.csv`；§3 形态 + §9 内容闸门（BANNED 残留、否定式、质量词、人数一致性、图-txt 配对） |
-| `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution` | 三件套 + `rationale.md` |
+| `fix-caption` | `name`(必填)、`add`/`remove`/`set` 三选一 | 只改点名的那一张 caption |
+| `verify` | `online`、`sample`、`trigger` | `wash_verify.csv`；§3 形态 + §9 内容闸门（BANNED 残留、否定式、质量词、人数一致性、图-txt 配对、触发词位置） |
+| `dict-check` | 不给 `tags` 就查现有 caption（只按逗号切，多词标签不会被拆） | 终端输出：存在 / 别名可归一 / `post_count=0`（幻觉标签）/ 词典外 + 形近候选，各带"出现在几张图里" |
+| `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution`、`allowOutOfBand` | 四件套 + `preflight.txt` |
 
-**除了 `init` 之外，所有写盘动作默认 dry-run，必须 `apply: true`。**
+**写盘语义按阶段分三类**（传了不支持的参数会在**执行前**报错，错误里列出该阶段支持的参数）：
 
-**dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。
+| 类别 | 阶段 | 规则 |
+|---|---|---|
+| 写盘是默认行为 | `init`、`thumbs` | **不吃 `apply`**；`init` 靠 `force`/`reset` 控制 |
+| 默认写盘、`dryRun` 反转 | `fetch`、`import` | 预演用 `dryRun:true` |
+| 默认 dry-run、要 `apply:true` | `dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`makecfg` | 不带就只出报告 |
+| 只读 | `status`、`review-list`、`verify`、`dict-check` | 没有 `apply` |
+
+**dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子）。
 
 **重复 `init` 不会毁掉进度**：数据集已存在时 `init` 只打印提示就返回；`init --force` 是**就地更新**触发词/类型（阶段记录全部保留），只有 `init --reset --yes` 才会丢掉阶段记录从零重建——`--reset` 不带 `--yes` 会先把「当前已完成：init, wash」列出来让你确认。类型（`--kind`）决定 wash 的整类规则，中途改类型是安全的：`--force` 改完从 `wash` 起重跑即可。
+
+### 状态文件的所有权（谁写、谁读）
+
+一次真实跑批（72 张，见下）的复盘结论：**技术卡点都顺，成本全花在「谁覆盖谁」上**。所以所有权写死：
+
+| 文件 | 谁写 | 谁读 | 规矩 |
+|---|---|---|---|
+| `images/<stem>.txt` | `wash` / `apply-review` / `fix-caption` | 所有下游（`verify`/`makecfg`） | **caption 的唯一权威副本**；要改走 `fix-caption`，别手改文件再重跑 `wash` |
+| `_pipeline/per_image.json` | `rename` / `wash` / `apply-review` / `fix-caption` | 引擎自己 | **只追加**：`old_names`/`merged_tags` 取并集、`history` 留最近 30 次；坏文件会改名 `.json.broken` 并从空状态继续 |
+| `_pipeline/rename_map.csv` | `rename` | `wash`（按 `old_name` 回查 booru 标签） | **只追加**，多批次共存 + 每批快照 `rename_map.<first>-<last>.csv`；预演只写 `rename_map.preview.csv` |
+| `raw_posts.jsonl` | `fetch` / `import` | `rename`、`wash`（来源 A） | 只追加，按 `(filename, post_id)` 去重合并 |
+
+**`wash` 默认不复活人工删掉的图源标签**（拿 `per_image.json` 的 `merged_tags` 与当前 caption 比对，差值即人工删除），确实要按图源整体重洗时用 `refreshSource:true`。这条就是「手改完 caption 一重跑全回来」那个坑的修法。
 
 ## 文字检测 + 修补（koharu 能力的复刻）
 
@@ -213,20 +250,27 @@ wash   →  caption 的来源 A（booru 标签）+ 来源 C（同名 .txt sideca
 
 `verify` 是**交付前的验收闸门**，按指南 §9 分两层：**形态层**（单行、全小写、无下划线形、` , ` 分隔、无前导逗号、无重复 token、标签数 20~45、触发词唯一且置首、BOM/尾换行/尾标点）与**内容层**（BANNED 令牌零残留＝画师/IP/meta/质量词/文字族/否定式/该换现行形的别名、人数一致性 = `solo` 与 `2girls`/`1boy`/`solo focus` 互斥、图-txt 配对完整含孤儿 `.txt`）。内容层是给"人工编辑过、或别的打标工具写的"caption 兜底的：`wash` 跑完再手改，画师/IP/质量词就会悄悄回来。`--online` 再用 danbooru `search[name_comma]` 复核"词典里没有"的标签是否真实存在（每批 120）。实测在用户的 63 张既有 caption 上查出 23 种残留（`explicit`×30、`sensitive`×17、`nsfw`×15、`blue archive`×9、`(series)`×8、`pantsu→panties`/`garter→garter belt`/`swimsuits→swimsuit` 等别名形）。
 
-## 训练配置三件套
+## 训练配置：四件套 + preflight.txt
 
 `makecfg` 依据用户自己的《Anima_LoRA_调参指南》决策表：Rank–LR 联动（风格 100+ 张 → dim 32 / lr 5e-5~8e-5）、曝光量算 steps、差异化 repeat、显存档。
 
 生成物严格不含 Anima 无效参数（`noise_offset`、`min_snr_gamma`），`shuffle_caption` 恒 false（`cache_text_encoder_outputs=true` 时 trainer 强制要求），`network_module` 恒 `networks.lora_anima`。默认 `resolution=[1280,1280]`（与既有 11 个可跑配置一致；8GB OOM 时退 1024）。
+
+每次还会写一份 **`preflight.txt`**（开跑前的体检单）：图片数与各子集 repeats、caption 合规率（标签数 min/avg/max、<20 / >45 计数、触发词不在首位）、**词典外与 `post_count=0` 的标签清单**、rank/LR/epochs→steps/save_every 的推导过程、分辨率与 batch，以及**与上一版配置的逐字段差异**（首版没有旧文件时不输出差异段）。这样"这版配置为什么这么写、跟上次差在哪"不用再翻聊天记录。
+
+**LR 超出该 rank 的建议区间会直接报错**（不再静默收紧）：报错文案会给出区间，要么用区间内的值，要么显式 `allowOutOfBand:true`——那时**不改值**、只在 preflight 与终端打一行警告。真实使用里给过 `lr 5e-05 / dim 16`，旧版把它悄悄改成 `8e-05`，用户没看见。
+
+`makecfg` 重跑会覆盖已有配置：旧文件先改名成 `<名字>.bak<时分秒>` 备份，`force:true` 则不备份。
 
 ## 目录契约
 
 ```
 datasets/<name>/
   00_raw/            下载/导入的原始文件
-  images/            重排编号后的工作集（图片 + 同名 .txt caption）
-  _pipeline/         manifest.json、*_report.csv、masks/、thumbs/、orig_text/、rename_map.csv
+  images/            重排编号后的工作集（图片 + 同名 .txt caption）★ caption 权威副本
+  _pipeline/         manifest.json、per_image.json、*_report.csv、masks/、thumbs/、orig_text/、rename_map.csv
   _excluded/         剔除物（按 reason 分子目录）+ _EXCLUDED_MANIFEST.json 证据链
+train_configs/<name>/  <name>_lora_stage1.toml + dataset_<name>.toml + train_<name>.bat + rationale.md + preflight.txt
 ```
 
 **只移动不删除。** 每条剔除都记 `_EXCLUDED_MANIFEST.json`：`{original, reason, rule, detail, decided_by}`。

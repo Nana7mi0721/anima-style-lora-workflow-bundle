@@ -88,9 +88,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--include-images", action="store_true")
     _apply(sp)
 
-    sp = add("thumbs", "生成缩略图（视觉子代理只能看这个）")
+    sp = add("thumbs", "生成缩略图（视觉子代理只能看这个；有 images/ 就用它，否则 00_raw）")
     sp.add_argument("--max-side", type=int, default=1536)
     sp.add_argument("--include-images", action="store_true")
+    sp.add_argument("--prune", action="store_true", help="删掉没有对应原图的陈旧缩略图")
 
     sp = add("text", "检测图中文字并修补（rfdetr + lama）")
     sp.add_argument("--warn-ratio", type=float, default=0.0)
@@ -116,16 +117,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--trigger", default="")
     sp.add_argument("--no-images", action="store_true", help="处理 00_raw 而不是 images")
     sp.add_argument("--rules", default="", help="额外规则 JSON 文件")
+    sp.add_argument("--refresh-source", action="store_true",
+                    help="按图源标签整体重洗（默认不复活人工删掉的标签）")
     _apply(sp)
 
     sp = add("review-list", "列出需要看图补全的图")
     sp = add("apply-review", "把视觉子代理的结果合并回 caption")
     sp.add_argument("--payload", required=True, help="子代理返回的 JSON")
+    sp.add_argument("--trigger", default="", help="覆盖触发词（默认取 manifest.trigger）")
+    _apply(sp)
+
+    sp = add("fix-caption", "增量修一张图的 caption（补/删/整条替换，不用外面写脚本）")
+    sp.add_argument("--name", required=True, help="图片名或编号（0001 / 0001.jpg / 旧文件名都行）")
+    sp.add_argument("--add", default="", help="补标签，逗号分隔；照样过 wash 规则")
+    sp.add_argument("--remove", default="", help="删标签，逗号分隔；记入人工删除名单，重跑 wash 不复活")
+    sp.add_argument("--set", default="", help="整条替换成这段 caption")
+    sp.add_argument("--trigger", default="")
     _apply(sp)
 
     sp = add("verify", "校验全部 caption 是否违反硬约束")
     sp.add_argument("--online", action="store_true")
     sp.add_argument("--sample", type=int, default=0)
+    sp.add_argument("--trigger", default="", help="覆盖触发词（默认取 manifest.trigger）")
+
+    sp = add("dict-check", "查一批标签在词典里的真实存在性与 category/post_count（消灭编造标签）",
+             required=False)
+    sp.add_argument("--tags", default="", help="逗号或空格分隔的标签；省略则读数据集 caption 里的全部标签")
+    sp.add_argument("--limit", type=int, default=0, help="最多检查多少个不同的标签")
 
     sp = add("makecfg", "生成训练配置三件套")
     sp.add_argument("--name", default="")
@@ -140,9 +158,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--dataset-dir", default="")
     sp.add_argument("--trigger", default="")
     sp.add_argument("--force", action="store_true")
+    sp.add_argument("--allow-out-of-band", action="store_true",
+                    help="明知 LR 超出该 rank 的建议区间也照写（默认报错让你确认）")
     _apply(sp)
 
     sp = add("doctor", "检查环境：python / torch / rfdetr / 模型 / 代理 / 词典", required=False)
+    sp.add_argument("--proxies", action="store_true",
+                    help="额外跑一遍「HTTP 客户端 × 代理候选」实测矩阵（每个候选 ~10s）")
     sp = add("config", "查看配置分层与每个键的来源（设置页读写的就是 runtime 层）", required=False)
     sp.add_argument("--json", action="store_true", help="输出 JSON（设置页用）")
     sub.add_parser("dict", help="词典缓存信息")
@@ -171,7 +193,139 @@ def _list_datasets(cfg: cfgmod.Config) -> int:
     return 0
 
 
-def _walk_leaves(node, prefix: str = "") -> list[tuple[str, object]]:
+_CATEGORY_NAME = {0: "general", 1: "artist", 3: "copyright", 4: "character", 5: "meta"}
+
+
+def _near_tags(td, tag: str, cache: dict, limit: int = 3) -> list[str]:
+    """词典里的形近标签（前缀桶 + difflib；383k 条全表 difflib 太慢）。"""
+    import difflib
+
+    key = wash.lookup_key(tag)
+    if len(key) < 3:
+        return []
+    prefix = key[:3]
+    pool = cache.get(prefix)
+    if pool is None:
+        pool = [n for n in td.meta if n[:3] == prefix]
+        cache[prefix] = pool
+    if not pool:
+        return []
+    scored = sorted(pool, key=lambda n: abs(len(n) - len(key)))[:80]
+    return difflib.get_close_matches(key, scored, n=limit, cutoff=0.6)
+
+
+def _split_caption_tags(text: str) -> list[str]:
+    """caption 里按逗号切标签。
+
+    真实数据踩过：早先这里也按空白切，于是 `amiya (arknights)`（它在 caption 里的空格形
+    正好就是词典键 `amiya_(arknights)`）被拆成 `amiya` + `(arknights)` 两条"查不到"的
+    假标签，报出一屏并不存在的问题标签，而真正的问题标签被埋掉。**caption 的分隔符只有逗号。**
+    """
+    import re as _re
+
+    return [c.strip() for c in _re.split(r"[,，、;；]+", text or "") if c.strip()]
+
+
+def _dict_check(cfg, tags: str, limit: int = 0, ds=None) -> int:
+    """逐个标签查词典：存在吗 / category / post_count；不存在的给形近候选。
+
+    为什么要它：真实使用里 agent 凭印象补了几个 danbooru 上并不存在的标签
+    （`see through`、`fate`、`erect nipples` 这类），只能等 verify --online 才发现。
+    补标签之前先查这里，成本是一次词典加载。
+    """
+    td = dicts.load(cfg)
+    counts: dict[str, int] = {}
+    chunks = _split_caption_tags(tags or "")
+    source = "命令行"
+    if chunks:
+        counts = {t: 0 for t in chunks}
+    elif ds is not None:
+        source = f"数据集 {ds.name} 的全部 caption"
+        for f in (ds.images() or ds.raw_images()):
+            txt = f.with_suffix(".txt")
+            if not txt.exists():
+                continue
+            for t in _split_caption_tags(txt.read_text(encoding="utf-8", errors="replace")):
+                if not t.startswith("@"):
+                    counts[t] = counts.get(t, 0) + 1
+    wanted = sorted(t for t in counts if not t.startswith("@"))
+    if not wanted:
+        print("[dict-check] 没有要查的标签：用 --tags 给一批，或 --dataset 让它在 caption 里收集")
+        return 0
+
+    # 别名表：词典里查不到、但 wash 会归一成现行形的写法（照写也没问题）
+    rules = wash.load_rules(ds) if ds is not None else wash.load_rules(None)
+    aliases = dict(rules.get("aliases") or {})
+    for extra in (rules.get("alias_extra") or []):
+        if extra.get("from"):
+            aliases.setdefault(extra["from"], extra.get("to"))
+    drops = set(rules.get("drop_exact") or [])
+
+    ok: list[tuple[str, str, int]] = []
+    zombie: list[str] = []
+    missing: list[str] = []
+    aliasable: list[tuple[str, str]] = []
+    near_cache: dict = {}
+    for raw_tag in wanted:
+        key = wash.lookup_key(raw_tag)
+        rec = td.meta.get(key)
+        if rec is None:
+            tgt = aliases.get(raw_tag) or aliases.get(raw_tag.replace("_", " "))
+            if isinstance(tgt, list):
+                tgt = " + ".join(str(x) for x in tgt)
+            if tgt:
+                aliasable.append((raw_tag, str(tgt)))
+            elif raw_tag in drops:
+                aliasable.append((raw_tag, "会被 drop_exact 丢弃"))
+            else:
+                missing.append(raw_tag)
+        elif int(rec.get("post_count") or 0) <= 0:
+            zombie.append(raw_tag)
+        else:
+            ok.append((raw_tag, _CATEGORY_NAME.get(int(rec.get("category") or 0),
+                                                  str(rec.get("category"))),
+                       int(rec.get("post_count") or 0)))
+
+    show = limit or 30
+    counts_of = lambda t: f"×{counts[t]} 张" if counts.get(t) else ""  # noqa: E731
+    print(f"[dict-check] 查 {len(wanted)} 个标签（{source}；词典 {td.size()} 条）")
+    print(f"  存在 {len(ok)}　别名可归一 {len(aliasable)}　词典里没有 {len(missing)}　"
+          f"post_count=0（幻觉标签）{len(zombie)}")
+    for name, cat, posts in sorted(ok, key=lambda r: -r[2])[:show]:
+        print(f"  ✓ {name:<38} {cat:<10} {posts:>10,} posts")
+    if len(ok) > show:
+        print(f"  … 另有 {len(ok) - show} 个存在（省略；要看全部就调大 limit）")
+    if aliasable:
+        print(f"\n  ↪ 词典里没有，但别名表会归一成现行形（可以照写）：")
+        for name, tgt in sorted(aliasable, key=lambda kv: -counts.get(kv[0], 0)):
+            print(f"      {name:<38}{counts_of(name):<8}→ {tgt}")
+    if zombie:
+        print(f"\n  ! post_count=0（danbooru 上没有这张图 -> 按指南 §7.7 属幻觉标签，禁止写）：")
+        for name in zombie[:20]:
+            print(f"      {name:<38}{counts_of(name)}")
+    if missing:
+        print(f"\n  ! 词典里没有（别写；或者这已经不是现行形）：")
+        for name in sorted(missing, key=lambda t: -counts.get(t, 0))[:20]:
+            cands = _near_tags(td, name, near_cache)
+            line = f"      {name:<38}{counts_of(name):<8}"
+            if cands:
+                line += "最接近：" + "、".join(
+                    f"{c}({td.posts(c):,})" if td.posts(c) else c for c in cands)
+            else:
+                words = [w for w in name.split() if td.meta.get(wash.lookup_key(w))]
+                if len(words) >= 2:
+                    line += f"整条不存在（但 {'、'.join(words)} 单独存在 —— 像多词标签被拆开了）"
+                else:
+                    line += "词典里找不到形近项 —— 确认拼写，或先按画面事实换一个真实标签"
+            print(line)
+    if missing or zombie:
+        print("\n  下一步：把存在的那些直接写进 caption；不存在的换成上面的候选，或走 review-list 看图"
+              "补一个真实存在的标签（补完用 wash 重洗 + verify 复核）。")
+    elif aliasable:
+        print(f"  ✓ 没有幻觉标签；上面 {len(aliasable)} 个写法会被别名表归一成现行形。")
+    else:
+        print(f"  ✓ 全部存在，没有幻觉标签。")
+    return 0
     """Flatten a config tree into (dotted key, leaf value) rows."""
     rows: list[tuple[str, object]] = []
     for key, value in (node or {}).items():
@@ -246,8 +400,15 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "status" and not getattr(args, "dataset", None):
         return _list_datasets(cfgmod.Config.load(home=getattr(args, "home", None)))
 
+    if cmd == "dict-check" and getattr(args, "tags", ""):
+        cfg = cfgmod.Config.load(home=getattr(args, "home", None))
+        return _dict_check(cfg, args.tags, getattr(args, "limit", 0), None)
+
     ds = _ds(args)
     ds.ensure_dirs()
+
+    if cmd == "dict-check":
+        return _dict_check(ds.cfg, getattr(args, "tags", ""), getattr(args, "limit", 0), ds)
 
     if cmd == "init":
         existing = ds.manifest_file.exists()
@@ -371,7 +532,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "thumbs":
-        curate.cmd_thumbs(ds, max_side=args.max_side, include_images=args.include_images)
+        curate.cmd_thumbs(ds, max_side=args.max_side, include_images=args.include_images,
+                          prune=args.prune)
         return 0
 
     if cmd == "text":
@@ -398,9 +560,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "wash":
         extra = json.loads(Path(args.rules).read_text(encoding="utf-8")) if args.rules else None
-        m = manifest.ensure(ds)
-        wash.cmd_wash(ds, apply=args.apply, trigger=args.trigger or m.trigger, rules_over=extra,
-                      include_images=not args.no_images)
+        wash.cmd_wash(ds, apply=args.apply, trigger=args.trigger, rules_over=extra,
+                      include_images=not args.no_images, refresh_source=args.refresh_source)
         _mark(ds, "wash", _applied(args))
         return 0
 
@@ -409,12 +570,19 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "apply-review":
-        wash.cmd_apply_review(ds, args.payload, apply=args.apply)
+        # 触发词走 wash.resolve_trigger（显式参数 > manifest），别再用 rules["trigger"]（永远是空）
+        wash.cmd_apply_review(ds, args.payload, apply=args.apply, trigger=args.trigger)
         _mark(ds, "review", _applied(args))
         return 0
 
+    if cmd == "fix-caption":
+        wash.cmd_set_caption(ds, args.name, add=args.add, remove=args.remove,
+                             set_text=args.set, trigger=args.trigger, apply=args.apply)
+        _mark(ds, "fix-caption", _applied(args))
+        return 0
+
     if cmd == "verify":
-        wash.cmd_verify(ds, online=args.online, sample=args.sample)
+        wash.cmd_verify(ds, online=args.online, sample=args.sample, trigger=args.trigger)
         return 0
 
     if cmd == "makecfg":
@@ -437,13 +605,13 @@ def main(argv: list[str] | None = None) -> int:
                             epochs=args.epochs or None, resolution=args.resolution,
                             batch=args.batch, grad_accum=args.grad_accum,
                             repeats=repeats or None, apply=args.apply,
-                            dataset_dir=args.dataset_dir or None, force=args.force)
+                            dataset_dir=args.dataset_dir or None, force=args.force,
+                            allow_out_of_band=args.allow_out_of_band)
         _mark(ds, "config", _applied(args))
         return 0
 
     if cmd == "doctor":
-        _doctor(args.home)
-        return 0
+        return _doctor(args.home, proxies=getattr(args, "proxies", False))
 
     return 1
 
@@ -467,6 +635,50 @@ def _mark(ds, stage: str, applied: bool = True, **info) -> None:
     m.save()
 
 
+def _proxy_matrix(cfg, url: str = "https://danbooru.donmai.us/posts.json?limit=1",
+                  timeout: float = 8.0) -> int:
+    """C3：同一个 URL 分别用 python-requests 与 curl 打一遍每个代理候选。
+
+    为什么要矩阵：真实使用里踩到的正是「curl + 7897 能用、python requests + 7897 超时、
+    7890 不可用、socks5 在 requests 侧缺依赖但 curl 原生支持」——只看一行"代理候选"看不出来。
+    """
+    import requests
+
+    cands = [p for p in (cfg.get("proxy_candidates") or [""])]
+    if "" not in cands:
+        cands.insert(0, "")
+    label = {p: ("直连" if not p else p) for p in cands}
+    print(f"  代理矩阵        目标 {url}")
+    print(f"  {'候选':<34}{'requests':<24}curl")
+    for cand in cands:
+        # --- requests ---
+        rq = "?"
+        try:
+            proxies = {"http": cand, "https": cand} if cand else None
+            r = requests.get(url, proxies=proxies, timeout=timeout, verify=True)
+            note = "（Cloudflare 挑战页）" if r.status_code in (403, 503) else ""
+            rq = f"HTTP {r.status_code}{note}"
+        except Exception as exc:
+            name = type(exc).__name__
+            if "InvalidSchema" in name:
+                rq = "✗ socks5 需 pysocks"
+            elif "ProxyError" in name:
+                rq = "✗ ProxyError"
+            elif "Timeout" in name:
+                rq = "✗ 超时"
+            else:
+                rq = f"✗ {name}"
+        # --- curl ---
+        cu = "✗ 无 curl"
+        if net.curl_available():
+            code = net.curl_status(cand, url, timeout=timeout)
+            cu = f"HTTP {code}" if code else "✗ 失败"
+        print(f"  {label[cand]:<34}{rq:<24}{cu}")
+    print("        用法：requests 走通的那档会被自动选中；它挂了才由 curl 兜底重放。")
+    print("        socks5 只在 curl 侧可用（requests 需要 pysocks；curl 原生支持）。")
+    return 0
+
+
 def _ml_hint(ml_py: str, stderr: str) -> None:
     """ML 解释器缺依赖时给可执行的修法 —— 直接贴 traceback 头等于没说。"""
     lines = [l for l in stderr.strip().splitlines() if l.strip()]
@@ -488,7 +700,7 @@ def _ml_hint(ml_py: str, stderr: str) -> None:
         print("                    把设置项 ml_python 指向带 torch+rfdetr 的解释器，见 README「ML 依赖」。")
 
 
-def _doctor(home: str | None = None) -> None:
+def _doctor(home: str | None = None, proxies: bool = False) -> int:
     cfg = cfgmod.Config.load(home=home)
     print(f"animasl {__import__('animasl').__version__}")
     print(f"  home            {cfg.home}")
@@ -519,16 +731,22 @@ def _doctor(home: str | None = None) -> None:
             _ml_hint(ml_py, out.stderr or "")
     except Exception as exc:
         print(f"  ML 依赖         探测失败 {exc}")
-    proxies = cfg.get("proxy_candidates") or [""]
-    print(f"  代理候选        直连 + {', '.join(proxies[1:])}")
+    cands = cfg.get("proxy_candidates") or [""]
+    print(f"  代理候选        直连 + {', '.join(cands[1:])}")
+    print(f"  curl 兜底       {'可用 ' + net.CURL_BIN if net.curl_available() else '不可用（装 curl 或设 ANIMASL_CURL）'}"
+          f"  UA={net.CURL_UA}")
     for host in ("pawchive.pw", "yande.re", "danbooru.donmai.us"):
         url = f"https://{host}/"
         try:
             s = net.session(cfg, url, {})
-            r = s.get(url, timeout=20)
-            print(f"  {host:<20} HTTP {r.status_code}  via {net.proxy_label()}")
+            r = s.get(url, timeout=12)
+            extra = "（Cloudflare 挑战页，不算 API 不可用）" if net.looks_like_challenge(
+                r.status_code, r.text) else ""
+            print(f"  {host:<20} HTTP {r.status_code}  via {net.proxy_label()}{extra}")
         except Exception as exc:
             print(f"  {host:<20} 不可达  {type(exc).__name__}: {str(exc)[:70]}")
+    if proxies:
+        _proxy_matrix(cfg)
     try:
         td = dicts.load(cfg)
         print(f"  词典            {td.size()} 个标签")
@@ -579,6 +797,7 @@ def _doctor(home: str | None = None) -> None:
     else:
         print("  凭据 cookies     未配置（pawchive 公开接口不需要；受限帖 / exhentai 需要；"
               "设置页填 cookies_file，或用 fetch 的 cookies= 临时指定 Netscape cookies.txt）")
+    return 0
 
 
 

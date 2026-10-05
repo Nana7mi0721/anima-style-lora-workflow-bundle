@@ -24,7 +24,7 @@ import json
 import re
 from pathlib import Path
 
-from . import curate, dicts, manifest as manifest_mod, net
+from . import curate, dicts, manifest as manifest_mod, net, state
 
 # --------------------------------------------------------------------------
 # default rules -- mirrors the guide's §7.2 / §7.6 tables
@@ -115,6 +115,14 @@ DEFAULT_RULES: dict = {
         # 站点拼写差异（yande.re 的标签拼法比 danbooru 松，实测遇到）
         "chinadress": "china dress", "garter": "garter belt", "nekomimi": "cat ears",
         "thighhigh": "thighhighs",
+        # 用户真实数据里出现过、实测词典查无此行形的写法（dict-check 会报"词典里没有"，
+        # 这里给出可以照写的现行形；目标标签都逐个核过词典）
+        "see through": "transparent", "see-through": "transparent",
+        #   —— danbooru 把 see-through 并进了 transparent（词典里只有 see-through_hat 这类派生）
+        "fate": "fate (series)",
+        #   —— 裸 fate 不存在；映射成 IP 系列名后会被 category=3 的"IP 永不添加"规则丢掉（正解）
+        "erect nipples": "nipples",
+        #   —— danbooru 没有 erect nipples / hard nipples 这种标签；保留可见特征本身
     },
     "alias_extra": [],          # [{from:..., to:...}] per-dataset additions
     "drop_parent_when_child": True,
@@ -254,6 +262,22 @@ def _merge_rules(rules: dict, over: dict) -> None:
             rules[k] = rules[k] + [x for x in v if x not in rules[k]]
         else:
             rules[k] = v
+
+
+def resolve_trigger(ds, trigger: str = "") -> str:
+    """触发词的唯一解析入口：显式参数 → manifest.trigger。
+
+    真实使用踩过的坑：`cmd_apply_review` 里写的是 `rules.get("trigger")`，而
+    `load_rules()` **从不设这个键**（触发词不是规则，是数据集属性）⇒ 补标之后
+    caption 首位的触发词被整条洗掉。所有阶段都从这里取触发词。
+    """
+    text = str(trigger or "").strip()
+    if text:
+        return text
+    try:
+        return str(manifest_mod.ensure(ds).trigger or "").strip()
+    except Exception:
+        return ""
 
 
 def load_rules(ds=None, extra: dict | None = None) -> dict:
@@ -827,12 +851,13 @@ def _patched_images(ds, rmap: dict) -> set[str]:
 
 
 def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None = None,
-             include_images: bool = True) -> dict:
+             include_images: bool = True, refresh_source: bool = False) -> dict:
     rules = load_rules(ds, rules_over)
-    trigger = trigger or rules.get("trigger") or ""
+    trigger = resolve_trigger(ds, trigger)
     if not trigger:
         print("[wash] ! 未指定触发词（--trigger 或 manifest.trigger），将不插入触发词")
     td = dicts.load(ds.cfg)
+    st = state.load(ds)
     print(f"[wash] 词典 {td.size()} 个标签；触发词 {trigger or '(无)'}")
     _kind = rules.get("kind") or "style"
     _cats = "".join(f" {c}={_CAT_WHY.get(c, c)}" for c in rules.get("category_drop", ()))
@@ -880,12 +905,31 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
     prose_dropped = 0
     emptied: list[str] = []            # caption 洗完只剩触发词的张数（来源标签全被规则丢光）
     emptied_why: dict[str, int] = {}
+    resurrect_guard = 0                # 有多少张用了「人工删除名单」保护
     for f in files:
         tags_a, text_c, origin = sources[f.name]
         had_source = bool(tags_a) or bool(text_c.strip())
         if not had_source:
             no_source += 1
         tags_c, nlp_c = parse_caption(text_c)
+
+        # 重跑 wash 不再复活人工删掉的标签：上一轮 wash 记下了「哪些图源标签真的写进了
+        # caption」（state.merged_tags），现在 caption 里没有的那几个就是人删的 —— 既包括
+        # fix-caption --remove / apply-review 显式记的，也包括直接改 txt 的。--refresh-source
+        # 是显式逃生口（改了规则、想按图源标签重来一遍）。
+        removed: set[str] = set()
+        prev = st.get(f.name)
+        if not refresh_source:
+            if prev.get("merged_tags") and text_c.strip():
+                now = {normalize_tag(t) for t in tags_c}
+                removed |= {t for t in prev["merged_tags"] if t not in now}
+            removed |= {normalize_tag(t) for t in st.manual_removed(f.name)}
+        if removed:
+            before = len(tags_a)
+            tags_a = [t for t in tags_a if normalize_tag(t) not in removed]
+            if len(tags_a) != before:
+                resurrect_guard += 1
+
         rep: dict = {}
         merged = wash_tags(list(tags_a) + list(tags_c), rules, td, trigger, rep,
                            drop_extra=wm_drop if f.name in patched else None,
@@ -904,6 +948,14 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
         out_path = f.with_suffix(".txt")
         if apply:
             out_path.write_text(line, encoding="utf-8", newline="\n")
+            # 记事实（只追加）：成品 caption、并进来的图源标签、标签数
+            written = {normalize_tag(t) for t in merged}
+            st.record(
+                f.name, caption=line, caption_source="wash", tag_count=rep.get("tag_count", 0),
+                merged_tags=sorted({normalize_tag(t) for t in tags_a if normalize_tag(t) in written}),
+                origin=origin, patched=bool(f.name in patched),
+                history={"what": "wash", "tags": rep.get("tag_count", 0)},
+            )
 
         rows.append({
             "file": f.name, "origin": origin, "tags_in": len(tags_a) + len(tags_c),
@@ -920,9 +972,18 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
 
     curate.write_csv(ds.pipe_dir / "wash_report.csv", rows)
     curate.write_csv(ds.pipe_dir / "review_todo.csv", review)
+    if apply:
+        if include_images:
+            state.sync_images(ds, st)
+        st.save()
     bad = [r for r in rows if r["issues"]]
     print(f"[wash] {len(rows)} 张 -> captions {'已写入' if apply else '未写入(加 --apply)'}"
           f"；有问题 {len(bad)} 张；待看图补全 {len(review)} 张")
+    if refresh_source:
+        print("[wash] --refresh-source：按图源标签整体重洗（人工删除的标签也会重新并入）")
+    elif resurrect_guard:
+        print(f"[wash] {resurrect_guard} 张里有「人工删掉的图源标签」，本轮**没有**把它们加回来"
+              f"（记在 _pipeline/per_image.json；要按图源重来一遍加 --refresh-source）")
     if bad[:5]:
         print("  例：" + "; ".join(f"{r['file']}:{r['issues']}" for r in bad[:5]))
     if prose_dropped:
@@ -942,9 +1003,16 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
               f"单画师图源（yande.re 一类）的 booru 标签往往只有画师+角色几个，洗完就空了。"
               f"\n        这批图必须补内容：跑 anima-lora-auto-caption 自动打标，或按 review-list 走看图补全，"
               f"再重跑 wash（wash 幂等，可反复跑）。")
+    if apply and include_images:
+        print("[wash] caption 健康度：")
+        for line_ in state.health_lines(ds, trigger=trigger,
+                                       min_tags=int(rules.get("min_tags") or 20),
+                                       max_tags=int(rules.get("max_tags") or 45)):
+            print(line_)
     return {"count": len(rows), "issues": len(bad), "review": len(review),
             "no_source": no_source, "prose_dropped": prose_dropped,
-            "empty_captions": len(emptied)}
+            "empty_captions": len(emptied), "resurrect_guard": resurrect_guard,
+            "state": str(st.path) if apply else ""}
 
 
 def _review_fields(tags: list[str], rules: dict) -> list[str]:
@@ -973,11 +1041,16 @@ def cmd_review_list(ds) -> dict:
     return {"count": len(rows)}
 
 
-def cmd_apply_review(ds, payload: str | Path, apply: bool = True) -> dict:
+def cmd_apply_review(ds, payload: str | Path, apply: bool = True, trigger: str = "") -> dict:
     """Merge vision-subagent answers back through the same rule engine."""
     rules = load_rules(ds)
-    trigger = rules.get("trigger") or ""
+    # 触发词从 manifest 取（早先读 rules["trigger"]，而 load_rules 从不设这个键 ⇒
+    # 补标之后 caption 首位的触发词被整条洗掉，真实使用时踩到过）
+    trigger = resolve_trigger(ds, trigger)
+    if not trigger:
+        print("[review] ! 数据集没有触发词（manifest.trigger 为空），成品不会带 @触发词")
     td = dicts.load(ds.cfg)
+    st = state.load(ds)
     data = None
     src = Path(payload)
     if src.exists():
@@ -1000,8 +1073,11 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True) -> dict:
         if not cand:
             print(f"  ! {name} 找不到对应图片")
             continue
-        txt = cand[0].with_suffix(".txt")
+        picture = cand[0]
+        txt = picture.with_suffix(".txt")
         old = txt.read_text(encoding="utf-8", errors="replace") if txt.exists() else ""
+        if not old.strip():
+            old = st.caption(picture.name)     # txt 还没生成时回落到状态里的副本
         tags, nlp = parse_caption(old)
         add = []
         for key in ("people", "relationship", "composition", "position", "appearance", "scene"):
@@ -1009,21 +1085,102 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True) -> dict:
             if not val:
                 continue
             add.extend(val if isinstance(val, list) else [val])
+        drop = [str(t) for t in (item.get("remove") or [])]
+        if drop:
+            gone = {normalize_tag(t) for t in drop}
+            tags = [t for t in tags if normalize_tag(t) not in gone]
         rep: dict = {}
         merged = wash_tags(tags + add, rules, td, trigger, rep)
         line = assemble(merged, nlp or item.get("nlp", ""), rules)
         if apply:
             txt.write_text(line, encoding="utf-8", newline="\n")
+            st.record(picture.name, caption=line, caption_source="apply-review",
+                      tag_count=rep.get("tag_count", 0), vision=item,
+                      history={"what": "apply-review", "tags": rep.get("tag_count", 0)})
+            if drop:
+                st.note_manual_removed(picture.name, drop)
         updated += 1
-    print(f"[review] 已合并 {updated} 张的看图结果")
-    return {"updated": updated}
+    if apply and updated:
+        st.save()
+    print(f"[review] 已合并 {updated} 张的看图结果"
+          + (f"（触发词 {trigger}）" if trigger else ""))
+    return {"updated": updated, "trigger": trigger}
 
 
-def cmd_verify(ds, online: bool = False, sample: int = 0) -> dict:
+def cmd_set_caption(ds, name: str, add: str = "", remove: str = "", set_text: str = "",
+                    trigger: str = "", apply: bool = False) -> dict:
+    """增量修一张图的 caption —— 不再需要外面写 _trim2.py / _add_vision.py。
+
+    三种用法可以叠加：
+      --add "hat, sitting"    补标签（照样过 wash 规则：别名/蕴含/排序/词典闸门）
+      --remove "gloves"       删标签（并记进 per_image.json：重跑 wash 不会复活它）
+      --set "@x, 1girl, …"    整条替换（先按 caption 解析，再走同一条规则链）
+    """
+    target = state.resolve_name(ds, name)
+    hit, where = state.locate(ds, target)
+    if hit is None:
+        raise SystemExit(f"[fix-caption] 找不到图片：{name}（在 images/ 与 00_raw/ 都没匹配到）")
+    rules = load_rules(ds)
+    trigger = resolve_trigger(ds, trigger)
+    td = dicts.load(ds.cfg)
+    st = state.load(ds)
+    txt = hit.with_suffix(".txt")
+    old = ""
+    if txt.exists():
+        old = txt.read_text(encoding="utf-8", errors="replace")
+    elif st.caption(hit.name):
+        old = st.caption(hit.name)
+    tags, nlp = parse_caption(old)
+    if set_text.strip():
+        tags, nlp = parse_caption(set_text)
+        print(f"[fix-caption] {hit.name}：整条替换（{len(tags)} 个标签）")
+    drop = [t.strip() for t in re.split(r"[,，]", remove) if t.strip()]
+    if drop:
+        gone = {normalize_tag(t) for t in drop}
+        before = len(tags)
+        tags = [t for t in tags if normalize_tag(t) not in gone]
+        print(f"[fix-caption] {hit.name}：删 {before - len(tags)} 个（{', '.join(drop)}）"
+              f" -> 记入人工删除名单，重跑 wash 不会复活")
+    extra = [t.strip() for t in re.split(r"[,，]", add) if t.strip()]
+    if extra:
+        print(f"[fix-caption] {hit.name}：补 {len(extra)} 个（{', '.join(extra)}）")
+    rep: dict = {}
+    merged = wash_tags(tags + extra, rules, td, trigger, rep)
+    line = assemble(merged, nlp, rules)
+    issues = validate(line, rules, rep.get("tag_count", 0), td)
+    print(f"[fix-caption] {hit.name}（{where}）  {len(tags)} -> {rep.get('tag_count', 0)} 个标签")
+    print(f"  旧：{old.strip()[:200] or '(空)'}")
+    print(f"  新：{line[:200]}")
+    if issues:
+        print(f"  ! 形态约束：{'|'.join(issues)}")
+    if not apply:
+        print("  （dry-run：加 --apply 才写盘）")
+        return {"file": hit.name, "before": len(tags), "after": rep.get("tag_count", 0),
+                "issues": len(issues), "applied": False}
+    txt.write_text(line, encoding="utf-8", newline="\n")
+    st.record(hit.name, caption=line, caption_source="fix-caption",
+              tag_count=rep.get("tag_count", 0), history={"what": "fix-caption"})
+    if drop:
+        st.note_manual_removed(hit.name, drop)
+    if extra:
+        # 补的标签也算"写进去了"：下轮 wash 若发现它不在 caption 里，说明是人又删的
+        st.record(hit.name, merged_tags=[t for t in extra if normalize_tag(t) in
+                                        {normalize_tag(x) for x in merged}])
+    st.save()
+    return {"file": hit.name, "before": len(tags), "after": rep.get("tag_count", 0),
+            "issues": len(issues), "applied": True, "caption": line}
+
+
+def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "") -> dict:
     """Audit every caption against the hard constraints (§3) and the rules."""
     rules = load_rules(ds)
     td = dicts.load(ds.cfg)
+    trigger = resolve_trigger(ds, trigger)
     files = ds.images() or ds.raw_images()
+    if sample and sample > 0 and len(files) > sample:
+        step = max(1, len(files) // sample)
+        files = files[::step][:sample]
+        print(f"[verify] --sample {sample}：抽查 {len(files)} 张")
     rmap = curate.load_rename_map(ds) if files else {}
     patched = _patched_images(ds, rmap)
     rows: list[dict] = []
@@ -1037,6 +1194,12 @@ def cmd_verify(ds, online: bool = False, sample: int = 0) -> dict:
                           len([t for t in tags if not t.startswith("@")]), td)
         if not text:
             issues.append("missing-caption")
+        if text and trigger:
+            body = text.strip()
+            if not body.startswith(trigger):
+                issues.append("trigger-not-first")
+            elif body.count(trigger) != 1:
+                issues.append("trigger-twice")
         if text:
             extra = audit_caption(text, rules, td, patched=f.name in patched)
             for e in extra:
@@ -1053,7 +1216,8 @@ def cmd_verify(ds, online: bool = False, sample: int = 0) -> dict:
         rows.append({"file": f.name, "tags": len(tags), "issues": "|".join(issues)})
     curate.write_csv(ds.pipe_dir / "wash_verify.csv", rows)
     bad = [r for r in rows if r["issues"]]
-    print(f"[verify] {len(rows)} 个 caption，{len(bad)} 个违反硬约束")
+    print(f"[verify] {len(rows)} 个 caption，{len(bad)} 个违反硬约束"
+          + (f"；触发词 {trigger}" if trigger else "（数据集无触发词，跳过触发词检查）"))
     if residue_all:
         top = sorted(residue_all.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
         print(f"[verify] 规则本该丢掉的残留 {len(residue_all)} 种（画师/IP/meta/质量词/否定式/"
@@ -1063,17 +1227,17 @@ def cmd_verify(ds, online: bool = False, sample: int = 0) -> dict:
         top = sorted(unknown_all.items(), key=lambda kv: -kv[1])[:15]
         print(f"[verify] 词典中不存在的标签 {len(unknown_all)} 种，出现最多的："
               + ", ".join(f"{k}({v})" for k, v in top))
-    if files:
-        stems = {f.stem for f in files}
-        orphans = [p.name for p in ds.images_dir.glob("*.txt") if p.stem not in stems]
-        if orphans:
-            print(f"[verify] ! {len(orphans)} 个 .txt 没有对应图片（图-txt 配对不完整）："
-                  + ", ".join(sorted(orphans)[:6]))
+    if files and not sample:
+        # 图-txt 配对、标签数区间、触发词位置、空 caption —— 一次给全（不必另开 status）
+        for line_ in state.health_lines(ds, trigger=trigger,
+                                       min_tags=int(rules.get("min_tags") or 20),
+                                       max_tags=int(rules.get("max_tags") or 45)):
+            print(line_)
     if online:
         print("[verify] --online：将用 danbooru search[name_comma] 批量复核（每批 120）")
         _online_verify(ds, sorted(unknown_all))
     return {"count": len(rows), "issues": len(bad), "unknown_kinds": len(unknown_all),
-            "residue_kinds": len(residue_all)}
+            "residue_kinds": len(residue_all), "trigger": trigger}
 
 
 def _online_verify(ds, tags: list[str], batch: int = 120) -> dict:

@@ -1,6 +1,6 @@
 ---
 name: anima-style-lora-source
-description: Anima 风格 LoRA 训练集的下载来源指南：yande.re / danbooru / pawchive.pw / exhentai 四个源的 API 用法与标签语义、认证方式（DANBOORU_LOGIN/DANBOORU_API_KEY、cookies.txt）、必须走代理的域名、父子投稿去重、原图选择、文件名标签不完整等坑，以及按画师类型选源的判断。用户要求"下载数据集/抓某画师的图/从 danbooru 或 yande.re 下载/补充素材"时使用。
+description: Anima 风格 LoRA 训练集的下载来源指南：yande.re / danbooru / pawchive.pw / exhentai 四个源的 API 用法与标签语义、认证方式（设置页「凭据」分组的 danbooru 用户名+API key / exhentai 三项，或 cookies.txt）、danbooru 的 Cloudflare 403 与 curl 兜底、必须走代理的域名、父子投稿去重、原图选择、文件名标签不完整等坑，以及按画师类型选源的判断。用户要求"下载数据集/抓某画师的图/从 danbooru 或 yande.re 下载/补充素材"时使用。
 ---
 
 # SKILL：训练集下载来源
@@ -20,11 +20,13 @@ description: Anima 风格 LoRA 训练集的下载来源指南：yande.re / danbo
 ## §1 统一调用方式
 
 ```
-anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", limit:250, apply:false)   # dry-run 先看清单
-anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", limit:250, apply:true)
+anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", limit:250, dryRun:true)   # 只看清单
+anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", limit:250)               # 真的下载（默认行为）
 ```
 
-写盘前一律 dry-run。产出行落在 `00_raw/`，元数据落 `_pipeline/raw_posts.jsonl`（每行一条候选：source/post_id/page_url/url/filename/ext/bytes/width/height/created_at/rating/tags[]/parent_id/md5/status）。**这批 `tags[]` 就是后面 wash 阶段的 booru 骨架**，丢了就得重新抓。
+**`fetch` 没有 `apply`**：默认就是下载，预演用 `dryRun:true`（`import` 同理）。传了 `apply` 会在执行前被拒，错误里会列出该阶段支持的参数。长阶段（250 张原图）用 `detach:true` 拿 runId 再 `anima_job` 轮询。
+
+产出行落在 `00_raw/`，元数据落 `_pipeline/raw_posts.jsonl`（每行一条候选：source/post_id/page_url/url/filename/ext/bytes/width/height/created_at/rating/tags[]/parent_id/md5/status）。**这批 `tags[]` 就是后面 wash 阶段的 booru 骨架**，丢了就得重新抓（`rename_map.csv` 里也有 `tags_full` 快照，但那是抓取当时的样子，别当权威来源）。
 
 ## §2 yande.re
 
