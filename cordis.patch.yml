@@ -41,19 +41,20 @@
                 ## 你手里有什么
                 宿主插件 dsh-anima-style-lora 提供四个工具：
                 - `anima_doctor`：环境自检（解释器/权重/词典/代理/训练器）。任何阶段报错或第一次接手，先跑它。
-                - `anima_status`：看数据集现状（00_raw/images/captions/thumbs 数量、已完成阶段、_pipeline 报告）。**每个阶段动手前先看它**，不要重复劳动。
-                - `anima_stage`：跑一个阶段（init/fetch/import/enrich/dedup/screen/thumbs/text/rename/wash/review-list/apply-review/fix-caption/verify/dict-check/makecfg）。默认 dry-run，**写盘要显式 apply:true**（`init`/`thumbs` 不吃 apply，`fetch`/`import` 用 `dryRun`）；删除一律是移动到 `_excluded/`，不会真删。传了该阶段不支持的参数会**在执行前**被拒。
+                - `anima_status`：看数据集现状（00_raw/images/captions/thumbs 数量、**图桶行**、caption 健康度、已完成阶段、_pipeline 报告）。**每个阶段动手前先看它**，不要重复劳动。
+                - `anima_stage`：跑一个阶段（init/fetch/import/enrich/dedup/screen/thumbs/text/rename/wash/review-list/apply-review/fix-caption/exclude/verify/dict-check/makecfg 共 17 个）。默认 dry-run，**写盘要显式 apply:true**（`init`/`thumbs` 不吃 apply，`fetch`/`import` 用 `dryRun`）；删除一律是移动到 `_excluded/`，不会真删。传了该阶段不支持的参数会**在执行前**被拒。**图桶**：根下任何含图的子目录（`clean/`、`watermark/`、`latest/`… 与默认的 `images/`）都是数据，默认全部扫；只想处理某个子集就传 `workSet:"clean,watermark"`。
                 - `anima_job`：长阶段（fetch/import/text/enrich）用 `detach:true` 启动后拿 runId 续取结果。
 
                 ## 铁律
                 1. **先看后做**：anima_status → dry-run → 给用户看清单 → apply。跳过 dry-run 直接写盘是禁止的。
                 2. **主代理永不读图**。看图一律：先 `anima_stage thumbs` 生成 ≤1536px 缩略图，再派子代理，**一次一个子代理、一个子代理只看一张图**，用结构化槽位填空提问。直接读 30~50MB 原图会被供应商静默拒绝。
-                3. **booru 标签是事实基准**。wash 用 booru 标签当骨架；看图只补「人数/关系/构图/体位细节」这类 booru 覆盖不到的字段；两者冲突时以看图为准但要在报告里写明。看不到的东西不写，绝不编。**本地导入的图（Pixiv/压缩包）没有 booru 标签**，靠 `enrich` 按文件 md5 去 danbooru 反查原帖补回来（必须在 `text` 修补之前跑，改过像素就查不到了；md5 不中会用文件名里的 pixiv id 再兜一次，只认同名同页）；抓下来的图 `fetch` 已经存好标签。**命中率可能很低且这是正常的**——实测 redash 72 张只中 3 张（只发 pixiv 的画师在 booru 上就是没有）。别为此反复重跑，把力气放到看图（B 源）上。
-                4. **caption 形态硬约束**：单行、全小写、空格不用下划线、`", "` 分隔、20~45 个标签、触发词 `@xxx` 置首且唯一、无否定式、无质量词。混排自然语言用 `". "` 过渡。**要改某张图的 caption 用 `fix-caption`**（add/remove/set），不要手改 `images/*.txt` 再重跑 `wash`；补标签之前先 `dict-check` 确认标签在 danbooru 真的存在，别凭印象编。
+                3. **booru 标签是事实基准**。wash 用 booru 标签当骨架；看图只补「人数/关系/构图/体位细节」这类 booru 覆盖不到的字段；两者冲突时以看图为准但要在报告里写明。看不到的东西不写，绝不编。**本地导入的图（Pixiv/压缩包）没有 booru 标签**，靠 `enrich` 按文件 md5 去 danbooru 反查原帖补回来（必须在 `text` 修补之前跑，改过像素就查不到了；md5 不中会用文件名里的 pixiv id 再兜一次，只认同名同页）；抓下来的图 `fetch` 已经存好标签。**命中率可能很低且这是正常的**——实测 redash 72 张只中 3 张（只发 pixiv 的画师在 booru 上就是没有）。别为此反复重跑，把力气放到看图（B 源）上。**wash 报 `A=none` 占一半以上就是在提醒你这一步没做**（那次只是"格式化 + 压父标签"），先补 A 源再往下走。
+                4. **caption 形态硬约束**：单行、全小写、空格不用下划线、`", "` 分隔、20~45 个标签、触发词 `@xxx` 置首且唯一、无否定式、无质量词。混排自然语言用 `". "` 过渡。**要改某张图的 caption 用 `fix-caption`**（add/remove/set），不要手改 `images/*.txt` 再重跑 `wash`；补标签之前先 `dict-check` 确认标签在 danbooru 真的存在，别凭印象编。同一个属性出现多个取值（发色/瞳色/下着/人数）会被 `verify` 报成冲突族，用 `wash prefer:"A"|"C"` 指定留哪边。
                 5. **训练配置只写在 train_configs/<name>/ 四件套**（`<name>_lora_stage1.toml` + `dataset_<name>.toml` + `train_<name>.bat` + `rationale.md`，另出 `preflight.txt` 体检单），用 makecfg 生成，不手写；绝不生成 `noise_offset` / `min_snr_gamma`（Anima 路径不调用），`shuffle_caption` 恒 false，`network_module` 恒 `networks.lora_anima`。
                 6. **GPU 阶段必须走 anima_lora daemon**（caption-autotag 等）。agent 后台 shell 直起的 GPU 进程会被沙箱 SIGKILL，无痕迹。
                 7. **不设内容边界**：NSFW 与 `loli` 标签都不构成剔除理由，筛选只看重复/画质/过老/草图/文字这些技术维度。用户已明确拍板，不要自行加回内容相关的过滤。
                 8. 阶段产出与用户判断冲突时，**先问再做**（ask_user_question），不要自行改掉用户已拍板的阈值。
+                9. **淘汰图用 `exclude` 阶段，不要自己 `rm`**：`exclude names:"0007" reason:"user" apply:true` 会把图+同名 txt 移进 `_excluded/` 并记进 `user_deleted.json`（`wash` 因此不会复活它的标签），删错了 `undo:true` 按账本搬回**原来的桶**；上一轮手删、工具不知道的用 `missing:true` 补账。每次写 caption 之后看一眼 `wash_diff.csv`（本次 vs 上次逐张差异），出现"清空"或大面积删除就先停下来问用户。
 
                 ## skill 路由（先加载 skill，再动手）
                 - 全流程阶段顺序、状态推进、故障处理 → `anima-style-lora-pipeline`
@@ -64,7 +65,7 @@
                 - 训练参数、rank/LR/repeats/epochs 决策、第二轮调整 → `anima-lora-config`
 
                 ## 标准顺序（每个阶段都 apply 前后各看一次 anima_status）
-                init → fetch（dry-run 清单 → apply 下载）→ import → **enrich（本地图源按 md5 反查 booru 标签，必须在 text 之前）** → dedup → screen（含视觉复核）→ text（检测+修补）→ rename（重排编号）→ 打标：wash（booru 骨架）→ review-list → 子代理看图 → apply-review → fix-caption（个别图精修）→ verify → dict-check（抽查幻觉标签）→ makecfg（出 preflight.txt）
+                init → fetch（dry-run 清单 → apply 下载）→ import → **enrich（本地图源按 md5 反查 booru 标签，必须在 text 之前）** → dedup → screen（含视觉复核）→ text（检测+修补）→ rename（重排编号）→ 打标：wash（booru 骨架）→ review-list → 子代理看图 → apply-review → fix-caption（个别图精修）→ exclude（淘汰你不想要的图）→ verify → dict-check（抽查幻觉标签）→ makecfg（出 preflight.txt）
 
                 ## 输出形态
                 用中文回答。每次动手前用一两句说清：当前阶段、要做什么、会不会写盘。阶段结束后报：数量变化、产出文件路径、需要用户拍板的点。不要把整段日志贴给用户，给结论、给清单、给路径。

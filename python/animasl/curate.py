@@ -42,9 +42,14 @@ except Exception as exc:  # pragma: no cover
 # small helpers
 # --------------------------------------------------------------------------
 def working_dir(ds, manifest=None, prefer_images: bool = True) -> Path:
-    """Images live in 00_raw until `rename` has run, then in images/."""
-    if prefer_images and ds.images_dir.exists() and any(ds.images_dir.iterdir()):
-        return ds.images_dir
+    """成品图所在的主要目录；还没有成品桶时回落到 00_raw（rename 之前）。
+
+    成品图可以住在 images/、clean/、watermark/ 任意一个桶里（见 Dataset.bucket_dirs），
+    这里只回答「主要的那个在哪」；要枚举全部图请用 `ds.work_images()`。
+    """
+    buckets = ds.bucket_dirs() if prefer_images else []
+    if buckets:
+        return buckets[0][1]
     return ds.raw_dir
 
 
@@ -192,6 +197,17 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
             f"         例如 <数据集>/00_raw 之外的一个新目录；数据集内的 images/、\n"
             f"         thumbs/ 由 rename/thumbs 阶段维护，不需要再导入。"
         )
+    if src_res.is_relative_to(root):
+        # 数据集目录内的路径：保留目录与成品图桶一律拒绝（它们是流水线自己的产物），
+        # 别的子目录放行但要说清楚 —— **含图的根子目录会自动成为图桶**，导完就多一个桶。
+        buckets = {name for name, _ in ds.bucket_dirs()}
+        if src_res.name in RESERVED_DIRS or src_res.name in buckets:
+            raise SystemExit(
+                f"[import] 拒绝执行：src 是数据集里的保留目录/图桶（{src_res.name}）\n"
+                f"         import 只收外部素材；{src_res.name}/ 是流水线自己的产物。"
+            )
+        print(f"[import] ⚠ src 在数据集目录内（{src_res.relative_to(root)}）——"
+              f"导入后这个目录只要还含图就会被当成图桶（work set）。建议把素材移出去再导入。")
 
     staging = ds.pipe_dir / "_import_staging"
     items: list[Path] = []
@@ -203,8 +219,9 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
             # 数据集自己的保留目录不再递归（只对数据集内的路径生效，
             # 别把外部素材目录里恰好叫 images/ 的文件夹也跳过）
             try:
-                if p.resolve().is_relative_to(root) and p.name in RESERVED_DIRS:
-                    return
+                if p.resolve().is_relative_to(root):
+                    if p.name in RESERVED_DIRS or p.name.startswith(("_", ".")):
+                        return
             except Exception:
                 pass
             it = p.rglob("*") if recurse else p.glob("*")
@@ -229,8 +246,16 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
                     items.append(child)
 
     images = [p for p in items if p.suffix.lower() in IMG_EXTS]
-    others = [p for p in items if p.suffix.lower() not in IMG_EXTS]
-    print(f"[import] 候选文件 {len(items)}，其中图片 {len(images)}，非图 {len(others)}")
+    # 同名 .txt 是 caption 侧车（人工或别的打标工具写的），必须跟着图一起搬：
+    # 上次真实使用里 import 只搬了图，144 条 caption 是手工补搬的。
+    img_stems = {p.stem for p in images}
+    sidecars = [p for p in items
+                if p.suffix.lower() == ".txt" and p.stem in img_stems
+                and p.with_suffix("") not in images]
+    side_set = set(sidecars)
+    others = [p for p in items if p not in side_set and p.suffix.lower() not in IMG_EXTS]
+    print(f"[import] 候选文件 {len(items)}，其中图片 {len(images)}，"
+          f"同名 txt 侧车 {len(sidecars)}，非图 {len(others)}")
     if others:
         # 早先这里是个静默黑洞：zip/mp4/txt 既不进 00_raw 也不进任何报告，
         # 于是"我明明导入了 30 个文件"没法核对。现在逐个列出来。
@@ -249,6 +274,7 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
                          "ext": p.suffix.lower(), "bytes": p.stat().st_size,
                          "status": "skipped-non-image"} for p in sorted(others)]
     copied = 0
+    side_copied = 0
     for p in sorted(images):
         if p.is_relative_to(ds.raw_dir) if hasattr(p, "is_relative_to") else str(p).startswith(str(ds.raw_dir)):
             continue
@@ -271,6 +297,14 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
                           "width": info["width"], "height": info["height"],
                           "created_at": time.strftime("%Y-%m-%d", time.localtime(p.stat().st_mtime))})
             copied += 1
+            side = p.with_suffix(".txt")
+            if side.exists():
+                try:
+                    shutil.copy2(side, dest.with_suffix(".txt"))
+                    side_copied += 1
+                    entry["sidecar"] = "txt"
+                except Exception as exc:
+                    print(f"  ! 侧车搬运失败 {side.name}: {exc}")
         rows.append(entry)
 
     if rows and not dry_run:
@@ -282,10 +316,13 @@ def cmd_import(ds, src: str, unpack: bool = True, move: bool = False,
         net.write_jsonl(ds.pipe_dir / "raw_posts.jsonl", merged)
     if staging.exists():
         shutil.rmtree(staging, ignore_errors=True)
-    print(f"[import] 导入 {copied} 张 -> {ds.raw_dir}")
+    print(f"[import] 导入 {copied} 张 -> {ds.raw_dir}"
+          + (f"（含同名 txt 侧车 {side_copied} 条）" if side_copied else ""))
+    if sidecars and not dry_run and side_copied < len(sidecars):
+        print(f"         注意：{len(sidecars) - side_copied} 条侧车没搬过来（同名图片没被导入？）")
     if others:
         print(f"         跳过非图 {len(others)} 个（已在报告里逐条列出）")
-    return {"rows": rows, "count": copied, "skipped": len(others)}
+    return {"rows": rows, "count": copied, "sidecars": side_copied, "skipped": len(others)}
 
 
 # --------------------------------------------------------------------------
@@ -355,7 +392,8 @@ def _ssim(path_a: Path, path_b: Path, size: int = 64) -> float:
 
 def cmd_dedup(ds, phash_distance: int = 4, ssim_threshold: float = 0.995,
               ssim_review: float = 0.97, aspect_tolerance: float = 0.02,
-              apply: bool = False, include_images: bool = False) -> dict:
+              apply: bool = False, include_images: bool = False,
+              work_set=None) -> dict:
     """De-duplicate 00_raw.
 
     Three tiers, in increasing aggressiveness:
@@ -373,7 +411,7 @@ def cmd_dedup(ds, phash_distance: int = 4, ssim_threshold: float = 0.995,
     into a single "duplicate" group.
     """
     ds.ensure_dirs()
-    files = ds.images() if include_images else ds.raw_images()
+    files = ds.work_images(work_set) if include_images else ds.raw_images()
     if not files:
         print(f"[dedup] 没有可处理的图片（{ds.raw_dir}）")
         return {"groups": 0, "dropped": 0}
@@ -511,7 +549,7 @@ DEFAULT_SKETCH_TAGS = {
 
 
 def cmd_screen(ds, rules: dict | None = None, apply: bool = False,
-               include_images: bool = False) -> dict:
+               include_images: bool = False, work_set=None) -> dict:
     ds.ensure_dirs()
     rules = rules or {}
     min_short = int(rules.get("min_short_side", 512))
@@ -519,7 +557,7 @@ def cmd_screen(ds, rules: dict | None = None, apply: bool = False,
     earliest = str(rules.get("earliest_date", "2015-01-01"))
     sketch_tags = {t.lower() for t in rules.get("sketch_tags", sorted(DEFAULT_SKETCH_TAGS))}
 
-    files = ds.images() if include_images else ds.raw_images()
+    files = ds.work_images(work_set) if include_images else ds.raw_images()
     meta = load_meta(ds)
     print(f"[screen] {len(files)} 张图  min_short_side={min_short} min_bytes={min_bytes} "
           f"earliest={earliest}")
@@ -586,22 +624,21 @@ def cmd_screen(ds, rules: dict | None = None, apply: bool = False,
 # --------------------------------------------------------------------------
 def cmd_thumbs(ds, max_side: int = 1536, max_bytes: int = 2_000_000,
                include_images: bool = False, prune: bool = False,
-               force: bool = False) -> dict:
+               force: bool = False, work_set=None) -> dict:
     """生成缩略图（视觉子代理只能看这个）。
 
     真实使用踩过的坑：thumbs 默认读 00_raw，而 rename 之后 00_raw 已经空了 ⇒
     第二次 thumbs 打印「0 张」，agent 只能自己拿 Pillow 造缩略图。现在：
-      * 工作集 = images/（有内容就用它）否则 00_raw —— 与 working_dir() 一致；
+      * 工作集 = 所有成品图桶（images/、clean/、watermark/ …，见 Dataset.bucket_dirs）；
       * 已存在且比原图新、长边也不超标的缩略图跳过（重跑不再白算几百张）；
       * --prune 清掉没有对应图的陈旧缩略图（改名后残留的旧编号）。
     """
     ds.ensure_dirs()
     ds.thumbs_dir.mkdir(parents=True, exist_ok=True)
-    files = ds.images() if include_images else working_dir(ds).iterdir()
-    files = sorted(p for p in files if p.is_file() and p.suffix.lower() in IMG_EXTS)
+    files = ds.work_images(work_set)
     if not files:
-        print("[thumbs] 工作集是空的：00_raw 与 images/ 都没有图。"
-              "先 fetch/import，或 rename 之后再跑 thumbs。")
+        print("[thumbs] 工作集是空的：没有含图的桶（images/ 是空的？）。"
+              "先 fetch/import，或 rename 之后再跑 thumbs；成品图放数据集根下任意子目录都行。")
         return {"count": 0, "skipped": 0, "pruned": 0, "dir": str(ds.thumbs_dir)}
 
     written = 0
@@ -650,6 +687,154 @@ def cmd_thumbs(ds, max_side: int = 1536, max_bytes: int = 2_000_000,
           + (f"、清理陈旧 {pruned} 张" if prune else "")
           + f" -> {ds.thumbs_dir}（平均 {total // max(written, 1) // 1024} KB，长边≤{max_side}）")
     return {"count": written, "skipped": skipped, "pruned": pruned, "dir": str(ds.thumbs_dir)}
+
+
+# --------------------------------------------------------------------------
+# exclude: 人工淘汰（带清单与回滚）
+# --------------------------------------------------------------------------
+def cmd_exclude(ds, names="", reason: str = "user", apply: bool = False,
+                undo: bool = False, missing: bool = False, work_set=None,
+                note: str = "") -> dict:
+    """人工淘汰：把图 + 同名 txt 移进 `_excluded/<reason>/`，并记进用户手删清单。
+
+    为什么需要它（真实使用复盘）：上一次跑完，用户手删了 4 张图，工具下一轮只报
+    「少了 4 张」，既不知道删的是谁，也没留找回路径；复核时只能去翻文件系统。
+
+      * `names` 里每张图 → 移动到 `_excluded/<reason>/`，`_pipeline/user_deleted.json`
+        只追加一条（记当前文件名、所有旧名、归档路径、原因、时间）；
+      * `missing: true` 是**事后补账**：把 per_image.json / rename_map.csv 里知道、
+        但工作集里已经不在的图补进清单（archived 为空，只留证据不搬文件）；
+      * `undo: true` → 按清单里的归档路径搬回**原来的桶**（entries 里记了 bucket），并标记
+        restored_at；不给 `names` 就恢复清单里所有还归档着的条目。
+
+    默认 dry-run，`apply: true` 才动文件。淘汰永远只移动不删除。
+    """
+    ds.ensure_dirs()
+    st = state.load(ds)
+    want = names if isinstance(names, (list, tuple, set)) else str(names or "").split(",")
+    want = [str(n).strip() for n in want if str(n).strip()]
+    rows: list[dict] = []
+
+    if undo:
+        data = state.load_user_deleted(ds)
+        if not want:
+            # 不给名字 = 把清单里所有还归档着的都搬回来（"我反悔了"是最常见的用法）
+            want = [str(e.get("name")) for e in data["entries"]
+                    if str(e.get("archived") or "") and not e.get("restored_at")]
+            if not want:
+                print("[exclude] 清单里没有可恢复的条目（用 names 指定，或先 missing:true 补账）")
+                return {"rows": [], "restored": 0, "applied": bool(apply)}
+        for name in want:
+            key = st.find_by_old_name(name) or name
+            entry = next((e for e in data["entries"]
+                          if e.get("name") == key
+                          or Path(str(e.get("name"))).stem == Path(name).stem), None)
+            if entry is None:
+                rows.append({"file": name, "action": "undo", "status": "不在清单里"})
+                continue
+            src = Path(str(entry.get("archived") or ""))
+            # 恢复目标必须回到它原来所在的桶（桶布局下 images/ 常常是空的）
+            bucket = (str(entry.get("bucket") or "")
+                      or str(st.get(str(entry["name"])).get("bucket") or "")
+                      or "images")
+            dest = ds.root / bucket / str(entry["name"])
+            if not src.is_file():
+                rows.append({"file": entry["name"], "action": "undo",
+                             "status": f"归档文件不在（{src}）—— 需要手工找回"})
+                continue
+            if apply:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dest))
+                side = src.with_suffix(".txt")
+                if side.exists():
+                    shutil.move(str(side), str(dest.with_suffix(".txt")))
+                state.clear_user_deleted(ds, str(entry["name"]))
+                st.record(str(entry["name"]), history={"what": "restored-by-user"})
+                rows.append({"file": entry["name"], "action": "undo", "status": f"已恢复到 {dest}"})
+            else:
+                rows.append({"file": entry["name"], "action": "undo",
+                             "status": f"会从 {src} 恢复到 {dest}"})
+        if apply:
+            st.save()
+        for row in rows:
+            print(f"  {row['file']}  {row['status']}")
+        print(f"[exclude] undo：{sum(1 for r in rows if r['status'].startswith('已恢复'))} 张已恢复"
+              + ("" if apply else "（dry-run：加 apply:true 才动文件）"))
+        return {"rows": rows, "restored": sum(1 for r in rows if r["status"].startswith("已恢复")),
+                "applied": bool(apply)}
+
+    if missing:
+        present = {p.name for p in ds.work_images(work_set)}
+        known: dict[str, list[str]] = {}
+        for name in st.names():
+            known[name] = [str(o) for o in (st.get(name).get("old_names") or [])]
+        for name, row in load_rename_map(ds).items():
+            known.setdefault(name, [])
+            old = str(row.get("old_name") or "")
+            if old and old not in known[name]:
+                known[name].append(old)
+        for e in state.load_user_deleted(ds)["entries"]:
+            known.setdefault(str(e.get("name") or ""), list(e.get("old_names") or []))
+        gone = [n for n in sorted(known) if n and n not in present]
+        for name in gone:
+            olds = known.get(name) or []
+            if apply:
+                state.note_user_deleted(ds, name, archived="", reason="user", old_names=olds,
+                                        note=note or "事后补账：文件已不在工作集里")
+                st.record(name, user_deleted_at=state.now(),
+                          history={"what": "user-deleted-recorded"})
+            rows.append({"file": name, "action": "missing", "status": "不在工作集里",
+                         "old_names": "; ".join(olds)})
+        if apply:
+            st.save()
+        for row in rows[:20]:
+            print(f"  {row['file']}  旧名：{row.get('old_names') or '（无记录）'}")
+        if len(rows) > 20:
+            print(f"  … 还有 {len(rows) - 20} 张")
+        print(f"[exclude] 事后补账：状态里知道 {len(known)} 张，其中 {len(gone)} 张已不在工作集"
+              + ("" if apply else "（dry-run：加 apply:true 才写清单）"))
+        return {"rows": rows, "missing": len(gone), "applied": bool(apply)}
+
+    if not want:
+        data = state.load_user_deleted(ds)
+        live = [e for e in data["entries"] if not e.get("restored_at")]
+        print(f"[exclude] 手删清单里有 {len(live)} 条：")
+        for e in live[:15]:
+            print(f"   {e.get('name')}　归档 {e.get('archived') or '（只留证据）'}"
+                  f"　原因 {e.get('reason') or '-'}　{e.get('at')}")
+        if not live:
+            print("   （空。要淘汰某几张：exclude name=\"0007,0012\" apply=true；"
+                  "要把历史上手删的补进清单：exclude missing=true apply=true）")
+        return {"entries": live, "count": len(live)}
+
+    moves: list[tuple[Path, str, dict]] = []
+    for name in want:
+        cur = state.resolve_name(ds, name)
+        hit, bucket = state.locate(ds, cur)
+        if hit is None:
+            rows.append({"file": name, "action": "exclude", "status": "找不到这张图"})
+            continue
+        dest = (ds.excluded_dir / (reason or "user")) / hit.name
+        if apply:
+            moves.append((hit, reason or "user",
+                          {"rule": "user-exclude", "detail": note, "decided_by": "user"}))
+            state.note_user_deleted(ds, hit.name, archived=str(dest), reason=reason or "user",
+                                    old_names=(st.get(hit.name).get("old_names") or []), note=note,
+                                    bucket=bucket)
+            st.record(hit.name, bucket=bucket, user_deleted_at=state.now(),
+                      history={"what": "user-excluded", "reason": reason or "user"})
+            rows.append({"file": hit.name, "action": "exclude", "status": f"已移到 {dest}"})
+        else:
+            rows.append({"file": hit.name, "action": "exclude",
+                         "status": f"会从 {bucket or '?'} 移到 {dest}"})
+    moved = move_excluded(ds, moves) if moves else 0
+    if apply:
+        st.save()
+    for row in rows:
+        print(f"  {row['file']}  {row['status']}")
+    print(f"[exclude] {moved} 张已淘汰（共处理 {len(rows)} 张）"
+          + ("" if apply else "（dry-run：加 apply:true 才动文件）"))
+    return {"rows": rows, "moved": moved, "applied": bool(apply)}
 
 
 # --------------------------------------------------------------------------

@@ -10,7 +10,10 @@
  *
  *   node --import ./test/stub/register.mjs test/params.mjs
  */
-import { RUN_OUTPUT_PROPERTIES, STAGE_PARAMS, stageParamError } from '../lib/run.js'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { RUN_OUTPUT_PROPERTIES, STAGE_PARAMS, datasetFacts, stageParamError } from '../lib/run.js'
 import { registerAnimaTools } from '../lib/tools.js'
 
 const errors = []
@@ -88,6 +91,43 @@ for (const key of Object.keys(RUN_OUTPUT_PROPERTIES)) {
 }
 check(Object.keys(jobSchema).length === Object.keys(stageSchema).length,
   'anima_job 与 anima_stage 输出 schema 完全一致')
+
+// ---- 4. 图桶扫描 + status 渲染（复盘痛点 4/5）-------------------------------
+// 上次真实使用把 142 条成品 caption 放在 clean/ 与 watermark/ 里，images/ 是空的，
+// 于是 anima_status 只报 raw=0 images=0 captions=0，工具对整批成品视而不见。
+
+const tmpHome = mkdtempSync(join(tmpdir(), 'anima-params-'))
+const dsRoot = join(tmpHome, 'datasets', 't')
+for (const dir of ['clean', 'watermark', 'images', '00_raw', '_pipeline']) {
+  mkdirSync(join(dsRoot, dir), { recursive: true })
+}
+writeFileSync(join(dsRoot, 'clean', '0001.png'), 'png')
+writeFileSync(join(dsRoot, 'clean', '0001.txt'), '@t, 1girl, solo')
+writeFileSync(join(dsRoot, 'watermark', '0002.jpg'), 'jpg')
+writeFileSync(join(dsRoot, 'watermark', '0002.txt'), '@t, 1boy, watermark')
+writeFileSync(join(dsRoot, '00_raw', '149878653_p0.png'), 'png')
+writeFileSync(join(dsRoot, '_pipeline', 'wash_report.csv'), 'file,origin\n0001.png,A=booru\n0002.jpg,A=none\n')
+
+const facts = datasetFacts({ config: () => ({ home: tmpHome }) }, 't')
+check(facts.buckets.map((b) => b.name).join(',') === 'clean,watermark',
+  `datasetFacts 发现图桶（实际 ${facts.buckets.map((b) => b.name).join(',') || '无'}）`)
+check(facts.bucketImages === 2 && facts.bucketCaptions === 2,
+  `datasetFacts 数桶里的图与 caption（${facts.bucketImages} 图 / ${facts.bucketCaptions} caption）`)
+check(facts.images === 0 && facts.raw === 1, '空 images/ 与 00_raw 仍各按各的算')
+check(facts.reports.some((r) => r.name === 'wash_report.csv' && r.rows === 2), '报告行数照旧数得对')
+
+const defs2 = new Map()
+registerAnimaTools({
+  tools: { register: (def) => { defs2.set(def.name, def); return () => defs2.delete(def.name) } },
+  effect: (fn) => fn(),
+}, { resolve: () => ({ home: tmpHome }) })
+const statusTool = defs2.get('anima_status')
+const statusValue = await statusTool.execute({ dataset: 't' }, { signal: undefined })
+const statusText = statusTool.output.render({ dataset: 't' }, statusValue)
+  .map((part) => part.text).join('\n')
+check(/图桶: clean 1图\/1caption/.test(statusText), `anima_status 渲染出图桶行（${JSON.stringify(statusText.split('\n')[1] ?? '')}）`)
+check(/caption 健康度/.test(statusText), 'anima_status 仍带 caption 健康度')
+rmSync(tmpHome, { recursive: true, force: true })
 
 console.log(errors.length === 0
   ? '\n[params] ALL OK'

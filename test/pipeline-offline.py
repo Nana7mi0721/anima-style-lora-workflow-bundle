@@ -217,6 +217,85 @@ check(txt.read_text(encoding="utf-8").strip() == "@tstyle, 1girl, solo", "fix-ca
 code, out = run("fix-caption", "--dataset", "t", "--name", "9999", "--add", "x", "--apply", expect=1)
 check("找不到" in out or "没有" in out, "fix-caption 对不存在的图报错而不是静默")
 
+# --- 图桶 + 冲突族 + 快照/差异 + exclude（小叶子miv 复盘那批修复）-----------
+
+import sys as _sys                                    # noqa: E402
+_sys.path.insert(0, str(BUNDLE / "python"))
+from animasl import config as _config, state as _state, makecfg as _makecfg, wash as _wash  # noqa: E402
+
+check(_wash.normalize_tag(":|") == ":|" and _wash.normalize_tag("@_@") == "@_@"
+      and _wash.normalize_tag("o_o") == "o_o" and _wash.normalize_tag(">_<") == ">_<",
+      "标点/表情标签不被洗坏（:| @_@ o_o >_<）")
+check(_wash.normalize_tag("smile,") == "smile" and _wash.normalize_tag("seifuku") == "seifuku",
+      "普通标签照旧去尾标点、下划线归一成空格")
+check("conflict-hair-color" in " ".join(_wash.conflict_issues(["pink hair", "purple hair"])),
+      "发色冲突被检出")
+check("conflict-underwear" in " ".join(_wash.conflict_issues(["panties", "no panties"])),
+      "下着冲突被检出")
+check(_wash.conflict_issues(["1girl", "1boy"]) == [], "1girl + 1boy 不算冲突")
+check("count-conflict" in " ".join(_wash.conflict_issues(["solo", "1boy"])), "solo 与多人互斥被检出")
+
+bk = home / "datasets" / "bk"
+bk.mkdir(parents=True, exist_ok=True)
+run("init", "--dataset", "bk", "--trigger", "@bk", "--kind", "style")
+(bk / "images").mkdir(exist_ok=True)                  # 空的 images/ 不该被当成图桶
+for bucket, name, color, body in [("clean", "0001.png", (10, 90, 160), "@bk, 1girl, solo, smile"),
+                                  ("watermark", "0002.png", (200, 40, 40), "@bk, 1boy, watermark, signature")]:
+    d = bk / bucket
+    d.mkdir(exist_ok=True)
+    make_png(d / name, color=color)
+    (d / name[:-4]).with_suffix(".txt").write_text(body, encoding="utf-8", newline="\n")
+# latest/ 做成 clean 的硬链接副本：复盘痛点 5（makecfg 曾把 142 张算成 284 张）
+(bk / "latest").mkdir(exist_ok=True)
+hardlinked = True
+try:
+    os.link(bk / "clean" / "0001.png", bk / "latest" / "0001.png")
+    os.link(bk / "clean" / "0001.txt", bk / "latest" / "0001.txt")
+except OSError:
+    hardlinked = False
+
+cfg = _config.Config.load(home=str(home))   # 别吃默认 home，否则 Dataset 指向别的数据根
+bds = _config.Dataset("bk", cfg)
+labels = [label for label, _ in bds.bucket_dirs()]
+check(labels == ["clean", "latest", "watermark"], f"图桶自动发现（实际 {labels}）")
+check("images" not in labels, "空 images/ 不算图桶")
+check(len(bds.work_images()) == 3, f"work_images 收齐三个桶里的图（实际 {len(bds.work_images())}）")
+
+code, out = run("wash", "--dataset", "bk", "--apply")
+check("clean" in out and "watermark" in out, "wash 报出处理的图桶")
+check("标签来源" in out and "A=none" in out, "wash 体检标签来源（A=none 要显眼）")
+check("enrich" in out or "fetch" in out, "A=none 占多数时给可执行修法（enrich / fetch）")
+c1 = bk / "clean" / "0001.txt"
+check(c1.read_text(encoding="utf-8").startswith("@bk"), "桶里的 caption 被就地重写（不再只认 images/）")
+check(len(list((bk / "_pipeline" / "captions_prev").glob("*"))) >= 1, "wash 写盘前留了 caption 快照")
+
+# 人工改 caption（删掉 smile）后重跑：不该复活，且要出本次 vs 上次的差异表
+c1.write_text("@bk, 1girl, solo", encoding="utf-8", newline="\n")
+run("wash", "--dataset", "bk", "--apply")
+body = c1.read_text(encoding="utf-8")
+check("smile" not in body, "桶布局下防复活照旧生效")
+diff_file = bk / "_pipeline" / "wash_diff.csv"
+check(diff_file.exists(), "wash 写盘后产出 wash_diff.csv（本次 vs 上次）")
+if diff_file.exists():
+    check("0001" in diff_file.read_text(encoding="utf-8"), "wash_diff.csv 里记着被改的那张")
+
+subs = _makecfg.collect_subsets(bds, None)
+total = sum(s["count"] for s in subs)
+check(total == 2, f"makecfg 跨桶按内容指纹去重（硬链接不算两次，实际 {total}）")
+if hardlinked:
+    check("latest" not in [s["name"] for s in subs], "整桶都是副本的桶被跳过并说明")
+
+code, out = run("exclude", "--dataset", "bk", "--names", "0002", "--reason", "user", "--apply")
+check(code == 0 and (bk / "_excluded" / "user" / "0002.png").exists(), "exclude 把图移进 _excluded/<reason>")
+check(any("0002" in n for n in _state.user_deleted_names(bds)), "exclude 记进 user_deleted.json")
+code, out = run("exclude", "--dataset", "bk", "--undo", "--apply")
+check(code == 0 and (bk / "watermark" / "0002.png").exists(), "exclude --undo 按账本搬回来")
+(bk / "clean" / "0001.png").unlink()
+(bk / "latest" / "0001.png").unlink()
+code, out = run("exclude", "--dataset", "bk", "--missing", "--apply")
+check(code == 0 and any("0001" in n for n in _state.user_deleted_names(bds)),
+      "exclude --missing 把「账本里有、图桶里没有」的记成人工删除")
+
 # --- verify / dict-check ----------------------------------------------------
 
 code, out = run("verify", "--dataset", "t")

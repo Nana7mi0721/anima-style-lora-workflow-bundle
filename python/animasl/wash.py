@@ -232,7 +232,23 @@ DEFAULT_RULES: dict = {
     # 10 → 5 → 4），但**本预设按用户拍板取消**：0 = 不限制，出现几次都保留。
     # 想跟随指南就把它改成 4（wash 会打印「[wash] 角色阈值 §8.2：…」确认已生效）。
     "character_min_images": 0,
-    "unknown_policy": "report",    # report | drop | keep
+    "unknown_policy": "report",    # report | drop | keep | alias-to-canonical
+    # 词典不认识的写法 → 现行形（unknown_policy=alias-to-canonical 时启用）。
+    # 与 aliases 的分工：aliases 是**无条件**展开（词典认识的也换），这里只在"查无此标签"
+    # 时兜底归一，避免像旧行为那样把整类废弃写法静默丢掉（复盘痛点 10）。
+    "canonical_map": {},
+    # 外部标识整族（§8.1）。图**没被修补**时这些标签是该写的——水印有固定像素对应，
+    # 标了模型才把那片像素归因到 watermark 而不是画风；所以默认保留。
+    # `--drop-marks` 把整族当 banned 丢，给 clean/ 这种已 PS 去签名的桶用（复盘痛点 9）。
+    "mark_tags": [
+        "watermark", "blue watermark", "red watermark", "white watermark", "black watermark",
+        "signature", "artist name", "artist logo", "twitter username", "web address",
+        "sample watermark", "logo", "text", "english text", "chinese text",
+        "korean text", "japanese text",
+    ],
+    # 冲突族覆盖表（空 = 用内置 CONFLICT_GROUPS）；prefer 是并集冲突时的裁决方
+    "conflict_groups": {},
+    "prefer": "",                  # "" | "A"（图源标签）| "C"（既有 caption）
     "min_tags": 20,
     "max_tags": 45,
     # 指南 §3.1：实测成品是纯标签串，混排自然语言「可选，非默认」。要保留来源 caption 里
@@ -337,8 +353,24 @@ def _apply_kind_rules(rules: dict) -> None:
 _WS = re.compile(r"\s+")
 
 
+# 表情/符号类标签**都是真标签**（`:|` 14582、`@_@` 56496、`>_<` 94748、`o_o` 29002、
+# `...` 79543），而旧的 `normalize_tag` 无脑 `.strip(".,;:")` + `replace("_"," ")` 会把它们洗坏：
+# `:|` → `|`、`@_@` → `@ @` ⇒ caption 里留下词典查不到的假标签（复盘痛点 3 实测到的
+# `0060` 的 `|`）。下面两份白名单让纯符号标签原样通过。
+_SYMBOL_TAGS = frozenset({
+    ":|", ":-|", ":/", ":-/", ":3", ":d", ":o", ":p", ":q", ":x", ":(",
+    ">_<", ">w<", "^_^", "-_-", "o_o", "0_0", "u_u", "._.", "x_x", "t_t", ";_;",
+    "@_@", "!?", "?", "!!", "...", "..", "♪", "♡", "☆",
+})
+_SYMBOL_RX = re.compile(r"[^\w\s]+(?:_[^\w\s]+)*\Z")
+
+
 def normalize_tag(tag: str) -> str:
-    t = tag.strip().strip('"').strip("'").strip(".,;:")
+    t = tag.strip().strip('"').strip("'").strip()
+    low = t.lower()
+    if low in _SYMBOL_TAGS or (low and _SYMBOL_RX.fullmatch(low)):
+        return low                     # 纯符号标签：标点与下划线都别动
+    t = t.strip(".,;:")
     t = t.replace("_", " ")
     t = _WS.sub(" ", t)
     t = t.lower()
@@ -566,6 +598,25 @@ def parse_caption(text: str) -> tuple[list[str], str]:
     return tags, nlp
 
 
+def canonical_form(tag: str, rules: dict, td) -> str:
+    """词典不认识的写法 → 现行形（`unknown_policy=alias-to-canonical` 时启用）。
+
+    查三条：显式 `canonical_map` → 别名表 → 形态变体（连字符↔空格、单复数）。只有**目标
+    真的在词典里**才返回，否则返回 ""（宁可报 unknown，也别造一个新幻觉标签）。"""
+    for table in (rules.get("canonical_map") or {}, rules.get("aliases") or {}):
+        tgt = table.get(tag)
+        if isinstance(tgt, (list, tuple)):
+            tgt = tgt[0] if tgt else ""
+        if tgt and str(tgt) != tag and lookup_key(str(tgt)) in td:
+            return str(tgt)
+    cands = [tag.replace("-", " "), tag.replace(" ", "-")]
+    cands.append(tag[:-1] if tag.endswith("s") else tag + "s")
+    for c in cands:
+        if c and c != tag and lookup_key(c) in td:
+            return c
+    return ""
+
+
 def wash_tags(raw_tags: list[str], rules: dict, td, trigger: str = "",
               report: dict | None = None, drop_extra: set[str] | None = None,
               drop_chars: dict[str, int] | None = None) -> list[str]:
@@ -616,6 +667,12 @@ def wash_tags(raw_tags: list[str], rules: dict, td, trigger: str = "",
                 and tag not in (rules.get("rating_tags") or ()):
             if trig_cmp and tag.strip().lstrip("@").lower() == trig_cmp:
                 return            # 触发词不是标签，别记成"词典里没有"
+            if rules.get("unknown_policy") == "alias-to-canonical":
+                canon = canonical_form(tag, rules, td)
+                if canon:
+                    dropped.append({"tag": tag, "why": f"normalized-to({canon})"})
+                    emit(canon, allow_alias=False)
+                    return
             unknown.append(tag)
             if rules.get("unknown_policy") == "drop":
                 dropped.append({"tag": tag, "why": "not-a-real-tag"})
@@ -742,6 +799,8 @@ def validate(line: str, rules: dict, tag_count: int, td=None) -> list[str]:
         if part and is_negative(part, rules, td):
             issues.append(f"banned-tag({part})")
             break
+    # 语义冲突族（发色/瞳色/长度/胸围/下着/人数）——只报不裁，让人或视觉子代理定夺
+    issues.extend(conflict_issues([normalize_tag(p) for p in line.split(",") if p.strip()], rules))
     return issues
 
 
@@ -749,6 +808,74 @@ def validate(line: str, rules: dict, tag_count: int, td=None) -> list[str]:
 _SOLO = "solo"
 _MULTI_COUNT = ("2girls", "3girls", "4girls", "5girls", "6+girls", "multiple girls",
                 "1boy", "2boys", "3boys", "multiple boys", "solo focus")
+
+
+# 语义冲突族：同一族里出现 ≥2 个不同取值 = 冲突。旧实现只查人数（复盘痛点 2：146 张里
+# 发色/瞳色冲突 32+38 张、`no panties` vs `panties` 5 张都是靠人肉看出来的）。
+# 注意 **`1girl` 与 `1boy` 不是冲突**（同人图常态），所以没有 gender 组。
+CONFLICT_GROUPS: dict[str, tuple[str, ...]] = {
+    "hair-color": ("black hair", "brown hair", "blonde hair", "red hair", "pink hair",
+                   "purple hair", "blue hair", "green hair", "orange hair", "white hair",
+                   "grey hair", "silver hair", "aqua hair", "yellow hair",
+                   "light blue hair", "dark blue hair"),
+    "eye-color": ("black eyes", "brown eyes", "red eyes", "pink eyes", "purple eyes",
+                  "blue eyes", "green eyes", "orange eyes", "white eyes", "grey eyes",
+                  "silver eyes", "aqua eyes", "yellow eyes",
+                  "light blue eyes", "dark blue eyes"),
+    "hair-length": ("short hair", "medium hair", "long hair", "very long hair",
+                    "absurdly long hair", "floor-length hair"),
+    "breast-size": ("flat chest", "small breasts", "medium breasts", "large breasts",
+                    "huge breasts", "gigantic breasts"),
+    "underwear": ("panties", "no panties", "bra", "no bra", "underwear", "no underwear"),
+    # count 只查 solo 与多数人/`solo focus` 的互斥（`1girl`+`1boy` 是常态，不算冲突）
+    "count": (_SOLO,) + _MULTI_COUNT,
+}
+
+
+def conflict_issues(names: list[str], rules: dict | None = None) -> list[str]:
+    """一份 caption 里的语义冲突。人数沿用历史文案 `count-conflict(solo vs X)`。
+
+    返回的是**提示**而不是错误：wash 只是把它记进报告的 issues 列，让 agent/人去看图定夺
+    （指南 §8.3：视觉回报才是权威）。要自动裁决就配 `prefer`（见 cmd_wash）。"""
+    groups = dict(CONFLICT_GROUPS)
+    for g, vals in ((rules or {}).get("conflict_groups") or {}).items():
+        groups[str(g)] = tuple(str(v) for v in vals)
+    have = set(names)
+    out: list[str] = []
+    for group, values in groups.items():
+        hit = [v for v in values if v in have]
+        if group == "count":
+            if _SOLO in have:
+                clash = [t for t in _MULTI_COUNT if t in have]
+                if clash:
+                    out.append("count-conflict(solo vs " + ", ".join(clash) + ")")
+            continue
+        if len(hit) >= 2:
+            out.append(f"conflict-{group}(" + " vs ".join(hit[:3]) + ")")
+    return out
+
+
+def _provenance_prefer(tags: list[str], prov: dict[str, str], prefer: str,
+                       dropped: list[dict]) -> list[str]:
+    """`prefer=A|C`：并集里同一冲突族出现多个取值时，只留 prefer 侧那些标签。
+
+    来源不明的标签（既不在 A 也不在 C 里，例如别名展开出来的）**不参与裁决**，保留。"""
+    if prefer not in ("A", "C"):
+        return tags
+    other = "C" if prefer == "A" else "A"
+    out = list(tags)
+    for group, values in CONFLICT_GROUPS.items():
+        hit = [t for t in out if t in values]
+        if len(hit) < 2:
+            continue
+        keep = [t for t in hit if prov.get(t) != other]
+        if not keep or len(keep) == len(hit):
+            continue                 # 一侧全无来源标记时别乱裁
+        for t in hit:
+            if t not in keep:
+                out.remove(t)
+                dropped.append({"tag": t, "why": f"conflict-lost-to-prefer-{prefer}({group})"})
+    return out
 
 
 def audit_caption(text: str, rules: dict, td=None, patched: bool = False) -> list[str]:
@@ -795,9 +922,7 @@ def audit_caption(text: str, rules: dict, td=None, patched: bool = False) -> lis
     if residue:
         issues.append("banned-residue(" + "|".join(residue[:4]) +
                       (f"|+{len(residue) - 4}" if len(residue) > 4 else "") + ")")
-    if _SOLO in names and any(t in names for t in _MULTI_COUNT):
-        clash = [t for t in names if t in _MULTI_COUNT]
-        issues.append("count-conflict(solo vs " + ", ".join(clash) + ")")
+    issues.extend(conflict_issues(names, rules))
     return issues
 
 
@@ -817,8 +942,12 @@ def _source_tags(ds, name: str, rmap: dict, meta: dict) -> tuple[list[str], str,
     if not tags_a:
         tags_a = (row.get("tags_full") or "").split()
     caption_file = None
-    for base in (ds.images_dir, ds.raw_dir):
-        cand = base / (Path(name).stem + ".txt")
+    stem = Path(name).stem
+    # 侧车 txt 跟图同目录：图桶（images/ 或 clean/ 一类）优先，再 00_raw。
+    # 旧实现只找 images_dir/raw_dir 两个固定位置 ⇒ 桶布局下读不到现有 caption，
+    # 来源 C 整个丢失（复盘痛点 4：142 条成品 caption 工具全看不见）。
+    for base in [d for _, d in ds.bucket_dirs()] + [ds.raw_dir]:
+        cand = base / (stem + ".txt")
         if cand.exists():
             caption_file = cand
             break
@@ -851,8 +980,17 @@ def _patched_images(ds, rmap: dict) -> set[str]:
 
 
 def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None = None,
-             include_images: bool = True, refresh_source: bool = False) -> dict:
+             include_images: bool = True, refresh_source: bool = False, work_set=None,
+             refresh_booru: bool = False, drop_marks: bool = False, prefer: str = "") -> dict:
     rules = load_rules(ds, rules_over)
+    if drop_marks:
+        # 整族丢外部标识（§8.1）：给 clean/ 这种已经在 PS 里去过签名的桶用
+        rules["drop_exact"] = sorted(set(rules["drop_exact"])
+                                     | {normalize_tag(t) for t in rules.get("mark_tags", ())})
+    prefer = str(prefer or rules.get("prefer") or "").strip().upper()
+    if prefer not in ("", "A", "C"):
+        raise SystemExit(f"[wash] prefer 只接受 A 或 C（给出的是 {prefer!r}）")
+    rules["prefer"] = prefer
     trigger = resolve_trigger(ds, trigger)
     if not trigger:
         print("[wash] ! 未指定触发词（--trigger 或 manifest.trigger），将不插入触发词")
@@ -864,9 +1002,20 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
     print(f"[wash] 目标类型 {_kind}；整类丢弃的词典 category：{_cats or ' （无）'}")
     if _kind == "character":
         print("[wash] 角色 LoRA：角色名 tag 由触发词承载 -> 整类剔除（指南 §5.2 / §8.2）")
-    files = ds.images() if include_images else ds.raw_images()
+    if drop_marks:
+        print("[wash] --drop-marks：外部标识整族当 banned 丢"
+              f"（{len(rules.get('mark_tags', ()))} 条，§8.1 只适用于已经去过签名的图）")
+    if prefer:
+        print(f"[wash] prefer={prefer}：并集里同一冲突族出现多个取值时，只留 {prefer} 侧"
+              f"（来源不明的标签不参与裁决）")
+    buckets = ds.bucket_dirs(work_set)
+    files = ds.work_images(work_set) if include_images else ds.raw_images()
     if not files:
-        raise SystemExit("[wash] 没有图片")
+        raise SystemExit("[wash] 没有图片（图桶：" + (", ".join(f"{l}({d})" for l, d in buckets)
+                                                       or "无") + "）")
+    if include_images and buckets:
+        print("[wash] 图桶：" + "、".join(
+            f"{lbl} {sum(1 for f in files if f.parent == d)} 张" for lbl, d in buckets))
     rmap = curate.load_rename_map(ds)
     meta = curate.load_meta(ds)
 
@@ -899,15 +1048,25 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
               f"（§8.1：能在图像层去掉就去掉，比标出来更好）")
     wm_drop = set(rules["watermark_tags"]) if patched else None
 
+    # 写盘前先给现有 caption 拍一张快照（只留最近 3 份），写盘后跟上一版比 diff ——
+    # 复盘痛点 11/12：wash 就地覆盖、没有任何"本次 vs 上次"的记录。
+    prev_snap = state.latest_snapshot(ds) if apply else None
+    if apply:
+        snap = state.snapshot_captions(ds, work_set=work_set, label="wash")
+        if snap:
+            print(f"[wash] 上一版 caption 已快照到 {snap.relative_to(ds.root)}")
+
     rows: list[dict] = []
     review: list[dict] = []
     no_source = 0
     prose_dropped = 0
+    origin_counts: dict[str, int] = {}
     emptied: list[str] = []            # caption 洗完只剩触发词的张数（来源标签全被规则丢光）
     emptied_why: dict[str, int] = {}
     resurrect_guard = 0                # 有多少张用了「人工删除名单」保护
     for f in files:
         tags_a, text_c, origin = sources[f.name]
+        origin_counts[origin] = origin_counts.get(origin, 0) + 1
         had_source = bool(tags_a) or bool(text_c.strip())
         if not had_source:
             no_source += 1
@@ -915,11 +1074,16 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
 
         # 重跑 wash 不再复活人工删掉的标签：上一轮 wash 记下了「哪些图源标签真的写进了
         # caption」（state.merged_tags），现在 caption 里没有的那几个就是人删的 —— 既包括
-        # fix-caption --remove / apply-review 显式记的，也包括直接改 txt 的。--refresh-source
-        # 是显式逃生口（改了规则、想按图源标签重来一遍）。
+        # fix-caption --remove / apply-review 显式记的，也包括直接改 txt 的。
+        # 三级逃生口：--refresh-booru（只按图源标签重来，**仍尊重人工删除名单**）
+        # → --refresh-source（彻底重洗，连人删的也复活）。
         removed: set[str] = set()
         prev = st.get(f.name)
-        if not refresh_source:
+        if refresh_source:
+            pass
+        elif refresh_booru:
+            removed |= {normalize_tag(t) for t in st.manual_removed(f.name)}
+        else:
             if prev.get("merged_tags") and text_c.strip():
                 now = {normalize_tag(t) for t in tags_c}
                 removed |= {t for t in prev["merged_tags"] if t not in now}
@@ -934,6 +1098,13 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
         merged = wash_tags(list(tags_a) + list(tags_c), rules, td, trigger, rep,
                            drop_extra=wm_drop if f.name in patched else None,
                            drop_chars=drop_chars)
+        if prefer:
+            # 归属：这个标签是图源带的（A）还是既有 caption 带的（C）？两边都有 = 无冲突
+            set_a = {normalize_tag(t) for t in tags_a}
+            set_c = {normalize_tag(t) for t in tags_c}
+            prov = {t: ("A" if t in set_a else "C" if t in set_c else "")
+                    for t in merged}
+            merged = _provenance_prefer(merged, prov, prefer, rep.setdefault("dropped", []))
         nlp_c = filter_prose(nlp_c, rules, td, rep.get("dropped"))
         if nlp_c and not rules.get("keep_natural_language", False):
             prose_dropped += 1
@@ -958,7 +1129,8 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
             )
 
         rows.append({
-            "file": f.name, "origin": origin, "tags_in": len(tags_a) + len(tags_c),
+            "file": f.name, "bucket": ds.bucket_of(f), "origin": origin,
+            "tags_in": len(tags_a) + len(tags_c),
             "tags_out": rep.get("tag_count", 0), "dropped": len(rep.get("dropped", [])),
             "drop_why": "|".join(sorted({str(d.get("why")) for d in rep.get("dropped", [])}))[:160],
             "patched": "yes" if f.name in patched else "",
@@ -972,15 +1144,37 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
 
     curate.write_csv(ds.pipe_dir / "wash_report.csv", rows)
     curate.write_csv(ds.pipe_dir / "review_todo.csv", review)
+    diff_rows: list[dict] = []
     if apply:
         if include_images:
-            state.sync_images(ds, st)
+            state.sync_images(ds, st, work_set=work_set)
         st.save()
+        diff_rows = state.caption_diff(ds, prev_snap, work_set=work_set)
+        if diff_rows:
+            curate.write_csv(ds.pipe_dir / "wash_diff.csv", diff_rows)
     bad = [r for r in rows if r["issues"]]
     print(f"[wash] {len(rows)} 张 -> captions {'已写入' if apply else '未写入(加 --apply)'}"
           f"；有问题 {len(bad)} 张；待看图补全 {len(review)} 张")
+    total = len(rows)
+    print("[wash] 标签来源：" + ("、".join(f"{k} {v}" for k, v in sorted(origin_counts.items()))
+                                 or "（无）"))
+    none_n = origin_counts.get("A=none", 0)
+    if include_images and total and none_n * 2 >= total:
+        print(f"[wash] ! {none_n}/{total} 张没有图源标签（A=none）——这次 wash 实际上只做了"
+              f"「格式化 + 压父标签」，规则里那些『丢画师/IP/质量词』的分支没东西可丢。"
+              f"\n        补 A 源两条路：① `enrich`（按文件 md5 反查 danbooru 原帖；"
+              f"文件名是 `<pixiv_id>_p<页>` 时还会用 pixiv_id 兜一次）"
+              f"\n                      ② `fetch --source danbooru --tags <画师名>` 抓该画师帖再 import"
+              f"（标签靠 md5 匹配回来）。两条都建议在 `text` 之前做。")
+    if diff_rows:
+        print("[wash] 与上一版的差异：" + state.diff_line(ds, diff_rows, prev_snap)
+              + "（详见 _pipeline/wash_diff.csv）")
+    elif apply:
+        print("[wash] 与上一版没有差异（caption 逐张一致）")
     if refresh_source:
-        print("[wash] --refresh-source：按图源标签整体重洗（人工删除的标签也会重新并入）")
+        print("[wash] --refresh-source：按图源标签整体重洗（连人工删除名单都不看）")
+    elif refresh_booru:
+        print("[wash] --refresh-booru：按图源标签重来，但人工删掉的标签仍然不加回来")
     elif resurrect_guard:
         print(f"[wash] {resurrect_guard} 张里有「人工删掉的图源标签」，本轮**没有**把它们加回来"
               f"（记在 _pipeline/per_image.json；要按图源重来一遍加 --refresh-source）")
@@ -1007,12 +1201,14 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
         print("[wash] caption 健康度：")
         for line_ in state.health_lines(ds, trigger=trigger,
                                        min_tags=int(rules.get("min_tags") or 20),
-                                       max_tags=int(rules.get("max_tags") or 45)):
+                                       max_tags=int(rules.get("max_tags") or 45),
+                                       work_set=work_set):
             print(line_)
     return {"count": len(rows), "issues": len(bad), "review": len(review),
             "no_source": no_source, "prose_dropped": prose_dropped,
             "empty_captions": len(emptied), "resurrect_guard": resurrect_guard,
-            "state": str(st.path) if apply else ""}
+            "origins": origin_counts, "a_none": none_n, "diff": len(diff_rows),
+            "prefer": prefer, "state": str(st.path) if apply else ""}
 
 
 def _review_fields(tags: list[str], rules: dict) -> list[str]:
@@ -1065,10 +1261,13 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True, trigger: str =
     if isinstance(data, dict):
         data = data.get("images") or data.get("results") or []
     updated = 0
+    prev_snap = state.latest_snapshot(ds) if apply else None
+    if apply:
+        state.snapshot_captions(ds, label="apply-review")
     for item in data:
         name = item.get("file") or item.get("image") or ""
         stem = Path(name).stem
-        cand = [f for f in ds.images() if f.stem == stem] + \
+        cand = [f for f in ds.work_images() if f.stem == stem] + \
                [f for f in ds.raw_images() if f.stem == stem]
         if not cand:
             print(f"  ! {name} 找不到对应图片")
@@ -1102,6 +1301,11 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True, trigger: str =
         updated += 1
     if apply and updated:
         st.save()
+        rows = state.caption_diff(ds, prev_snap)
+        if rows:
+            curate.write_csv(ds.pipe_dir / "wash_diff.csv", rows)
+            print("[review] 与上一版的差异：" + state.diff_line(ds, rows, prev_snap)
+                  + "（_pipeline/wash_diff.csv）")
     print(f"[review] 已合并 {updated} 张的看图结果"
           + (f"（触发词 {trigger}）" if trigger else ""))
     return {"updated": updated, "trigger": trigger}
@@ -1119,7 +1323,9 @@ def cmd_set_caption(ds, name: str, add: str = "", remove: str = "", set_text: st
     target = state.resolve_name(ds, name)
     hit, where = state.locate(ds, target)
     if hit is None:
-        raise SystemExit(f"[fix-caption] 找不到图片：{name}（在 images/ 与 00_raw/ 都没匹配到）")
+        raise SystemExit(f"[fix-caption] 找不到图片：{name}"
+                         f"（图桶 " + "、".join(f"{l}/" for l, _ in ds.bucket_dirs())
+                         + " 与 00_raw/ 都没匹配到）")
     rules = load_rules(ds)
     trigger = resolve_trigger(ds, trigger)
     td = dicts.load(ds.cfg)
@@ -1157,6 +1363,8 @@ def cmd_set_caption(ds, name: str, add: str = "", remove: str = "", set_text: st
         print("  （dry-run：加 --apply 才写盘）")
         return {"file": hit.name, "before": len(tags), "after": rep.get("tag_count", 0),
                 "issues": len(issues), "applied": False}
+    prev_snap = state.latest_snapshot(ds)
+    state.snapshot_captions(ds, label="fix-caption")
     txt.write_text(line, encoding="utf-8", newline="\n")
     st.record(hit.name, caption=line, caption_source="fix-caption",
               tag_count=rep.get("tag_count", 0), history={"what": "fix-caption"})
@@ -1167,16 +1375,22 @@ def cmd_set_caption(ds, name: str, add: str = "", remove: str = "", set_text: st
         st.record(hit.name, merged_tags=[t for t in extra if normalize_tag(t) in
                                         {normalize_tag(x) for x in merged}])
     st.save()
+    rows = state.caption_diff(ds, prev_snap)
+    if rows:
+        curate.write_csv(ds.pipe_dir / "wash_diff.csv", rows)
+        print("[fix-caption] 与上一版的差异："
+              + state.diff_line(ds, rows, prev_snap) + "（_pipeline/wash_diff.csv）")
     return {"file": hit.name, "before": len(tags), "after": rep.get("tag_count", 0),
             "issues": len(issues), "applied": True, "caption": line}
 
 
-def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "") -> dict:
+def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "",
+               work_set=None) -> dict:
     """Audit every caption against the hard constraints (§3) and the rules."""
     rules = load_rules(ds)
     td = dicts.load(ds.cfg)
     trigger = resolve_trigger(ds, trigger)
-    files = ds.images() or ds.raw_images()
+    files = ds.work_images(work_set) or ds.raw_images()
     if sample and sample > 0 and len(files) > sample:
         step = max(1, len(files) // sample)
         files = files[::step][:sample]
@@ -1227,17 +1441,48 @@ def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "") -> 
         top = sorted(unknown_all.items(), key=lambda kv: -kv[1])[:15]
         print(f"[verify] 词典中不存在的标签 {len(unknown_all)} 种，出现最多的："
               + ", ".join(f"{k}({v})" for k, v in top))
+    # 水印区一致性（§8.1「与视觉台账逐张一致」）：修补过的图不该再有标识标签；
+    # 反过来**不能**做恒定断言（指南明确警告过：只有大部分图有水印），所以只在
+    # 「同批未修补图里过半都标了 watermark」时，才把没标的列出来提醒看图确认。
+    marks = {normalize_tag(t) for t in rules.get("mark_tags", ())}
+    plain: list[str] = []
+    with_mark = 0
+    mark_residue: list[str] = []
+    for f in files:
+        txt = f.with_suffix(".txt")
+        if not txt.exists():
+            continue
+        text = txt.read_text(encoding="utf-8", errors="replace")
+        tags_now = {normalize_tag(t) for t in parse_caption(text)[0]}
+        if f.name in patched:
+            hit = sorted(tags_now & marks)
+            if hit:
+                mark_residue.append(f"{f.name}:{','.join(hit[:3])}")
+        elif tags_now & marks:
+            with_mark += 1
+        else:
+            plain.append(f.name)
+    if mark_residue:
+        print(f"[verify] {len(mark_residue)} 张**已被去字工具修补**却还写着标识标签（§8.1："
+              f"像素没了，写就是幻觉）：" + "; ".join(mark_residue[:6]))
+    unpatched = len(plain) + with_mark
+    if unpatched and with_mark * 2 >= unpatched and plain:
+        print(f"[verify] {unpatched - len(plain)}/{unpatched} 张未修补的图都标了 watermark/signature"
+              f" 一类，另有 {len(plain)} 张没标 —— 看图确认是「本来就没有」还是漏标："
+              + ", ".join(plain[:8]))
     if files and not sample:
         # 图-txt 配对、标签数区间、触发词位置、空 caption —— 一次给全（不必另开 status）
         for line_ in state.health_lines(ds, trigger=trigger,
                                        min_tags=int(rules.get("min_tags") or 20),
-                                       max_tags=int(rules.get("max_tags") or 45)):
+                                       max_tags=int(rules.get("max_tags") or 45),
+                                       work_set=work_set):
             print(line_)
     if online:
         print("[verify] --online：将用 danbooru search[name_comma] 批量复核（每批 120）")
         _online_verify(ds, sorted(unknown_all))
     return {"count": len(rows), "issues": len(bad), "unknown_kinds": len(unknown_all),
-            "residue_kinds": len(residue_all), "trigger": trigger}
+            "residue_kinds": len(residue_all), "trigger": trigger,
+            "mark_residue": len(mark_residue), "mark_unlabeled": len(plain)}
 
 
 def _online_verify(ds, tags: list[str], batch: int = 120) -> dict:

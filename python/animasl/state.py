@@ -41,6 +41,11 @@ def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def now() -> str:
+    """当前时间戳（本地时区、秒级）—— 别的模块记历史时用这个，别碰 _now。"""
+    return _now()
+
+
 def _as_list(value) -> list[str]:
     if value is None:
         return []
@@ -65,14 +70,26 @@ def state_file(ds) -> Path:
 
 
 def caption_path(ds, name: str) -> Path:
-    """caption 的唯一权威路径。"""
+    """caption 的唯一权威路径：**与图同目录**的同名 .txt。
+
+    成品图可能住在 images/ 之外的桶里（clean/、watermark/ …），caption 始终跟着图走；
+    找不到图时回落到 images/（新建 caption 的默认落点）。
+    """
+    hit, _ = locate(ds, name)
+    if hit is not None:
+        return hit.with_suffix(".txt")
     return ds.images_dir / (Path(name).stem + ".txt")
 
 
 def locate(ds, name: str) -> tuple[Path | None, str]:
-    """在 images/ 与 00_raw/ 里找这张图（先 images/）。返回 (路径, "images"|"00_raw"|"")。"""
+    """在成品图桶（images/、clean/、watermark/ …）与 00_raw/ 里找这张图。
+
+    返回 (路径, 桶名)；桶名是 "images"/"clean"/… 或 "00_raw"，找不到是 ""。
+    先成品桶后 00_raw：改名前后同名时以成品为准。
+    """
     stem = Path(name).stem
-    for base, where in ((ds.images_dir, "images"), (ds.raw_dir, "00_raw")):
+    bases = [(label, path) for label, path in ds.bucket_dirs()] + [("00_raw", ds.raw_dir)]
+    for where, base in bases:
         if not base.exists():
             continue
         direct = base / name
@@ -282,32 +299,244 @@ def load(ds) -> State:
     return State.load(ds)
 
 
-def sync_images(ds, st: State | None = None) -> dict:
-    """把 images/ 里的实际文件与状态对齐：新图建记录、消失的图只记一笔（不删记录）。"""
+# -- caption 快照与逐图 diff ----------------------------------------------------
+#
+# 真实使用的痛点 11/12：wash 就地覆盖 images/*.txt，洗坏了没有后悔药；也没有
+# 「本次 vs 上次」的逐图差异（只看到汇总行的 added/removed 数）。
+# 规则：**任何会写 caption 的阶段（wash / apply-review / fix-caption）在写盘前先
+# 快照当前的全部 caption**，并和上一版快照做 diff，产出 `wash_diff.csv`。
+
+SNAPSHOT_DIR = "captions_prev"
+SNAPSHOT_KEEP = 3
+
+
+def _snapshot_root(ds) -> Path:
+    return ds.pipe_dir / SNAPSHOT_DIR
+
+
+def snapshot_captions(ds, work_set=None, label: str = "", keep: int = SNAPSHOT_KEEP) -> Path | None:
+    """把当前工作集里的 caption 抄一份到 `_pipeline/captions_prev/<时间戳>/`。
+
+    返回快照目录（没有 caption 时返回 None）。只保留最新 keep 份，避免无限堆积。
+    """
+    pairs = [(p, p.with_suffix(".txt")) for p in ds.work_images(work_set)]
+    rows = [(img.name, txt.read_text(encoding="utf-8", errors="replace"))
+            for img, txt in pairs if txt.exists()]
+    if not rows:
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = _snapshot_root(ds) / stamp
+    if dest.exists():                       # 同一秒内两次写盘：加后缀
+        dest = _snapshot_root(ds) / f"{stamp}-{len(list(_snapshot_root(ds).iterdir())) + 1}"
+    dest.mkdir(parents=True, exist_ok=True)
+    for name, text in rows:
+        path = dest / f"{Path(name).stem}.txt"
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+    meta = {"at": _now(), "label": label, "files": len(rows)}
+    (dest / "_meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2) + "\n",
+                                     encoding="utf-8")
+    _prune_snapshots(ds, keep)
+    return dest
+
+
+def _prune_snapshots(ds, keep: int = SNAPSHOT_KEEP) -> list[str]:
+    root = _snapshot_root(ds)
+    if not root.exists():
+        return []
+    dirs = sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name)
+    removed = []
+    for old in dirs[:-keep] if keep > 0 else dirs:
+        import shutil
+        shutil.rmtree(old, ignore_errors=True)
+        removed.append(old.name)
+    return removed
+
+
+def latest_snapshot(ds, exclude: Path | None = None) -> Path | None:
+    root = _snapshot_root(ds)
+    if not root.exists():
+        return None
+    dirs = sorted([p for p in root.iterdir() if p.is_dir()], key=lambda p: p.name)
+    if exclude is not None:
+        dirs = [p for p in dirs if p.name != Path(exclude).name]
+    return dirs[-1] if dirs else None
+
+
+def caption_diff(ds, prev: Path | None, work_set=None) -> list[dict]:
+    """逐图比较「上一版 caption」与「现在盘上的 caption」→ 每张一行。"""
+    rows: list[dict] = []
+    for img in ds.work_images(work_set):
+        txt = img.with_suffix(".txt")
+        before = ""
+        if prev is not None:
+            old = prev / f"{img.stem}.txt"
+            if old.exists():
+                before = old.read_text(encoding="utf-8", errors="replace")
+        after = txt.read_text(encoding="utf-8", errors="replace") if txt.exists() else ""
+        b = before.strip()
+        a = after.strip()
+        if b == a:
+            continue
+        bt = [t.strip() for t in b.split(",") if t.strip()]
+        at = [t.strip() for t in a.split(",") if t.strip()]
+        added = [t for t in at if t not in set(bt)]
+        removed = [t for t in bt if t not in set(at)]
+        rows.append({
+            "file": img.name,
+            "bucket": ds.bucket_of(img),
+            "before_tags": len(bt),
+            "after_tags": len(at),
+            "added": added,
+            "removed": removed,
+            "status": "new" if not b else ("emptied" if not a else "changed"),
+        })
+    return rows
+
+
+def diff_line(ds, rows: list[dict], prev: Path | None) -> str:
+    if prev is None:
+        return f"  逐图 diff       首版（没有上一版快照），本次写了 {len(rows)} 张"
+    add = sum(len(r["added"]) for r in rows)
+    rem = sum(len(r["removed"]) for r in rows)
+    return (f"  逐图 diff       与上一版快照比较：{len(rows)} 张有变化"
+            f"（+{add} 标签 / −{rem} 标签）；明细 _pipeline/wash_diff.csv；"
+            f"上一版 caption 副本 _pipeline/{SNAPSHOT_DIR}/{prev.name}/")
+
+
+# -- 用户手删清单 ---------------------------------------------------------------
+#
+# 真实使用时用户手删了 4 张图，工具只在下一轮 rename 里发现「少了 4 张」，
+# 既不知道删的是谁、也没留归档路径 ⇒ 补一张只追加的清单，记原文件名 + 归档位置。
+
+DELETED_NAME = "user_deleted.json"
+
+
+def user_deleted_path(ds) -> Path:
+    return ds.pipe_dir / DELETED_NAME
+
+
+def load_user_deleted(ds) -> dict:
+    path = user_deleted_path(ds)
+    if not path.exists():
+        return {"version": VERSION, "entries": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": VERSION, "entries": []}
+    if not isinstance(data, dict):
+        return {"version": VERSION, "entries": []}
+    data.setdefault("version", VERSION)
+    data.setdefault("entries", [])
+    return data
+
+
+def save_user_deleted(ds, data: dict) -> Path:
+    path = user_deleted_path(ds)
+    ds.pipe_dir.mkdir(parents=True, exist_ok=True)
+    data["updated_at"] = _now()
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+def user_deleted_names(ds) -> set[str]:
+    return {str(e.get("name") or "") for e in load_user_deleted(ds)["entries"] if e.get("name")}
+
+
+def note_user_deleted(ds, name: str, archived: str = "", reason: str = "",
+                      old_names=None, note: str = "", bucket: str = "") -> dict:
+    data = load_user_deleted(ds)
+    entries = data["entries"]
+    for row in entries:
+        if row.get("name") == name and not row.get("restored_at"):
+            row.update({"archived": archived or row.get("archived", ""),
+                        "reason": reason or row.get("reason", ""),
+                        "note": note or row.get("note", ""),
+                        "bucket": bucket or row.get("bucket", "")})
+            save_user_deleted(ds, data)
+            return row
+    row = {
+        "name": name,
+        "stem": Path(name).stem,
+        "old_names": _as_list(old_names),
+        "archived": archived,
+        "bucket": bucket,
+        "reason": reason,
+        "note": note,
+        "at": _now(),
+    }
+    entries.append(row)
+    save_user_deleted(ds, data)
+    return row
+
+
+def clear_user_deleted(ds, name: str) -> bool:
+    data = load_user_deleted(ds)
+    hit = False
+    for row in data["entries"]:
+        if row.get("name") == name and not row.get("restored_at"):
+            row["restored_at"] = _now()
+            hit = True
+    if hit:
+        save_user_deleted(ds, data)
+    return hit
+
+
+def sync_images(ds, st: State | None = None, work_set=None) -> dict:
+    """把成品图桶里的实际文件与状态对齐：新图建记录、消失的图只记一笔（不删记录）。"""
     st = st or State.load(ds)
-    present = {p.name for p in ds.images()} if ds.images_dir.exists() else set()
+    present = {}
+    for label, base in ds.bucket_dirs(work_set):
+        for p in sorted(base.iterdir()):
+            if p.is_file() and p.suffix.lower() in IMG_EXTS:
+                present[p.name] = label
     added = []
     for name in sorted(present):
         if not st.has(name):
-            st.record(name, first_seen=_now(), history={"what": "adopted"})
+            st.record(name, bucket=present[name], first_seen=_now(), history={"what": "adopted"})
             added.append(name)
+        elif st.get(name).get("bucket") != present[name]:
+            st.record(name, bucket=present[name], history={"what": "moved-bucket", "to": present[name]})
     missing = [n for n in st.names() if n not in present]
     if missing:
         for name in missing:
             item = st.get(name)
             if item.get("missing_at"):
                 continue
-            st.record(name, missing_at=_now(), history={"what": "missing-from-images"})
-    return {"added": added, "missing": missing, "present": len(present)}
+            st.record(name, missing_at=_now(), history={"what": "missing-from-buckets"})
+    return {"added": added, "missing": missing, "present": len(present), "buckets": present}
 
 
 _LEADING_TRIGGER = re.compile(r"^@\S+")
 
 
-def caption_health(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45) -> dict:
-    """caption 健康度（A5）：形态问题 + 触发词位置 + 有图无 txt / 有 txt 无图。"""
-    imgs = {p.stem: p.name for p in ds.images()} if ds.images_dir.exists() else {}
-    txts = {p.stem: p for p in sorted(ds.images_dir.glob("*.txt"))} if ds.images_dir.exists() else {}
+def caption_health(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45,
+                   work_set=None) -> dict:
+    """caption 健康度（A5）：形态问题 + 触发词位置 + 有图无 txt / 有 txt 无图。
+
+    跨桶统计：成品图在哪个桶就算哪个桶，caption 与图同目录。
+    """
+    buckets = ds.bucket_dirs(work_set)
+    imgs: dict[str, str] = {}      # stem -> 文件名
+    where: dict[str, str] = {}     # 文件名 -> 桶名
+    txts: dict[str, Path] = {}     # stem -> 路径
+    per_bucket: dict[str, dict] = {}
+    for label, base in buckets:
+        rows = [p for p in sorted(base.iterdir()) if p.is_file() and p.suffix.lower() in IMG_EXTS]
+        if not rows:
+            continue
+        for p in rows:
+            imgs[p.stem] = p.name
+            where[p.name] = label
+        txt_rows = [p for p in sorted(base.glob("*.txt"))]
+        for p in txt_rows:
+            txts[p.stem] = p
+        per_bucket[label] = {
+            "dir": str(base),
+            "images": len(rows),
+            "captions": sum(1 for p in rows if p.with_suffix(".txt").exists()),
+        }
     missing_txt = sorted(name for stem, name in imgs.items() if stem not in txts)
     orphan_txt = sorted(p.name for stem, p in txts.items() if stem not in imgs)
     counts: list[int] = []
@@ -315,6 +544,8 @@ def caption_health(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45
     over: list[str] = []
     bad_trigger: list[str] = []
     empty: list[str] = []
+    duplicates: list[str] = []
+    seen_text: dict[str, str] = {}
     for stem, path in txts.items():
         if stem not in imgs:
             continue
@@ -335,9 +566,17 @@ def caption_health(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45
         if trigger:
             if not body.startswith(trigger) or body.count(trigger) != 1:
                 bad_trigger.append(path.name)
+        prev = seen_text.get(body)
+        if prev:
+            duplicates.append(f"{prev} = {path.name}")
+        else:
+            seen_text[body] = path.name
     return {
+        "buckets": per_bucket,
+        "work_set": [str(b) for _, b in buckets],
         "images": len(imgs),
         "captions": len(txts),
+        "where": where,
         "missing_txt": missing_txt,
         "orphan_txt": orphan_txt,
         "empty": empty,
@@ -347,12 +586,14 @@ def caption_health(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45
         "under_min": under,
         "over_max": over,
         "trigger_not_first": bad_trigger,
+        "duplicate_captions": duplicates,
     }
 
 
-def health_lines(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45) -> list[str]:
+def health_lines(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45,
+                 work_set=None) -> list[str]:
     """caption 健康度 → 给人看的几行。"""
-    h = caption_health(ds, trigger=trigger, min_tags=min_tags, max_tags=max_tags)
+    h = caption_health(ds, trigger=trigger, min_tags=min_tags, max_tags=max_tags, work_set=work_set)
     out = [
         f"  caption 健康度  图 {h['images']} 张 / txt {h['captions']} 个"
         f"　标签数 {h['min_tags']}~{h['max_tags']}（均 {h['avg_tags']}）",
@@ -361,6 +602,12 @@ def health_lines(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45) 
         f"　空 caption：{len(h['empty'])}"
         + (f"　触发词不在首位/重复：{len(h['trigger_not_first'])}" if trigger else ""),
     ]
+    if h["buckets"]:
+        desc = "　".join(f"{name} {row['images']}图/{row['captions']}txt" for name, row in h["buckets"].items())
+        out.append(f"  图桶            {desc}")
+    else:
+        out.append("  ⚠ 图桶          没找到任何含图的目录（images/ 是空的？）"
+                   "　成品图放数据集根下任意子目录都行，工具会自动认。")
     if h["missing_txt"]:
         out.append(f"  ⚠ 有图无 txt（{len(h['missing_txt'])}）：{', '.join(h['missing_txt'][:8])}"
                    + (" …" if len(h["missing_txt"]) > 8 else ""))
@@ -376,4 +623,7 @@ def health_lines(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45) 
     if h["trigger_not_first"]:
         out.append(f"  ⚠ 触发词问题：{', '.join(h['trigger_not_first'][:8])}"
                    + (" …" if len(h["trigger_not_first"]) > 8 else ""))
+    if h["duplicate_captions"]:
+        out.append(f"  ⚠ 两张图 caption 一模一样（{len(h['duplicate_captions'])} 对）："
+                   f"{', '.join(h['duplicate_captions'][:4])}" + (" …" if len(h["duplicate_captions"]) > 4 else ""))
     return out

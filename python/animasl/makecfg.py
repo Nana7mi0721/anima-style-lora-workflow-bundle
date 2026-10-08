@@ -13,6 +13,7 @@ epochs from the target exposure, save interval from the step count.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -58,6 +59,49 @@ def repeats_for(count: int) -> int:
     return 1
 
 
+def _fingerprint(p: Path) -> tuple:
+    """(大小, 前 256KB 的 md5)：够用来认出硬链接/副本，又不至于把 1000 张图算一分钟。"""
+    h = hashlib.md5()
+    with open(p, "rb") as fh:
+        h.update(fh.read(262144))
+    return (p.stat().st_size, h.hexdigest())
+
+
+def dedupe_subsets(subsets: list[dict], verbose: bool = True) -> list[dict]:
+    """跨桶按**内容指纹**去重。
+
+    复盘痛点 5：上一次真实使用里 `images/` 与 `clean/`+`watermark/` 指向同一批图（硬链接），
+    makecfg 把 142 张数成 284 张 ⇒ repeats/epochs/steps 全错。这里按内容去重，
+    整桶都是副本的直接跳过（并在输出里说清楚）。"""
+    seen: dict[tuple, str] = {}
+    kept: list[dict] = []
+    for s in subsets:
+        path = s.get("path")
+        uniq = dup = 0
+        if path is not None and Path(path).exists():
+            for f in sorted(Path(path).iterdir()):
+                if not f.is_file() or f.suffix.lower() not in curate.IMG_EXTS:
+                    continue
+                fp = _fingerprint(f)
+                owner = seen.get(fp)
+                if owner is None:
+                    seen[fp] = s["name"]
+                    uniq += 1
+                else:
+                    dup += 1
+                    if verbose:
+                        print(f"[makecfg] ! {s['name']}/{f.name} 与 {owner} 里的图内容相同"
+                              f"（硬链接/副本）——只算一次")
+        s = dict(s, count=uniq, dup=dup)
+        if dup and not uniq:
+            if verbose:
+                print(f"[makecfg] ! 图桶 {s['name']} 整桶都是别的桶的副本，本次**跳过**"
+                      f"（想同时训练两个版本就改文件名，别用硬链接）")
+            continue
+        kept.append(s)
+    return kept
+
+
 def collect_subsets(ds, subdirs: list[str] | None, base: Path | None = None) -> list[dict]:
     """[{name, path, count}] -- only directories that actually exist and hold images."""
     base = base or ds.root
@@ -73,12 +117,14 @@ def collect_subsets(ds, subdirs: list[str] | None, base: Path | None = None) -> 
         return out
     out = []
     for p in sorted(base.iterdir()) if base.exists() else []:
-        # 00_raw is the download staging area: `rename` moves its files into
-        # images/, so counting both would silently double every picture.
+        # 00_raw 是下载暂存区（`rename` 会把图搬进图桶），两边都数会凭空翻倍。
+        # 图桶统一走 ds.bucket_dirs()：跳过 `_`/`.` 前缀、thumbs、masks，且要求真的含图。
         if p.is_dir() and not p.name.startswith(("_", ".")) and p.name not in ("meta", "00_raw"):
             n = len([f for f in p.iterdir() if f.suffix.lower() in curate.IMG_EXTS])
             if n:
                 out.append({"name": p.name, "path": p, "count": n})
+    if len(out) > 1:
+        out = dedupe_subsets(out)
     return out
 
 

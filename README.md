@@ -13,7 +13,7 @@ DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 →
 | agent 预设 `anima-style-lora`（显示名「Anima风格LoRA全流程」） | 带专属 persona 的 agent 组合；`skill-filesystem` 通过 `customSkillDirs` 挂载本包的 `skills/` |
 | 3 个 skill | `anima-style-lora-pipeline`（总纲）/ `-source`（选源下载）/ `-curate`（筛选 + 文字修补 + 视觉复核） |
 | 设置页（浏览器半侧 + 宿主路由 `/anima-lora/api`） | 在 DSH 设置里直接改全部配置项（含凭据），写进 `<home>/.animasl/animasl.config.json`，下次调用即生效 |
-| Python 工具箱 `python/animasl/` | 16 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
+| Python 工具箱 `python/animasl/` | 17 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
 
 ## 安装
 
@@ -58,7 +58,7 @@ npm run test:client   # 设置页浏览器半侧：假 React 渲染 + 断言发�
 npm run test:route    # 设置页宿主路由：真起 http server + 真 Python CLI（含信任栅栏）
 npm run test:route:doctor  # 上面那条再加一次真 doctor（慢约 1 分钟）
 npm run test:py       # 离线：Cloudflare 挑战识别 + curl 参数 + cookie 域隔离 + 凭据优先级
-npm run test:params   # 离线：参数矩阵（哪些阶段不吃 apply）+ 两个工具的返回 schema 一致
+npm run test:params   # 离线：参数矩阵（哪些阶段不吃 apply）+ 两个工具的返回 schema 一致 + 图桶扫描
 npm run test:pipeline # 离线端到端：init→…→verify→dict-check→makecfg（临时数据集，跑完自删）
 npm run test:all      # 上面全部（check:patch + params + client + route + py + pipeline + smoke）
 ```
@@ -67,14 +67,17 @@ npm run test:all      # 上面全部（check:patch + params + client + route + p
 `E:/LoRA_Train/.animasl/venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
 `SKIP` 并返回 0）。
 
-`test/pipeline-offline.py` 是**唯一一条把 16 个阶段串起来跑**的回归：在 `<home>/datasets`
+`test/pipeline-offline.py` 是**唯一一条把 17 个阶段串起来跑**的回归：在 `<home>/datasets`
 下建 `_pipeoff_*` 临时现场（`_` 前缀，`anima_status` 看不见），用真 CLI 走
 init → import（含"跳过非图"与"拒绝 src=数据集根"）→ rename → thumbs（重排之后仍出图）
-→ 第二批 import + rename（验证对照表只追加）→ wash（触发词置首、并入图源标签、
-**人工删掉的标签不复活**、`refreshSource` 才整体重洗）→ fix-caption 三种用法 →
+→ 第二批 import + rename（验证对照表只追加）→ 图桶布局（`clean/` + `watermark/` + 硬链接副本
+`latest/`：桶自动发现、caption 就地重写、`makecfg` 去重）→ wash（触发词置首、并入图源标签、
+**人工删掉的标签不复活**、`refreshSource` 才整体重洗、A 源体检告警、`wash_diff.csv` 快照差异）
+→ exclude（淘汰 / `undo` 回原桶 / `missing` 补账）→ fix-caption 三种用法 →
 verify → dict-check → makecfg（LR 超区间报错、`allowOutOfBand` 放行、`preflight.txt` 的
-差异段），共 34 条断言，跑完删现场（`--keep` 保留）。它抓到过：`import`/`fetch` 其实没有
-`apply`、wash 会把标签规范成空格形、缩略图落在 `_pipeline/thumbs` 而不是数据集根。
+差异段），共 66 条断言，跑完删现场（`--keep` 保留）。它抓到过：`import`/`fetch` 其实没有
+`apply`、wash 会把标签规范成空格形、缩略图落在 `_pipeline/thumbs` 而不是数据集根、
+`exclude --undo` 把图恢复到 `images/` 而不是它原来的桶（`user_deleted.json` 当时没记 `bucket`）。
 
 `test/smoke.mjs` 把插件装进一个假 ctx（`test/stub/` 用 ESM loader 钩子把
 `@deepseek-ai/dsh-tools` 指到替身），校验注册数量、返回值无 `undefined`、
@@ -136,7 +139,13 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 
 插件的 `config`（在 profile 的 `cordis.patch.yml` 里改）：`home` / `pythonDir` / `python` / `mlPython` / `runtimeDir` / `animaLoraDir` / `timeoutMs` / `longTimeoutMs`。
 
-## 十六个阶段
+## 十七个阶段
+
+### 图桶：根下任何含图的子目录都是数据
+
+`images/` 只是**默认**落点，不是唯一落点。真实使用里出现过 `clean/`（109 张已修水印）+ `watermark/`（33 张未修）的布局，成品 caption 全在这两个目录里、`images/` 是空的 —— 当时的工具只数 `images/`，于是 `anima_status` 报 `raw=0 images=0 captions=0`，`verify`/`thumbs`/`fix-caption` 对着 142 条成品 caption **视而不见**（`makecfg` 还会把 `images/` 与子目录里的同一张图算两遍，142 变成 284）。
+
+现在：**根下任何含图的子目录都自动算图桶**（跳过 `_`/`.` 前缀与 `00_raw`/`thumbs`/`masks`/`orig_text`；空目录不算），`images/` 排在最前。所有阶段默认扫全部桶，caption 与图**同目录**；只想处理某个子集就传 `workSet:"clean,watermark"`，给错名字会报错并列出自动发现的桶。`makecfg` 另外按内容指纹跨桶去重（硬链接/副本只算一次），整桶都是副本时跳过并说明。
 
 | stage | 工具参数要点 | 产出 |
 |---|---|---|
@@ -149,12 +158,13 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | `thumbs` | `maxSide`(1536)、`prune`、`includeImages` | `_pipeline/thumbs/`（视觉子代理只能看这个） |
 | `text` | `warnRatio`(0.08)、`dropRatio`(0.30)、`patchSmall`、`thresholds`、`dilate`(6) | `masks/`、`text_report.csv`；修补后自动把 `wash` 标 stale |
 | `rename` | `start`(1)、`digits`(4)、`move` | `images/0001.ext` + `rename_map.csv`（只追加）+ `per_image.json` |
-| `wash` | `trigger`、`rules`、`refreshSource`、`noImages` | `images/NNNN.txt` + `wash_report.csv` + `review_todo.csv` |
+| `wash` | `trigger`、`rules`、`minTags`/`maxTags`、`prefer`(A\|C)、`dropMarks`、`refreshBooru`(只忽略手删名单)、`refreshSource`(最狠：连手删名单都不看)、`noImages`、`workSet` | 每个图桶里的 `NNNN.txt` + `wash_report.csv` + `review_todo.csv` + `wash_diff.csv`（本次 vs 上次改了哪些）+ `captions_prev/` 快照 |
 | `review-list` / `apply-review` | `payload` | 看图必答字段的往返 |
-| `fix-caption` | `name`(必填)、`add`/`remove`/`set` 三选一 | 只改点名的那一张 caption |
-| `verify` | `online`、`sample`、`trigger` | `wash_verify.csv`；§3 形态 + §9 内容闸门（BANNED 残留、否定式、质量词、人数一致性、图-txt 配对、触发词位置） |
+| `fix-caption` | `name`(必填)、`add`/`remove`/`set` 三选一 | 只改点名的那一张 caption（写盘前留快照，写盘后出 `wash_diff.csv`） |
+| `exclude` | `names`、`reason`、`note`；`undo` 按账本搬回原桶、`missing` 事后补账、无参数列清单 | 图 + 同名 txt 移进 `_excluded/<reason>/`，并记进手删账本（重跑 `wash` 不复活） |
+| `verify` | `online`、`sample`、`trigger`、`workSet` | `wash_verify.csv`；§3 形态 + §9 内容闸门（BANNED 残留、否定式、质量词、人数一致性、**冲突族**、水印区与修补状态一致性、图-txt 配对、触发词位置） |
 | `dict-check` | 不给 `tags` 就查现有 caption（只按逗号切，多词标签不会被拆） | 终端输出：存在 / 别名可归一 / `post_count=0`（幻觉标签）/ 词典外 + 形近候选，各带"出现在几张图里" |
-| `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution`、`allowOutOfBand` | 四件套 + `preflight.txt` |
+| `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution`、`allowOutOfBand` | 四件套 + `preflight.txt`；自动发现图桶 + 跨桶按内容指纹去重 |
 
 **写盘语义按阶段分三类**（传了不支持的参数会在**执行前**报错，错误里列出该阶段支持的参数）：
 
@@ -162,10 +172,10 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 |---|---|---|
 | 写盘是默认行为 | `init`、`thumbs` | **不吃 `apply`**；`init` 靠 `force`/`reset` 控制 |
 | 默认写盘、`dryRun` 反转 | `fetch`、`import` | 预演用 `dryRun:true` |
-| 默认 dry-run、要 `apply:true` | `enrich`、`dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`makecfg` | 不带就只出报告（`enrich` 的 dry-run **仍会发请求**——它就是给你看命中率的） |
+| 默认 dry-run、要 `apply:true` | `enrich`、`dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`exclude`、`makecfg` | 不带就只出报告（`enrich` 的 dry-run **仍会发请求**——它就是给你看命中率的） |
 | 只读 | `status`、`review-list`、`verify`、`dict-check` | 没有 `apply` |
 
-**dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子）。
+**dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子），数据集用了 `images/` 以外的桶时再多打一行 **图桶**（`图桶: clean 109图/109caption、watermark 33图/33caption`）。
 
 **重复 `init` 不会毁掉进度**：数据集已存在时 `init` 只打印提示就返回；`init --force` 是**就地更新**触发词/类型（阶段记录全部保留），只有 `init --reset --yes` 才会丢掉阶段记录从零重建——`--reset` 不带 `--yes` 会先把「当前已完成：init, wash」列出来让你确认。类型（`--kind`）决定 wash 的整类规则，中途改类型是安全的：`--force` 改完从 `wash` 起重跑即可。
 
@@ -175,10 +185,14 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 
 | 文件 | 谁写 | 谁读 | 规矩 |
 |---|---|---|---|
-| `images/<stem>.txt` | `wash` / `apply-review` / `fix-caption` | 所有下游（`verify`/`makecfg`） | **caption 的唯一权威副本**；要改走 `fix-caption`，别手改文件再重跑 `wash` |
-| `_pipeline/per_image.json` | `rename` / `wash` / `apply-review` / `fix-caption` | 引擎自己 | **只追加**：`old_names`/`merged_tags` 取并集、`history` 留最近 30 次；坏文件会改名 `.json.broken` 并从空状态继续 |
+| `<桶>/<stem>.txt` | `wash` / `apply-review` / `fix-caption` | 所有下游（`verify`/`makecfg`） | **caption 的唯一权威副本**，与图同目录（`images/` 或 `clean/`…）；要改走 `fix-caption`，别手改文件再重跑 `wash` |
+| `_pipeline/per_image.json` | `rename` / `wash` / `apply-review` / `fix-caption` / `exclude` | 引擎自己 | **只追加**：`old_names`/`merged_tags` 取并集、`history` 留最近 30 次、`bucket` 记它在哪个桶；坏文件会改名 `.json.broken` 并从空状态继续 |
 | `_pipeline/rename_map.csv` | `rename` | `wash`（按 `old_name` 回查 booru 标签） | **只追加**，多批次共存 + 每批快照 `rename_map.<first>-<last>.csv`；预演只写 `rename_map.preview.csv` |
-| `raw_posts.jsonl` | `fetch` / `import` | `rename`、`wash`（来源 A） | 只追加，按 `(filename, post_id)` 去重合并 |
+| `raw_posts.jsonl` | `fetch` / `import` / `enrich` | `rename`、`wash`（来源 A） | 只追加，按 `(filename, post_id)` 去重合并 |
+| `_pipeline/user_deleted.json` | `exclude` / `fix-caption`（`remove`） | `wash`（防复活）、`verify` | 人工删除名单：记 `name`/`old_names`/`archived`/`bucket`/`reason`/时间；`restored_at` 标记已恢复。**手删了图就 `exclude`，别直接从磁盘删** —— 否则下一轮工具只会告诉你"少了几张" |
+| `_pipeline/captions_prev/<时间戳>/` | `wash` / `apply-review` / `fix-caption` | 人 | 写盘**前**自动快照（只留最近 3 份），`_meta.json` 记是谁触发的；配套 `wash_diff.csv` 是"本次 vs 上次"的逐张差异（新增/删除/清空） |
+
+**变更可观测**：任何一次写 caption 的阶段都会先留快照、再写盘、最后出 `wash_diff.csv`，终端直接打印 `本次改动 N 张（新增 x / 删除 y / 清空 z）`；没有差异就明说"与上一版没有差异"。所以"这次 wash 到底改了什么"不用靠 diff 工具或翻聊天记录。
 
 **`wash` 默认不复活人工删掉的图源标签**（拿 `per_image.json` 的 `merged_tags` 与当前 caption 比对，差值即人工删除），确实要按图源整体重洗时用 `refreshSource:true`。这条就是「手改完 caption 一重跑全回来」那个坑的修法。
 
@@ -236,6 +250,19 @@ koharu 0.83.1 是 GUI-only（CLI 是空的 Cli{}，无 HTTP/MCP），所以直�
 - 词典里没有、但同义现行形存在的写法走别名：`bunny girl→playboy bunny`、`gluteal fold→gluteal sulcus`、`aftersex→after sex`。查无同义形的留在 `wash_report.csv` 的 `unknown` 列里报给用户（`verify` 也会列出来），要压制就在 `_pipeline/wash_rules.json` 里加 `alias_extra`。
 - **实测效果**（`datasets/arata/latest/` 的 63 张真实 caption，评级词保留之后重测）：标签数中位 **49 → 43**（区间 27~62）；丢弃项只有四类可解释的 —— `implied-by-child` 335（§7.4 折叠）、`banned` 19（占位符 `(series)` 8、单字母碎片 `o`/`t` 8、`artist revision` 1 等）、`duplicate` 19、`copyright-ip` 13（`blue archive`/`fate (series)`/`indie virtual youtuber`）。unknown 收敛到 3 种（`see through` 18、`fate` 8、`erect nipples` 1）。
 
+### 合并、冲突与体检（小叶子miv 复盘修掉的那批）
+
+| 症状（那次真实使用） | 现在 |
+|---|---|
+| 合并只有**集合层**：`tags_a + tags_c` 一 union，同族冲突（`pink hair` vs `purple hair`）靠**顺序**定胜负 | **冲突族检测**：`CONFLICT_GROUPS`（发色 16 / 瞳色 15 / 发长 6 / 胸围 6 / 下着 6 / 人数）在 `validate` 与 `verify` 里都报 `conflict-hair-color(pink hair vs purple hair)`；`1girl`+`1boy` **不算**冲突，只有 `solo` 与多人互斥才算。可用 `prefer:"A"`（booru 权威）或 `"C"`（既有 caption）指定同族多取值留哪边，裁掉的记进报告 `conflict-lost-to-prefer-A(...)`；一侧完全没有来源标记时**不裁**（没依据就别猜） |
+| 上限只报不裁，要手改规则 json | `minTags`/`maxTags` 直接进 CLI（例：`wash minTags=30 maxTags=60`），写进 `wash_rules.json` 长期生效 |
+| `refreshSource` 全有/全无（要么不复活、要么全复活） | **三级防复活**：默认（`merged_tags` 差集 + 手删名单）/ `refreshBooru:true`（只忽略手删名单）/ `refreshSource:true`（连手删名单都不看） |
+| 水印族标签要一张张 `fix-caption` 删 | `dropMarks:true` 一次丢掉 `mark_tags` 整类（`watermark`/颜色水印/`signature`/`artist name`/`twitter username`/`logo`/`web address`/文字族）——给已经用 PS 清过的桶用 |
+| `:|` 被洗成 `|`、`@_@` 被洗成 `@ @`（`strip(".,;:")` + 下划线转空格） | **纯符号/表情白名单**：`:|` `:-|` `>_<` `o_o` `0_0` `@_@` `...` `♪` `♡` 等原样保留、不动下划线 —— 它们词典里都有（`:|` 14,582 帖、`@_@` 56,496） |
+| 词典里没有的写法直接被丢（`unknown_policy` 只有 report/drop/keep） | 新增 `unknown_policy:"alias-to-canonical"`：先在 `aliases` / `canonical_map` / 形态变体（连字符↔空格、尾 `s`）里找**词典里真实存在**的目标形，找到就用它（记 `normalized-to(...)`），否则仍进 `unknown` |
+| `wash` 全程 `A=none` 却照报 ok | **A 源体检**：每次打印 `标签来源：A+booru N、A=none M`；`A=none` 占一半以上时打醒目告警并给两条修法（`enrich` 按 md5 反查、`fetch --source danbooru --tags <画师名>`），提醒要在 `text` 之前做 |
+| 修补过的图还写着 `watermark`（像素已经没了） | `verify` 增加**水印区一致性**：已修补（`text_report.csv` 里 `decision=patch`）却有标识标签的逐张列出来；未修补的图里多数标了、少数没标时提示"看图确认是本来就没有还是漏标"（不做恒定断言） |
+
 ### 标签来源链（断了不会报错，只会让 caption 只剩触发词）
 
 ```
@@ -271,14 +298,16 @@ wash   →  caption 的来源 A（booru 标签）+ 来源 C（同名 .txt sideca
 
 ```
 datasets/<name>/
-  00_raw/            下载/导入的原始文件
-  images/            重排编号后的工作集（图片 + 同名 .txt caption）★ caption 权威副本
-  _pipeline/         manifest.json、per_image.json、raw_posts.jsonl、enrich_report.csv、*_report.csv、masks/、thumbs/、orig_text/、rename_map.csv
+  00_raw/            下载/导入的原始文件（不算图桶）
+  images/            默认工作集（图片 + 同名 .txt caption）★ caption 权威副本
+  clean/ watermark/  可选：自己分的图桶 —— 根下**任何含图的子目录**都自动算一个桶
+  _pipeline/         manifest.json、per_image.json、user_deleted.json、raw_posts.jsonl、enrich_report.csv、
+                     *_report.csv、wash_diff.csv、captions_prev/、masks/、thumbs/、orig_text/、rename_map.csv
   _excluded/         剔除物（按 reason 分子目录）+ _EXCLUDED_MANIFEST.json 证据链
 train_configs/<name>/  <name>_lora_stage1.toml + dataset_<name>.toml + train_<name>.bat + rationale.md + preflight.txt
 ```
 
-**只移动不删除。** 每条剔除都记 `_EXCLUDED_MANIFEST.json`：`{original, reason, rule, detail, decided_by}`。
+**只移动不删除。** 每条剔除都记 `_EXCLUDED_MANIFEST.json`：`{original, reason, rule, detail, decided_by}`；人工淘汰走 `exclude`，同一张图还会进 `_pipeline/user_deleted.json`，`undo` 能按账本搬回**原来的桶**。
 
 ## 环境要求
 

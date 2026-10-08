@@ -15,6 +15,17 @@ from typing import Any
 BUNDLE_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_FILE = BUNDLE_ROOT / "animasl.config.json"
 
+IMG_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+# 这些根目录下的子目录永远不算图桶：00_raw 是原始素材，thumbs/masks 是派生物
+BUCKET_SKIP = frozenset({"00_raw", "thumbs", "masks", "orig_text"})
+
+
+def _has_images(path: Path) -> bool:
+    try:
+        return any(p.is_file() and p.suffix.lower() in IMG_EXTS for p in path.iterdir())
+    except OSError:
+        return False
+
 
 def runtime_dir() -> Path:
     """Heavy runtime state (ML venv, caches) -- kept out of the installed package.
@@ -245,6 +256,8 @@ class Dataset:
     <datasets_dir>/<name>/
         00_raw/                 downloaded originals, untouched
         images/                 curated + renumbered training images (+ .txt)
+        clean/ watermark/ ...   OPTIONAL extra buckets: finished images may live in
+                                any root subdir that holds images (see bucket_dirs)
         _pipeline/              every report / manifest produced by the toolchain
         _excluded/              rejected images, kept as evidence
     """
@@ -281,15 +294,89 @@ class Dataset:
             )
         return self
 
-    def images(self, exts=(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")) -> list[Path]:
+    def images(self, exts=IMG_EXTS) -> list[Path]:
         if not self.images_dir.exists():
             return []
         return sorted(p for p in self.images_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
 
-    def raw_images(self, exts=(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")) -> list[Path]:
+    def raw_images(self, exts=IMG_EXTS) -> list[Path]:
         if not self.raw_dir.exists():
             return []
         return sorted(p for p in self.raw_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
+
+    # -- 图桶（bucket）：成品图不必都住在 images/ ---------------------------------
+    #
+    # 真实使用（小叶子miv，146 张）里成品被人工分成了 clean/ 109 + watermark/ 33，
+    # images/ 是空的；而工具只认 images/ ⇒ thumbs、verify、fix-caption、status 全部
+    # 报 0，makecfg 又按根下子目录扫、把同一批图数了两遍（142 → 284）。
+    #
+    # 统一口径：**成品图桶 = 数据集根目录下、名字不以 `_`/`.` 开头、含图、且不是
+    # 00_raw / thumbs / masks 的子目录**。images/ 只是其中一个（排在最前）。
+    # 各阶段用 bucket_dirs() / work_images() 拿工作集，不再各自写死 images/。
+    def bucket_dirs(self, work_set=None) -> list[tuple[str, Path]]:
+        """本次要处理的图桶 → [(桶名, 目录)]，稳定顺序（images/ 优先，其余按名字）。
+
+        work_set 传了就只用这些桶（名字或相对/绝对路径，逗号分隔的字符串也收），
+        传错时报错并列出自动发现的桶，避免静默处理 0 张图。
+        """
+        if work_set:
+            items = work_set if isinstance(work_set, (list, tuple, set)) else str(work_set).split(",")
+            out: list[tuple[str, Path]] = []
+            for raw in items:
+                text = str(raw).strip().strip("/\\")
+                if not text:
+                    continue
+                path = Path(text)
+                if not path.is_absolute():
+                    path = self.root / text
+                if not (path.is_dir() and _has_images(path)):
+                    found = "、".join(name for name, _ in self.discover_buckets()) or "（一个都没有）"
+                    raise SystemExit(
+                        f"[animasl] workSet 里的 '{text}' 不是数据集里的图桶（没有图或不存在）。\n"
+                        f"          自动发现的桶：{found}\n"
+                        f"          桶 = 数据集根下含图的子目录，如 images / clean / watermark。"
+                    )
+                out.append((path.name, path))
+            return out
+        return self.discover_buckets()
+
+    def discover_buckets(self) -> list[tuple[str, Path]]:
+        """自动发现图桶（不含 00_raw，因为那是未处理的原始素材）。"""
+        if not self.root.exists():
+            return []
+        found: list[tuple[str, Path]] = []
+        for p in sorted(self.root.iterdir(), key=lambda x: x.name):
+            if not p.is_dir() or p.name.startswith(("_", ".")) or p.name in BUCKET_SKIP:
+                continue
+            if _has_images(p):
+                found.append((p.name, p))
+        # images/ 排最前：它是 rename 的正式落点，报告里先说它更符合直觉
+        found.sort(key=lambda item: (item[0] != "images", item[0]))
+        return found
+
+    def bucket_of(self, path) -> str:
+        """某个文件属于哪个桶（不在桶里就返回空串）。"""
+        try:
+            rel = Path(path).resolve().relative_to(self.root.resolve())
+        except Exception:
+            return ""
+        name = rel.parts[0] if rel.parts else ""
+        return name if name in {n for n, _ in self.discover_buckets()} else ""
+
+    def work_images(self, work_set=None) -> list[Path]:
+        """工作集：所有图桶里的图，按桶顺序、桶内按名字。"""
+        out: list[Path] = []
+        for _, base in self.bucket_dirs(work_set):
+            out.extend(sorted(p for p in base.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS))
+        return out
+
+    def captions(self, work_set=None) -> list[Path]:
+        """工作集里已有的 caption 文件（与图同目录）。"""
+        return [p.with_suffix(".txt") for p in self.work_images(work_set) if p.with_suffix(".txt").exists()]
+
+    def bucket_counts(self, work_set=None) -> dict[str, int]:
+        return {name: len([p for p in base.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS])
+                for name, base in self.bucket_dirs(work_set)}
 
 
 def find_python(cfg: Config) -> str:

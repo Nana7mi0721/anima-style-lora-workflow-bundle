@@ -87,6 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--phash-distance", type=int, default=4)
     sp.add_argument("--ssim", type=float, default=0.995)
     sp.add_argument("--include-images", action="store_true")
+    sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
     _apply(sp)
 
     sp = add("screen", "低质量 / 过老 / 草图筛选")
@@ -94,12 +95,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--min-bytes", type=int, default=0)
     sp.add_argument("--earliest", default="", help="早于此日期(YYYY-MM-DD)的剔除")
     sp.add_argument("--include-images", action="store_true")
+    sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
     _apply(sp)
 
-    sp = add("thumbs", "生成缩略图（视觉子代理只能看这个；有 images/ 就用它，否则 00_raw）")
+    sp = add("thumbs", "生成缩略图（视觉子代理只能看这个；图桶优先，否则 00_raw）")
     sp.add_argument("--max-side", type=int, default=1536)
     sp.add_argument("--include-images", action="store_true")
     sp.add_argument("--prune", action="store_true", help="删掉没有对应原图的陈旧缩略图")
+    sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
 
     sp = add("text", "检测图中文字并修补（rfdetr + lama）")
     sp.add_argument("--warn-ratio", type=float, default=0.0)
@@ -123,10 +126,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = add("wash", "洗标：规则引擎规范化 + 七槽位排序")
     sp.add_argument("--trigger", default="")
-    sp.add_argument("--no-images", action="store_true", help="处理 00_raw 而不是 images")
+    sp.add_argument("--no-images", action="store_true", help="处理 00_raw 而不是图桶")
     sp.add_argument("--rules", default="", help="额外规则 JSON 文件")
     sp.add_argument("--refresh-source", action="store_true",
-                    help="按图源标签整体重洗（默认不复活人工删掉的标签）")
+                    help="按图源标签整体重洗（连人工删除名单都不看）")
+    sp.add_argument("--refresh-booru", action="store_true",
+                    help="按图源标签重来，但**仍尊重**人工删除名单（比 --refresh-source 温和）")
+    sp.add_argument("--drop-marks", action="store_true",
+                    help="外部标识整族（watermark/signature/artist name/…）当 banned 丢；"
+                         "只适用于已经去过签名的图（clean/ 那种桶）")
+    sp.add_argument("--prefer", default="", choices=["", "A", "C", "a", "c"],
+                    help="并集里同一冲突族出现多个取值时留哪一侧：A=图源标签 C=既有 caption")
+    sp.add_argument("--min-tags", type=int, default=0, help="少于这么多标签记 too-few-tags")
+    sp.add_argument("--max-tags", type=int, default=0, help="多于这么多标签记 too-many-tags")
+    sp.add_argument("--work-set", default="",
+                    help="只处理这些图桶（逗号分隔，如 clean 或 clean,latest）；默认自动发现")
     _apply(sp)
 
     sp = add("review-list", "列出需要看图补全的图")
@@ -147,6 +161,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--online", action="store_true")
     sp.add_argument("--sample", type=int, default=0)
     sp.add_argument("--trigger", default="", help="覆盖触发词（默认取 manifest.trigger）")
+    sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
+
+    sp = add("exclude", "把图移到 _excluded/ 并记进人工排除名单（不再出现在后续阶段）")
+    sp.add_argument("--names", default="", help="图片名/编号/旧名，逗号分隔；省略则列出清单")
+    sp.add_argument("--reason", default="user", help="排除原因（决定 _excluded/ 子目录名）")
+    sp.add_argument("--note", default="", help="备注，记进账本")
+    sp.add_argument("--undo", action="store_true", help="把清单里的图搬回来并销账")
+    sp.add_argument("--missing", action="store_true",
+                    help="图已经不在了（被外部删掉/移走）：只补账本，不搬文件")
+    sp.add_argument("--work-set", default="", help="只在这些图桶里找（逗号分隔）")
+    _apply(sp)
 
     sp = add("dict-check", "查一批标签在词典里的真实存在性与 category/post_count（消灭编造标签）",
              required=False)
@@ -538,7 +563,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "dedup":
         curate.cmd_dedup(ds, phash_distance=args.phash_distance, ssim_threshold=args.ssim,
-                         apply=args.apply, include_images=args.include_images)
+                         apply=args.apply, include_images=args.include_images,
+                         work_set=_work_set(args))
         _mark(ds, "dedup", _applied(args))
         return 0
 
@@ -550,13 +576,14 @@ def main(argv: list[str] | None = None) -> int:
             over["min_bytes"] = args.min_bytes
         if args.earliest:
             over["earliest_date"] = args.earliest
-        curate.cmd_screen(ds, rules=over, apply=args.apply, include_images=args.include_images)
+        curate.cmd_screen(ds, rules=over, apply=args.apply, include_images=args.include_images,
+                          work_set=_work_set(args))
         _mark(ds, "screen", _applied(args))
         return 0
 
     if cmd == "thumbs":
         curate.cmd_thumbs(ds, max_side=args.max_side, include_images=args.include_images,
-                          prune=args.prune)
+                          prune=args.prune, work_set=_work_set(args))
         return 0
 
     if cmd == "text":
@@ -582,9 +609,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "wash":
-        extra = json.loads(Path(args.rules).read_text(encoding="utf-8")) if args.rules else None
-        wash.cmd_wash(ds, apply=args.apply, trigger=args.trigger, rules_over=extra,
-                      include_images=not args.no_images, refresh_source=args.refresh_source)
+        extra = json.loads(Path(args.rules).read_text(encoding="utf-8")) if args.rules else {}
+        extra = dict(extra or {})
+        if args.min_tags:
+            extra["min_tags"] = args.min_tags
+        if args.max_tags:
+            extra["max_tags"] = args.max_tags
+        wash.cmd_wash(ds, apply=args.apply, trigger=args.trigger, rules_over=extra or None,
+                      include_images=not args.no_images, refresh_source=args.refresh_source,
+                      work_set=_work_set(args), refresh_booru=args.refresh_booru,
+                      drop_marks=args.drop_marks, prefer=args.prefer)
         _mark(ds, "wash", _applied(args))
         return 0
 
@@ -605,7 +639,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "verify":
-        wash.cmd_verify(ds, online=args.online, sample=args.sample, trigger=args.trigger)
+        wash.cmd_verify(ds, online=args.online, sample=args.sample, trigger=args.trigger,
+                        work_set=_work_set(args))
+        return 0
+
+    if cmd == "exclude":
+        curate.cmd_exclude(ds, names=args.names, reason=args.reason, apply=args.apply,
+                           undo=args.undo, missing=args.missing, note=args.note,
+                           work_set=_work_set(args))
         return 0
 
     if cmd == "makecfg":
@@ -649,6 +690,14 @@ def _applied(args) -> bool:
     if hasattr(args, "dry_run"):
         return not args.dry_run
     return bool(getattr(args, "apply", False))
+
+
+def _work_set(args) -> list[str] | None:
+    """--work-set 的解析：逗号分隔的图桶名 → list；没给就 None（各阶段自动发现）。"""
+    raw = str(getattr(args, "work_set", "") or "").strip()
+    if not raw:
+        return None
+    return [x.strip() for x in re.split(r"[,，]", raw) if x.strip()]
 
 
 def _mark(ds, stage: str, applied: bool = True, **info) -> None:

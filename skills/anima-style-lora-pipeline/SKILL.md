@@ -11,18 +11,29 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 ```
 <home>/datasets/<name>/
-  00_raw/            下载/导入的原始图（只读，不动）
-  images/            进入流水线的图 + 同名 .txt caption（0001.png + 0001.txt）★ caption 唯一权威副本
+  00_raw/            下载/导入的原始图（只读，不动；**不算图桶**）
+  images/            默认图桶：图片 + 同名 .txt caption（0001.png + 0001.txt）★ caption 唯一权威副本
+  clean/ watermark/  可选图桶：根下**任何含图的子目录**都自动算一个桶（自己分的 clean/watermark/latest 都行）
   _pipeline/
-    manifest.json    阶段状态（每个 stage: pending/preview/done/stale/failed + 时间戳）
-    per_image.json   ★ 每张图的只追加状态（旧名、写过的标签、人工删掉的标签、看图结果、历史）
+    manifest.json    阶段状态（每个 stage: pending/preview/done/stale/failed + 时间戳）+ 触发词
+    per_image.json   ★ 每张图的只追加状态（旧名、写过的标签、人工删掉的标签、所在桶、看图结果、历史）
+    user_deleted.json ★ 人工淘汰账本（谁、为什么、归档到哪、能不能搬回）
     rename_map.csv   新名↔旧名↔post_id↔tags_full 对照表（★ 只追加；预演写 rename_map.preview.csv）
+    captions_prev/   写 caption 之前自动留的快照（只留最近 3 份）+ wash_diff.csv（本次 vs 上次的逐张差异）
     dedup_report.csv / screen_report.csv / text_report.csv / wash_report.csv / review_todo.csv / wash_verify.csv
     thumbs/          ≤1536px 缩略图（视觉子代理唯一允许看的输入）
     masks/           文字检测的掩膜与对照图；orig_text/ 是修补前的原图备份
-    wash_rules.json  可选，数据集级洗标规则覆盖
-  _excluded/         被剔除的图（duplicates/<reason>），永不删
+    wash_rules.json  可选，数据集级洗标规则覆盖（minTags/maxTags/prefer/unknown_policy 都可写这里）
+  _excluded/         被剔除的图（按 reason 分子目录），永不删
 ```
+
+### 图桶：`images/` 不是唯一落点
+
+真实使用里出现过 `clean/`（109 张已修水印）+ `watermark/`（33 张未修）、而 `images/` 是空的布局 —— 成品 caption 全在子目录里，工具只数 `images/` 时 `anima_status` 报 `raw=0 images=0 captions=0`，`verify`/`thumbs`/`fix-caption` 对 142 条成品视而不见，`makecfg` 还会把同一张图算两遍。
+
+现在的规则：**根下任何含图的子目录都自动算图桶**（跳过 `_`/`.` 前缀与 `00_raw`/`thumbs`/`masks`/`orig_text`；空目录不算），`images/` 排最前；caption 与图**同目录**；所有阶段默认扫全部桶。只想处理某个子集就传 `workSet:"clean,watermark"`——**给错名字会报错并列出自动发现的桶**（不会静默变成空集）。`makecfg` 另按内容指纹跨桶去重（硬链接/副本只算一次），整桶都是副本时跳过并说明原因。
+
+`anima_status` 会多打一行 `图桶: clean 109图/109caption、watermark 33图/33caption`——**看到这行就不要再去数 `images/` 了**。
 
 `<home>` 默认 `E:/LoRA_Train`，可用插件配置或 `--home` 覆盖。训练配置落在 `<home>/train_configs/<name>/`（`<name>_lora_stage1.toml` + `dataset_<name>.toml` + `train_<name>.bat` + `rationale.md` + `preflight.txt`）。
 
@@ -32,17 +43,19 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 | 文件 | 谁写 | 谁读 | 规矩 |
 |---|---|---|---|
-| `images/<stem>.txt` | `wash` / `apply-review` / `fix-caption` | **所有下游**（`verify`、`makecfg`、你自己） | **caption 的唯一权威副本**。要改 caption 走 `fix-caption`，不要手改文件再重跑 `wash`（重跑会按图源重建） |
-| `_pipeline/per_image.json` | `rename` / `wash` / `apply-review` / `fix-caption` | 引擎自己 + 你排查时 | **只追加**：`old_names`/`merged_tags` 取并集，`history` 保留最近 30 次。它是"这张图经历过什么"的账本，不删记录 |
+| `<桶>/<stem>.txt` | `wash` / `apply-review` / `fix-caption` | **所有下游**（`verify`、`makecfg`、你自己） | **caption 的唯一权威副本**，与图同目录。要改 caption 走 `fix-caption`，不要手改文件再重跑 `wash`（重跑会按图源重建） |
+| `_pipeline/per_image.json` | `rename` / `wash` / `apply-review` / `fix-caption` / `exclude` | 引擎自己 + 你排查时 | **只追加**：`old_names`/`merged_tags` 取并集，`history` 保留最近 30 次，`bucket` 记它在哪个桶。它是"这张图经历过什么"的账本，不删记录 |
 | `_pipeline/rename_map.csv` | `rename` | `wash`（按 `old_name` 回查 booru 标签） | **只追加**，多批次共存；每批另留 `rename_map.<first>-<last>.csv` 快照。**不要读它的 `tags_full` 当标签来源**（那是抓取当时的快照，可能已被清洗） |
 | `raw_posts.jsonl` | `fetch` / `import` / `enrich` | `rename`（写进对照表）、`wash`（图源标签 A） | 只追加，按 `(filename, post_id)` 去重合并。**行键是文件名**：`enrich` 补的行必须落在 `rename_map.csv` 的 `old_name` 上，否则 `wash` 静默读不到（它自己按这条选键） |
+| `_pipeline/user_deleted.json` | `exclude` / `fix-caption`（`remove`） | `wash`（防复活）、`verify` | 人工淘汰账本：`name`/`old_names`/`archived`/`bucket`/`reason`/`at`，`restored_at` 表示已搬回。**手删图要发 `exclude`，别直接删文件**（否则下一轮只会告诉你"少了几张"） |
+| `_pipeline/captions_prev/` + `wash_diff.csv` | `wash` / `apply-review` / `fix-caption` | 人 | 写 caption **前**自动快照（最近 3 份），写完后出逐张差异（新增/删除/清空）。"这次到底改了什么"不用自己 diff |
 | `manifest.json` | 每个阶段 | `anima_status`、`wash.resolve_trigger` | 触发词/类型的权威来源 |
 
-**推论**：`wash` 默认**不会复活**你删掉的图源标签（它拿 `per_image.json` 的 `merged_tags` 与当前 caption 比对，差值视为人工删除）；确实想按图源整体重洗时用 `refreshSource:true`。这条就是"手工改完 caption 一重跑全回来"那个坑的修法。
+**推论**：`wash` 默认**不会复活**你删掉的图源标签（它拿 `per_image.json` 的 `merged_tags` 与当前 caption 比对，差值视为人工删除，再并上 `user_deleted.json` 的名单）。三级开关：默认（差集 + 手删名单）→ `refreshBooru:true`（只忽略手删名单）→ `refreshSource:true`（连手删名单都不看，**会复活**）。这条就是"手工改完 caption 一重跑全回来"那个坑的修法。
 
 ## §2 阶段表与 I/O 契约
 
-**16 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
+**17 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
 
 | 阶段 | 工具调用 | 输入 | 产出 | 重跑会覆盖什么 |
 |---|---|---|---|---|
@@ -50,18 +63,19 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | fetch | `anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"artist_name", limit:250)` | 图源 | `00_raw/*` + raw_posts.jsonl | 只追加：同名文件跳过，元数据按 `(filename, post_id)` 去重合并。**默认就下载**，`dryRun:true` 只列清单 |
 | import | `anima_stage(stage:"import", dataset:"X", src:"D:/下载/xxx")` | 素材目录/压缩包 | `00_raw/*`（zip/rar/7z 自动解） | 只追加（重名加 `__n`）。**`src` 不能是数据集目录本身或它的上级**，会被拒绝；非图文件会报"跳过 N 个"，不进 `00_raw` |
 | enrich | `anima_stage(stage:"enrich", dataset:"X")` → `apply:true` | `images/`（没重排就是 `00_raw/`） | raw_posts.jsonl + enrich_report.csv（含 `by` 列） | 只追加（按 `(filename, post_id)` 合并；`force:true` 才重查已有标签的图）。**默认 dry-run 只查不写**，但**仍会发请求**——就是给你看命中率。**必须在 `text` 修补之前跑**（改过像素 md5 就对不上）；md5 不中时用文件名里的 pixiv id 兜一次（只认同名同页/单帖 p0，`noPixiv:true` 可关） |
-| dedup | `anima_stage(stage:"dedup", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 连 `images/`） | dedup_report.csv | 覆盖报告；apply 时把重复图**移动**到 `_excluded/duplicates/` |
-| screen | `stage:"screen"` → 视觉复核 → `apply:true` | `00_raw/` | screen_report.csv + review_queue.csv | 覆盖报告；apply 时移入 `_excluded/<reason>/` |
-| thumbs | `anima_stage(stage:"thumbs", dataset:"X")` | `images/` 有就用它，否则 `00_raw/` | `_pipeline/thumbs/*.jpg` | 覆盖已有缩略图（**不吃 apply**，写盘是默认行为）；已是最新的跳过，`prune:true` 清掉没有对应图的陈旧缩略图 |
+| dedup | `anima_stage(stage:"dedup", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 连图桶） | dedup_report.csv | 覆盖报告；apply 时把重复图**移动**到 `_excluded/duplicates/` |
+| screen | `stage:"screen"` → 视觉复核 → `apply:true` | `00_raw/`（`includeImages:true` 连图桶） | screen_report.csv + review_queue.csv | 覆盖报告；apply 时移入 `_excluded/<reason>/` |
+| thumbs | `anima_stage(stage:"thumbs", dataset:"X")` | 图桶（没有才用 `00_raw/`） | `_pipeline/thumbs/*.jpg` | 覆盖已有缩略图（**不吃 apply**，写盘是默认行为）；已是最新的跳过，`prune:true` 清掉没有对应图的陈旧缩略图 |
 | text | `anima_stage(stage:"text", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 处理 `images/`） | 修补后的图 + text_report.csv + `masks/` | **⚠️ 修补不可逆**：apply 就地改写图片（修补前备份在 `_pipeline/orig_text/`），并让 `wash` 及之后全部失效 |
 | rename | `anima_stage(stage:"rename", dataset:"X", apply:true)` | `00_raw/`（已重排过会报错） | `images/0001.ext` + rename_map.csv + per_image.json | `rename_map.csv` **只追加**（按 `old_name` 去重，本次为准）+ 本批快照；预演只写 `rename_map.preview.csv`，不碰权威表；同名 `.txt` 边车跟着搬 |
-| wash | `anima_stage(stage:"wash", dataset:"X", trigger:"@xxx")` → `apply:true` | `images/*.txt` + raw_posts.jsonl（经 rename_map 的 `old_name` 回查） | `images/NNNN.txt` + wash_report.csv + review_todo.csv | 覆盖 caption（**幂等**：同输入重跑结果一致）。默认不复活人工删掉的图源标签；`refreshSource:true` 才按图源整体重洗 |
+| wash | `anima_stage(stage:"wash", dataset:"X", trigger:"@xxx")` → `apply:true` | 图桶里的 `*.txt` + raw_posts.jsonl（经 rename_map 的 `old_name` 回查） | 每个桶里的 `NNNN.txt` + wash_report.csv + review_todo.csv + wash_diff.csv + captions_prev/ | 覆盖 caption（**幂等**：同输入重跑结果一致）。默认不复活人工删掉的图源标签（`refreshBooru` / `refreshSource` 逐级放宽）；写盘前自动快照、写盘后出本次 vs 上次的差异 |
 | review-list | `anima_stage(stage:"review-list", dataset:"X")` | wash_report.csv | review_todo.csv | 覆盖清单 |
 | apply-review | `anima_stage(stage:"apply-review", dataset:"X", payload:"...json", apply:true)` | 视觉子代理的补标 JSON | 回填后的 caption | 覆盖这些图的 caption；触发词从 manifest 取（不会丢）；`item.remove` 里的标签进人工删除名单 |
 | fix-caption | `anima_stage(stage:"fix-caption", dataset:"X", name:"0007", add:"…", apply:true)` | `images/<stem>.txt` | 改好的 caption | **只动你点名的那一张**：`add` 补标签 / `remove` 删标签（并记进人工删除名单）/ `set` 整条替换，都要再过一遍洗标 + 形态校验 |
-| verify | `anima_stage(stage:"verify", dataset:"X")` / `online:true` | `images/*.txt` | wash_verify.csv | 覆盖报告（**只读，不写 caption**，也没有 apply）。`sample:N` 等距抽查；`trigger:"@yyy"` 可覆盖 |
+| exclude | `anima_stage(stage:"exclude", dataset:"X", names:"0007,0012", reason:"user", apply:true)` | 图桶里的图 | 图+同名 txt 移到 `_excluded/<reason>/` + user_deleted.json | **淘汰专用**：`undo:true` 按账本搬回**原来的桶**、`missing:true` 把"账本里有、现在不在图桶里"的记成人工删除（事后补账）、无参数则列清单。别直接删文件 |
+| verify | `anima_stage(stage:"verify", dataset:"X")` / `online:true` | 图桶里的 `*.txt` | wash_verify.csv | 覆盖报告（**只读，不写 caption**，也没有 apply）。查形态 + 内容闸门 + **冲突族** + **水印区与修补状态一致性**；`sample:N` 等距抽查；`trigger:"@yyy"` 可覆盖 |
 | dict-check | `anima_stage(stage:"dict-check", dataset:"X")` / `tags:"a, b"` | caption 或显式标签 | 终端输出（不写盘） | — |
-| makecfg | `anima_stage(stage:"makecfg", dataset:"X", kind:"style", trigger:"@xxx", subdirs:"before,latest,present")` | `images/` + manifest | `train_configs/X/` 四件套 + **preflight.txt** | 覆盖已有配置（旧文件先改名成 `.bak<时分秒>` 备份；`force:true` 则不备份）。**LR 超出该 rank 的建议区间直接报错**，除非 `allowOutOfBand:true` |
+| makecfg | `anima_stage(stage:"makecfg", dataset:"X", kind:"style", trigger:"@xxx", subdirs:"before,latest,present")` | 图桶 + manifest | `train_configs/X/` 四件套 + **preflight.txt** | 覆盖已有配置（旧文件先改名成 `.bak<时分秒>` 备份；`force:true` 则不备份）。**LR 超出该 rank 的建议区间直接报错**，除非 `allowOutOfBand:true`；自动发现图桶并按内容指纹跨桶去重 |
 
 顺序不是死板的：`text` 必须在 `rename` 前（rename 后文件名与 raw_posts.jsonl 的对应关系会断，text 报告就不好回溯）；`wash` 必须在 `rename` 后（caption 文件名跟新编号走）；`thumbs` 可以在 `screen` 前先跑一遍用于人工看；**`enrich` 要在 `text` 之前**（修补改像素 ⇒ md5 变了对不上原帖；local 图源没有 booru 标签时它是唯一的 A 源）。
 
@@ -80,8 +94,12 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | `verify` / `review-list` / `dict-check` | **只读**，没有 `apply`（`verify` 可以 `trigger` 覆盖，`dict-check` 可以只给 `tags` 不给 dataset） |
 | `force` | 只在 `init`、`enrich`、`makecfg` 上存在 |
 | `enrich` 的 `noPixiv` | 关掉「md5 不中就用文件名里的 pixiv id 再兜一次」这条支路（默认开着） |
+| `workSet` | `dedup` / `screen` / `thumbs` / `wash` / `verify` / `exclude` 都能限定只看某些图桶（`"clean,watermark"`）；不传就是全部桶 |
+| `exclude` | 默认 dry-run，要 `apply:true`；没有 `dryRun`（反过来也一样） |
 
 `fix-caption` 的 `add`/`remove`/`set` 三个参数至少要给一个；`set` 是整条替换，给了它 `add`/`remove` 会被忽略。
+
+`wash` 的常用旋钮（都在参数矩阵里，传错会报错）：`minTags`/`maxTags`（标签数上下限，写进 rules）、`prefer:"A"|"C"`（同族冲突留哪边）、`dropMarks`（整类丢水印/签名/logo 族）、`refreshBooru` / `refreshSource`（防复活逐级放宽）、`trigger`（不传就从 manifest 取）。
 
 ## §2.5 与已有 skill 的分工（不要重复造）
 
@@ -126,7 +144,10 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 5. 任何异常先 `anima_doctor`，再决定是否重跑。
 6. **要改 caption 就用 `fix-caption`**，不要手工改 `images/*.txt` 后重跑 `wash`——`wash` 是整条重建的（默认虽不复活你删掉的标签，但你新加的东西它也不认识）。`fix-caption` 只动你点名的那一张，且改动会进 `per_image.json` 的账本。
 7. **补标签前先 `dict-check`**：`anima_stage(stage:"dict-check", dataset:"X")` 会把你 caption 里**词典查不到**和 **post_count=0（danbooru 上不存在 ⇒ 幻觉标签，指南 §7.7 禁止写）**的标签逐条列出来。真实使用里出现过模型凭印象编标签、最后靠 verify 才发现的情况——这一步能提前拦住。
-8. **`anima_status` 现在会报 caption 健康度**（`tags min/avg/max`、缺 txt、孤立 txt、空 caption、<20 标签、>45 标签、触发词缺失/不在首位）。低于下限的图多半是"洗完只剩触发词"，处置见上文。
+8. **`anima_status` 现在会报 caption 健康度**（`tags min/avg/max`、缺 txt、孤立 txt、空 caption、<20 标签、>45 标签、触发词缺失/不在首位）**和图桶行**。低于下限的图多半是"洗完只剩触发词"，处置见上文；`图桶:` 那行告诉你数据实际躺在哪些目录（别默认是 `images/`）。
+9. **淘汰图用 `exclude`，不要直接删文件**：`exclude names:"0007" reason:"user" apply:true` 会把图+同名 txt 移进 `_excluded/`、记进 `user_deleted.json`（`wash` 因此不会复活它的标签）。删错了 `undo:true` 按账本搬回**原来的桶**；上一次跑批里手删的、工具不知道的，用 `missing:true` 补账。
+10. **每次写 caption 后看一眼 `wash_diff.csv`**：它是"本次 vs 上次"的逐张差异（新增/删除/清空），终端也会打印 `本次改动 N 张`。看到"清空"或大面积"删除"就先停下来问用户，别接着往下跑。
+11. **`wash` 报 `A=none` 占一半以上时，先补 A 源再谈洗标**：那条告警意味着这次 wash 只做了"格式化 + 压父标签"，没有 booru 权威标签可依据。修法是 `enrich`（md5 反查）或 `fetch --source danbooru --tags <画师名>`，**都要在 `text` 修补之前做**。
 
 ## §4 必须停下来问用户的点
 
@@ -150,7 +171,12 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | fetch 报代理错误 / ConnectionReset | 该源需要代理，在**设置页「网络」分组**改 `proxy_candidates`（或 bundle 的 `animasl.config.json`）；`prefer_proxy_hosts` 里的主机会优先走代理 |
 | danbooru 报 403 / `Just a moment...` / 只有单标签能查 | ① 多标签查询要凭据：设置页「凭据」分组填用户名 + API key；② 403 挑战页由 **curl 兜底**自动绕过（`requests` 直发 403 属正常）；③ 若日志显示 `proxy=直连` + `ConnectTimeout`，重跑一次 |
 | exhentai 报「需要 cookies.txt 或 EXHENTAI_*」 | 设置页「凭据」分组填 `ipb_member_id`/`ipb_pass_hash`/`igneous`，或 `cookies:"<cookies.txt>"`；`igneous` 过期就重新登录一次再抄 |
-| caption 数 ≠ 图片数 | wash 只对 `images/` 下的图写 caption；缺的那些多半是 wash 判弃或看图待补，看 wash_report.csv |
+| caption 数 ≠ 图片数 | 先看 `anima_status` 的**图桶行**确认数据在哪个目录（不是只有 `images/`）；再查 wash 判弃或看图待补，看 wash_report.csv |
+| 工具"看不见"我的图/caption（`images=0` 却有几百个 txt） | 数据在 `clean/`、`watermark/` 这类子目录里 —— 现在自动识别为图桶；仍看不到就 `anima_status` 看 `图桶:` 行、`anima_stage(..., workSet:"clean")` 显式指定 |
+| `wash` 打印 `A=none` 占多数 | 这批图没有 booru 权威标签（本地导入且 `enrich` 没命中是常态）。先 `enrich` 或 `fetch --source danbooru --tags <画师名>`，再 wash；别把画师/IP 标签手工加回去 |
+| `verify` 报 `conflict-hair-color(...)` / `count-conflict(...)` | 同一族出现多个取值（发色/瞳色/下着/人数）。以 booru 标签为准就用 `wash prefer:"A"`，以看图结果为准用 `prefer:"C"`；若本来是两个角色，那是人数标签缺失，先按 §8.3 看图补人数 |
+| caption 里出现 `|`、`@ @` 这种碎片 | 旧版把 `:|`（14,582 帖）当标点洗坏了 —— 现在纯符号/表情标签原样保留。仍出现就 `fix-caption` 修那一条 |
+| `makecfg` 报"图片数比预期多一倍" | 旧版把子目录和 `images/` 里的同一张图算两遍；现在按内容指纹跨桶去重，硬链接/副本只算一次 |
 | 图片很小/被拉伸 | 检查 screen 的 min_short_side 与 makecfg 的 bucket_no_upscale；resize 不创造信息 |
 | 训练 OOM | 不在本流程内，但先确认 resolution：8GB 建议 1024 |
 
@@ -170,3 +196,13 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | `makecfg` 把我给的 `lr 5e-05` 静默收紧成 `8e-05` | 已修：LR 超出该 rank 的建议区间**直接报错**（列出区间），要么用区间内的值，要么 `allowOutOfBand:true` 明确放行（此时**不改值**，只警告） |
 | `anima_status` 只报图片数和 caption 数 | 现在还有一行 caption 健康度（标签数 min/avg/max、缺/孤立 txt、<20、>45、触发词位置 + 示例）+ 每个数据集一行（`_`/`.` 前缀目录自动跳过） |
 | `anima_doctor` 180s 超时 | 现在允许 300s；排障时用 `proxies:true` 让它跑一遍「代理 × 客户端」实测矩阵（`requests` vs `curl`，含 socks5 缺依赖的说明） |
+| 142 条成品 caption 放在 `clean/`+`watermark/` 里，`anima_status` 却报 `raw=0 images=0 captions=0`（工具对整批成品视而不见） | 已修：**根下任何含图的子目录都算图桶**，所有阶段默认扫全部桶，caption 与图同目录；`anima_status` 多打一行 `图桶: clean 109图/109caption、watermark 33图/33caption` |
+| `wash` 全程 `A=none` 却报 ok，洗出来只是"格式化 + 压父标签" | 已修：wash 每次打印 `标签来源：A+booru N、A=none M`，A=none 占一半以上时**醒目告警**并给两条修法（`enrich` / `fetch --source danbooru --tags <画师名>`） |
+| 合并只有集合层：同族冲突（`pink hair` vs `purple hair`）靠顺序定胜负 | 已修：**冲突族检测**（发色/瞳色/发长/胸围/下着/人数）进 `validate` 与 `verify`；`prefer:"A"\|"C"` 指定留哪边，裁掉的记进报告 |
+| 发现标签数超上限，只能手改 `wash_rules.json` | 已修：`minTags`/`maxTags` 直接是 `wash` 的参数 |
+| `refreshSource` 全有/全无（要么不复活、要么全复活） | 已修：三级 —— 默认（差集+手删名单）/ `refreshBooru:true`（只忽略手删名单）/ `refreshSource:true`（全放开） |
+| `:|` 被洗成 `|`、`@_@` 被洗成 `@ @` | 已修：纯符号/表情标签白名单（`:|` `>_<` `o_o` `0_0` `@_@` `...` `♪` …）原样保留，词典里都有 |
+| 水印族标签要一张张 `fix-caption` 删 | 已修：`dropMarks:true` 一次丢掉 `mark_tags` 整类（给已经清过水印的桶用） |
+| 洗完看不到"这次改了什么"（得自己 diff） | 已修：写 caption 前自动快照 `captions_prev/`（留 3 份）、写完后出 `wash_diff.csv` 并打印 `本次改动 N 张（新增/删除/清空）` |
+| 用户手删了 4 张图，工具下一轮只说"少了 4 张"，不知道是谁、也没找回路径 | 已修：`exclude` 阶段（移进 `_excluded/` + 记 `user_deleted.json`，`undo` 能按账本搬回原桶，`missing:true` 给历史手删补账） |
+| `makecfg` 把 142 张算成 284 张（`images/` 与子目录双计） | 已修：按内容指纹跨桶去重；整桶都是副本时跳过并说明"想同时训练两个版本就改文件名，别用硬链接" |

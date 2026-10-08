@@ -7,7 +7,7 @@ description: Anima 风格 LoRA 训练集的筛选与清理指南：导入素材�
 
 ## §0 三条原则
 
-1. **只移动，不删除**。所有被剔除的图移到 `_excluded/<reason>/`，并写 `_EXCLUDED_MANIFEST.json`（记录原文件名、来源、命中规则、判定依据）。用户复核后要能一键找回。
+1. **只移动，不删除**。所有被剔除的图移到 `_excluded/<reason>/`，并写 `_EXCLUDED_MANIFEST.json`（记录原文件名、来源、命中规则、判定依据）。用户复核后要能一键找回；**人工淘汰走 `exclude` 阶段**（同时记进 `user_deleted.json`，`undo` 能搬回原桶），不要自己 `rm`。
 2. **主观项必须给用户看清单再动手**。"古老""草图"是判断而非事实，dry-run 的清单是给用户拍板的，不是给自己看的。
 3. **风格 LoRA 要覆盖不要纯净**。同一画师的早期/近期/不同题材都要留（这正是子文件夹 `before/latest/present` 的意义）；剔的是「不是完整作品」和「有文字噪声」，不是「画得一般」。
 
@@ -150,6 +150,32 @@ anima_stage(stage:"dict-check", tags:"kimono, obi, wide sleeves")   # 查你打�
 输出分四类：`✓ 存在(名字/类别/出现帖数)`、`↪ 别名可归一`（词典里没有这个写法，但洗标引擎的别名表会把它换成现行形，照写没问题）、`! post_count=0`（danbooru 上**没有这张图** ⇒ 按指南 §7.7 属幻觉标签，**禁止写**）、`! 词典里没有`（拼错或已不是现行形，会给形近候选；多词标签被拆开时会直说"整条不存在，但每个词单独存在"）。从 `--dataset` 收集时每个问题标签还会带上"出现在几张图里"，最普遍的问题排在最前。
 
 实测过的那三条（用户问过）：`see through` → 归一成 **`transparent`**（danbooru 把 see-through 并进了它，词典里只剩 `see-through_hat` 这类派生）；`fate` → 归一成 **`fate (series)`**，随后被"IP 系列名永不添加"整类丢掉（正解：IP 根本不该写）；`erect nipples` → **不存在这种标签**，归一成 `nipples` 保留可见特征。**注意 `--tags` 只按逗号切**，多词标签请照 caption 的空格形整条写（`amiya (arknights)` 而不是 `amiya`+`(arknights)`）。
+
+## §3.6 图桶与人工淘汰（workSet / exclude）
+
+**图桶**：数据集根下**任何含图的子目录**都算一个数据桶（`images/` 只是默认那个）。真实使用里出现过 `clean/`（已修水印 109 张）+ `watermark/`（未修 33 张）、而 `images/` 是空的布局——那时工具只认 `images/`，142 条成品 caption 全部"不存在"。现在所有阶段默认扫全部桶、caption 与图**同目录**：
+
+```
+anima_stage(stage:"screen", dataset:"X", includeImages:true, workSet:"clean,watermark")   # 只看这两个桶
+anima_stage(stage:"verify", dataset:"X", workSet:"clean")
+```
+
+- 桶名给错会**报错并列出自动发现的桶**（不会静默处理 0 张）。
+- `anima_status` 会打一行 `图桶: clean 109图/109caption、watermark 33图/33caption` —— 判断"工具到底看见了什么"先看这行。
+- `makecfg` 会自动发现桶并按内容指纹去重：硬链接/副本只算一次，整桶都是副本时跳过并提示"想同时训练两个版本就改文件名"。
+
+**人工淘汰**：想删掉某几张图（不是规则命中，而是你自己判断），**不要直接删文件**——用 `exclude`：
+
+```
+anima_stage(stage:"exclude", dataset:"X")                                   # 列出手删清单
+anima_stage(stage:"exclude", dataset:"X", names:"0007,0012", reason:"user", apply:true)
+anima_stage(stage:"exclude", dataset:"X", undo:true, apply:true)            # 反悔：按账本搬回**原来的桶**
+anima_stage(stage:"exclude", dataset:"X", missing:true, apply:true)         # 给"上次直接删掉的"补账
+```
+
+- 图 + 同名 `.txt` 一起移进 `_excluded/<reason>/`，并记进 `_pipeline/user_deleted.json`（`wash` 因此不会复活它带的标签）。
+- 上一次会话里已经手删、工具不知道的图，用 `missing:true` 补一条记录（`archived` 空，只留证据）——**复盘时才知道删的是谁**。
+- `undo` 不带 `names` 就是"把清单里所有还归档着的搬回来"。
 
 ## §4 不设内容边界
 
