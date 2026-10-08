@@ -95,8 +95,10 @@ anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", li
 **抓下来的图有标签，本地导入的图没有**：`fetch` 把每帖的 `tag_string` 存进 `raw_posts.jsonl`，这就是 `wash` 的来源 A（图源权威标签）；而 `import` 进来的 Pixiv 图/压缩包/别人给的素材只有 `source=import` 一行元数据，**没有任何标签**，caption 会退化成「只有触发词 + 视觉子代理补的几条」。这种素材补一步 `enrich` 即可——按文件 md5 去 danbooru 反查原帖：
 
 ```
-anima_stage(stage:"enrich", dataset:"X")              # dry-run 只查不写，先看命中率
+anima_stage(stage:"enrich", dataset:"X")              # dry-run 只查不写（但**仍会发请求**），先看命中率
 anima_stage(stage:"enrich", dataset:"X", apply:true)  # 把权威标签补进 raw_posts.jsonl
 ```
 
-实测 72 张本地图全部命中（danbooru 支持 `md5:<hex>`；不支持 `md5:a,md5:b` 批量，一张一次请求）。**必须在 `text` 修补之前跑**（改过像素 md5 就变），命中率低于一半时先怀疑三件事：跑过修补、裁剪或重编码过、原图本来没上传 danbooru。
+danbooru 支持 `md5:<hex>`；**不支持 `md5:a,md5:b` 批量**，一张一次请求（默认 0.35s 间隔）。md5 不中时还会用**文件名里的 pixiv illust id** 再兜一次（`<id>_p<页>` 命名，`noPixiv:true` 关掉）：只认「原文件名同名同页」或「该作品只有一帖且本图是 p0」，挑不出同一页就不认（多页作品尺寸常常完全一样，硬贴会串页）。**必须在 `text` 修补之前跑**（改过像素 md5 就变），命中率低于一半时先怀疑三件事：跑过修补、裁剪或重编码过、原图本来没上传 danbooru。
+
+但**命中率天生可能很低**：实测 redash 的 72 张图 md5 只中 3 张（都是当初从 danbooru 抓下来的），200 张 pixiv 原图里能解析出 id 的 46 张只有 6 张在 danbooru 有帖。**只发 pixiv 的画师，booru 上就是没有**——这时别反复重跑 `enrich`，把力气放到看图（B 源）上。

@@ -9,6 +9,7 @@
   import  src 传数据集根 -> 必须拒绝（否则 images/thumbs 被卷进 00_raw）
   import  非图文件 -> 不再静默黑洞，报告里要有 skipped-non-image
   enrich  没有图片 -> 给指引不联网；补标行必须写在 rename_map 的 old_name 上
+  enrich  pixiv 兜底 -> 只认同名同页；多页作品尺寸还一样时拒绝猜（错标签比没标签糟）
   thumbs  rename 之后 -> 必须用 images/（旧实现读 00_raw 打印 0 张）
   rename  跑第二批 -> rename_map.csv 只追加 + 留本批快照
   wash    手工删掉的图源标签 -> 默认不复活；--refresh-source 才整体重洗
@@ -105,6 +106,32 @@ check(_enrich.lookup_key("0007.png", {"0007.png": {"old_name": "pixiv_a.png"}}) 
       "enrich 补标键取 rename_map 的 old_name（否则 wash 静默读不到）")
 check(_enrich.lookup_key("pixiv_a.png", {}) == "pixiv_a.png",
       "enrich 还没 rename 时就用当前文件名")
+
+# pixiv 兜底只认确定同页：md5 查不到时会用文件名里的 illust id 再查一次，
+# 但多页作品（尺寸还都一样）绝不能按尺寸硬贴 —— 错标签比没标签更糟。
+check(_enrich.pixiv_of("145960069_p2-标题.png") == ("145960069", 2), "从 pixiv 文件名解析 illust id 与页号")
+check(_enrich.pixiv_of("145960069_p0.png") == ("145960069", 0), "p0 也要认（单帖作品的合法兜底）")
+check(_enrich.pixiv_of("redash_a.png") is None, "普通文件名不给 pixiv id，不去瞎查")
+
+
+class _P:
+    """pick_pixiv 只用到 source 与 id，不需要真 Session。"""
+    def __init__(self, pid, source=""):
+        self.pid, self.source = pid, source
+
+    def get(self, k):
+        return {"id": self.pid, "source": self.source}.get(k)
+
+
+_amb = [_P(12267680, "img/2026/09/20/12/02/06/149878653_p0.png"), _P(12267681)]
+_ok, how = _enrich.pick_pixiv([_P(1, "https://i.pximg.net/img/2026/01/01/x/149878653_p1.png?foo=1")],
+                              "149878653_p1.png", 1, None)
+check(how == "pixiv-source", "原文件名与我们的 old_name 同名同页 -> 认（source 带域名和 query 也要剥干净）")
+_ok, how = _enrich.pick_pixiv(_amb, "149878653_p1.png", 1, None)
+check(_ok is None and how == "pixiv-ambiguous",
+      "多帖候选 -> 拒绝（redash 实测：3 张不同页尺寸全一样，按尺寸贴就串页）")
+_ok, how = _enrich.pick_pixiv([_P(9)], "149878653_p2.png", 2, None)
+check(_ok is None, "单帖但不是 p0 -> 拒绝（那帖可能是别的页）")
 
 code, out = run("import", "--dataset", "t", "--src", str(src))
 raw = sorted((ds_dir / "00_raw").glob("*"))

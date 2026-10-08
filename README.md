@@ -143,7 +143,7 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | `init` | `trigger`、`kind`、`force`、`reset`+`yes` | `_pipeline/manifest.json` |
 | `fetch` | `source=yandere\|danbooru\|pawchive\|exhentai`、`tags`/`creator`/`gallery`、`limit`、`cookies`；`dryRun` 预演 | `00_raw/` + `raw_posts.jsonl`（含每帖 `tags[]`） |
 | `import` | `src=<素材目录或压缩包>`、`move`、`noUnpack`；`dryRun` 预演 | 解包/收编进 `00_raw/` |
-| `enrich` | `limit`、`force`；`apply` 才写盘 | 按文件 md5 去 danbooru 反查原帖，把权威 `tag_string` 补进 `raw_posts.jsonl`（来源 A）+ `enrich_report.csv` |
+| `enrich` | `limit`、`force`、`noPixiv`；`apply` 才写盘 | 按文件 md5（不中再用文件名里的 pixiv id）去 danbooru 反查原帖，把权威 `tag_string` 补进 `raw_posts.jsonl`（来源 A）+ `enrich_report.csv`（含 `by` 列：md5 / pixiv-source / pixiv-single） |
 | `dedup` | `phashDistance`(4)、`ssim`(0.995)、`includeImages` | `dedup_report.csv`，`apply` 时移入 `_excluded/duplicates/` |
 | `screen` | `minShortSide`(512)、`minBytes`(102400)、`earliest`(2015-01-01) | `screen_report.csv` + `review_queue.csv` |
 | `thumbs` | `maxSide`(1536)、`prune`、`includeImages` | `_pipeline/thumbs/`（视觉子代理只能看这个） |
@@ -240,15 +240,16 @@ koharu 0.83.1 是 GUI-only（CLI 是空的 Cli{}，无 HTTP/MCP），所以直�
 
 ```
 fetch  →  _pipeline/raw_posts.jsonl      每个下载文件的 post_id / tags / created_at / 宽高
-enrich →  _pipeline/raw_posts.jsonl      本地图的 md5 反查原帖，补上同样的行（source=danbooru-md5）
+enrich →  _pipeline/raw_posts.jsonl      本地图反查原帖补上同样的行（source=danbooru-md5，md5 不中再用 pixiv id）
 rename →  _pipeline/rename_map.csv       new_name → old_name + post 元数据 + tags_full
 wash   →  caption 的来源 A（booru 标签）+ 来源 C（同名 .txt sidecar）
 ```
 
 - `screen` 从 `raw_posts.jsonl` 读 `created_at` 判"过老"，`dedup` 读宽高决定保留哪张，`rename` 按 `created_at` 排序编号。
 - **标签一律用 danbooru 下划线原形**（`hakurei_reimu`、`long_hair`），不是空格形：`raw_posts.jsonl` 的 `tags` 是 list（边界无歧义，`wash` 优先读它）；`rename_map.csv` 只能存字符串，`rename` 会写 `tags_full` = 下划线形空格拼接。历史上这里有个坑——CSV 里存空格形多词标签，下游 `.split()` 会把它切成 `hakurei` + `reimu` 两个词，且**不会报错**。
-- 本地 `import` 进来的图只有"从哪来"这一行元数据（`source=import`），**没有 booru 标签**：要么自带 `.txt`，要么用 **`enrich`** 按文件 md5 去 danbooru 反查原帖把权威标签补回来（Pixiv 图、压缩包、别人给的素材都能查；实测 72 张 redash 里的图全部命中）。
-- **`enrich` 要在 `text` 修补之前跑**：修补改像素 ⇒ md5 变了就永远查不到。命中率低时先看这三条：跑过 text 修补、裁剪/重编码过、原图本来没上传 danbooru。danbooru 不支持批量 md5 查询（`md5:a,md5:b` 返回 0），所以是一张一次请求，默认 0.35s 间隔。
+- 本地 `import` 进来的图只有"从哪来"这一行元数据（`source=import`），**没有 booru 标签**：要么自带 `.txt`，要么用 **`enrich`** 按文件 md5 去 danbooru 反查原帖把权威标签补回来（Pixiv 图、压缩包、别人给的素材都能查）。md5 不中时还会用**文件名里的 pixiv illust id** 再兜一次（`<id>_p<页>` 命名；只认"原文件名同名同页"或"该作品只有一帖且本图是 p0"，**挑不出同一页就不认** —— 多页作品尺寸往往完全一样，硬贴会把 p0 的标签安到 p1 上；不要这个兜底传 `noPixiv:true`）。
+- **别对 `enrich` 的命中率抱幻想**：实测 `E:/LoRA_Train/datasets/redash` 的 72 张图，md5 只命中 **3 张**（全是当初从 danbooru 抓下来的 `.jpg`），43 张查不到、26 张本来就有标签；那 200 张 pixiv 原图里能解析出 illust id 的 46 张，只有 6 张在 danbooru 有帖，其中 3 张还是同一作品的不同页（按上面的规则**拒绝**）。结论：**只发 pixiv 的画师，A 源天生稀薄，B 源（看图）才是主力**。`enrich_report.csv` 的 `by` 列会写清每张是靠 `md5` 还是 `pixiv-source`/`pixiv-single` 命中的。
+- **`enrich` 要在 `text` 修补之前跑**：修补改像素 ⇒ md5 变了就永远查不到。命中率低时先看这三条：跑过 text 修补、裁剪/重编码过、原图本来没上传 danbooru。danbooru 不支持批量 md5 查询（`md5:a,md5:b` 返回 0），所以是一张一次请求，默认 0.35s 间隔（`pixiv_id` 兜底会让 miss 的图多一次请求）。
 - `wash` 有**两个点名报警器**：① "既无来源标签也无既有 caption"（来源链断了）；② "caption 洗完只剩触发词"（来源标签**有**数据，但被整类规则丢光——单画师图源的典型症状，附丢弃理由计数）。`verify` 的 `too-few-tags` 是第三道闸。
 - **反查回来的是权威全集（常见 45~65 条），比"看图精修过的 caption"长得多**：`wash` 会丢光画师/IP/meta 类，但剩下的仍可能超过指南 §9 的 45 条上限（实测一张 63 条源标签丢完还剩 49）。`enrich` 只把超限张数报出来，**不自动裁剪**——按 §2.2 的槽位优先级（人物/服装/动作 > 构图/背景/光影）用 `fix-caption` 往下删才是对的。
 

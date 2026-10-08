@@ -25,11 +25,13 @@ anima_stage(stage:"import", dataset:"X", src:"D:/下载/某画师", dryRun:true)
 - **导入的图没有 booru 标签**（`import` 只写「从哪来」这行元数据），而 `wash` 的来源 A 全靠 `raw_posts.jsonl` 里的 `tags`。所以素材是本地图/Pixiv/压缩包时，导入后补一步 `enrich`——按文件 md5 去 danbooru 反查原帖：
 
 ```
-anima_stage(stage:"enrich", dataset:"X")              # dry-run 只查不写，先看命中率
+anima_stage(stage:"enrich", dataset:"X")              # dry-run 只查不写（但**仍会发请求**），先看命中率
 anima_stage(stage:"enrich", dataset:"X", apply:true)  # 权威标签补进 raw_posts.jsonl + enrich_report.csv
 ```
 
-  实测 72 张本地图全部命中；**要在 `text` 修补之前跑**（修补改像素 ⇒ md5 变），命中率低先怀疑「修补过 / 裁剪重编码过 / 原图没上传」。反查回来的是权威全集（45~65 条），可能超过 §9 的 45 条上限，`enrich` 会把超限张数报出来，按 §2.2 槽位优先级用 `fix-caption` 往下删。
+  md5 不中时还会用**文件名里的 pixiv illust id** 再兜一次（`<id>_p<页>` 命名，`noPixiv:true` 可关掉）：只认「原文件名同名同页」或「该作品只有一帖且本图是 p0」，挑不出同一页就不认——多页作品尺寸往往完全一样，硬贴会把 p0 的标签安到 p1 上，**错标签比没标签更糟**。
+  **别期待高命中率**：实测 redash 的 72 张图 md5 只中 3 张（全是当初从 danbooru 抓下来的 `.jpg`），43 张查不到；200 张 pixiv 原图里能解析出 id 的 46 张只有 6 张在 danbooru 有帖，其中 3 张还是同作品不同页（被拒）。**只发 pixiv 的画师，A 源天生稀薄，B 源（看图）才是主力**——这不是流程出错。`enrich_report.csv` 的 `by` 列写清每张靠什么命中的。
+  **要在 `text` 修补之前跑**（修补改像素 ⇒ md5 变），命中率低先怀疑「修补过 / 裁剪重编码过 / 原图没上传」。反查回来的是权威全集（45~65 条），可能超过 §9 的 45 条上限，`enrich` 会把超限张数报出来，按 §2.2 槽位优先级用 `fix-caption` 往下删。
 
 ## §1 去重（dedup）
 

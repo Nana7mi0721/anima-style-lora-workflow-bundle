@@ -75,10 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-unpack", action="store_true")
     sp.add_argument("--dry-run", action="store_true")
 
-    sp = add("enrich", "按 md5 去 danbooru 反查原帖，把权威标签补进 raw_posts.jsonl")
+    sp = add("enrich", "按 md5（查不到再用 pixiv_id）去 danbooru 反查原帖，把权威标签补进 raw_posts.jsonl")
     sp.add_argument("--limit", type=int, default=0, help="最多查几张（0=全部）")
     sp.add_argument("--force", action="store_true",
                     help="已有标签的也重查 / 覆盖同键旧行")
+    sp.add_argument("--no-pixiv", action="store_true",
+                    help="md5 查不到时不再用文件名里的 pixiv_id 兜底")
     _apply(sp)
 
     sp = add("dedup", "md5 + pHash/SSIM 去重")
@@ -529,7 +531,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "enrich":
-        enrich.cmd_enrich(ds, limit=args.limit, apply=args.apply, force=args.force)
+        enrich.cmd_enrich(ds, limit=args.limit, apply=args.apply, force=args.force,
+                          no_pixiv=args.no_pixiv)
         _mark(ds, "enrich", _applied(args))
         return 0
 

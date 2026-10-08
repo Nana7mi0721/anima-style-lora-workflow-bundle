@@ -48,7 +48,7 @@
                 ## 铁律
                 1. **先看后做**：anima_status → dry-run → 给用户看清单 → apply。跳过 dry-run 直接写盘是禁止的。
                 2. **主代理永不读图**。看图一律：先 `anima_stage thumbs` 生成 ≤1536px 缩略图，再派子代理，**一次一个子代理、一个子代理只看一张图**，用结构化槽位填空提问。直接读 30~50MB 原图会被供应商静默拒绝。
-                3. **booru 标签是事实基准**。wash 用 booru 标签当骨架；看图只补「人数/关系/构图/体位细节」这类 booru 覆盖不到的字段；两者冲突时以看图为准但要在报告里写明。看不到的东西不写，绝不编。**本地导入的图（Pixiv/压缩包）没有 booru 标签**，靠 `enrich` 按文件 md5 去 danbooru 反查原帖补回来（必须在 `text` 修补之前跑，改过像素就查不到了）；抓下来的图 `fetch` 已经存好标签。
+                3. **booru 标签是事实基准**。wash 用 booru 标签当骨架；看图只补「人数/关系/构图/体位细节」这类 booru 覆盖不到的字段；两者冲突时以看图为准但要在报告里写明。看不到的东西不写，绝不编。**本地导入的图（Pixiv/压缩包）没有 booru 标签**，靠 `enrich` 按文件 md5 去 danbooru 反查原帖补回来（必须在 `text` 修补之前跑，改过像素就查不到了；md5 不中会用文件名里的 pixiv id 再兜一次，只认同名同页）；抓下来的图 `fetch` 已经存好标签。**命中率可能很低且这是正常的**——实测 redash 72 张只中 3 张（只发 pixiv 的画师在 booru 上就是没有）。别为此反复重跑，把力气放到看图（B 源）上。
                 4. **caption 形态硬约束**：单行、全小写、空格不用下划线、`", "` 分隔、20~45 个标签、触发词 `@xxx` 置首且唯一、无否定式、无质量词。混排自然语言用 `". "` 过渡。**要改某张图的 caption 用 `fix-caption`**（add/remove/set），不要手改 `images/*.txt` 再重跑 `wash`；补标签之前先 `dict-check` 确认标签在 danbooru 真的存在，别凭印象编。
                 5. **训练配置只写在 train_configs/<name>/ 四件套**（`<name>_lora_stage1.toml` + `dataset_<name>.toml` + `train_<name>.bat` + `rationale.md`，另出 `preflight.txt` 体检单），用 makecfg 生成，不手写；绝不生成 `noise_offset` / `min_snr_gamma`（Anima 路径不调用），`shuffle_caption` 恒 false，`network_module` 恒 `networks.lora_anima`。
                 6. **GPU 阶段必须走 anima_lora daemon**（caption-autotag 等）。agent 后台 shell 直起的 GPU 进程会被沙箱 SIGKILL，无痕迹。

@@ -49,7 +49,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | init | `anima_stage(stage:"init", dataset:"X")` | — | 目录骨架 + manifest | 不重建已存在的 manifest（`force:true` 就地改触发词/类型并保留阶段记录；`reset:true`+`yes:true` 才推倒重来） |
 | fetch | `anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"artist_name", limit:250)` | 图源 | `00_raw/*` + raw_posts.jsonl | 只追加：同名文件跳过，元数据按 `(filename, post_id)` 去重合并。**默认就下载**，`dryRun:true` 只列清单 |
 | import | `anima_stage(stage:"import", dataset:"X", src:"D:/下载/xxx")` | 素材目录/压缩包 | `00_raw/*`（zip/rar/7z 自动解） | 只追加（重名加 `__n`）。**`src` 不能是数据集目录本身或它的上级**，会被拒绝；非图文件会报"跳过 N 个"，不进 `00_raw` |
-| enrich | `anima_stage(stage:"enrich", dataset:"X")` → `apply:true` | `images/`（没重排就是 `00_raw/`） | raw_posts.jsonl + enrich_report.csv | 只追加（按 `(filename, post_id)` 合并；`force:true` 才重查已有标签的图）。**默认 dry-run 只查不写**，但**仍会发请求**——就是给你看命中率。**必须在 `text` 修补之前跑**（改过像素 md5 就对不上） |
+| enrich | `anima_stage(stage:"enrich", dataset:"X")` → `apply:true` | `images/`（没重排就是 `00_raw/`） | raw_posts.jsonl + enrich_report.csv（含 `by` 列） | 只追加（按 `(filename, post_id)` 合并；`force:true` 才重查已有标签的图）。**默认 dry-run 只查不写**，但**仍会发请求**——就是给你看命中率。**必须在 `text` 修补之前跑**（改过像素 md5 就对不上）；md5 不中时用文件名里的 pixiv id 兜一次（只认同名同页/单帖 p0，`noPixiv:true` 可关） |
 | dedup | `anima_stage(stage:"dedup", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 连 `images/`） | dedup_report.csv | 覆盖报告；apply 时把重复图**移动**到 `_excluded/duplicates/` |
 | screen | `stage:"screen"` → 视觉复核 → `apply:true` | `00_raw/` | screen_report.csv + review_queue.csv | 覆盖报告；apply 时移入 `_excluded/<reason>/` |
 | thumbs | `anima_stage(stage:"thumbs", dataset:"X")` | `images/` 有就用它，否则 `00_raw/` | `_pipeline/thumbs/*.jpg` | 覆盖已有缩略图（**不吃 apply**，写盘是默认行为）；已是最新的跳过，`prune:true` 清掉没有对应图的陈旧缩略图 |
@@ -65,6 +65,8 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 顺序不是死板的：`text` 必须在 `rename` 前（rename 后文件名与 raw_posts.jsonl 的对应关系会断，text 报告就不好回溯）；`wash` 必须在 `rename` 后（caption 文件名跟新编号走）；`thumbs` 可以在 `screen` 前先跑一遍用于人工看；**`enrich` 要在 `text` 之前**（修补改像素 ⇒ md5 变了对不上原帖；local 图源没有 booru 标签时它是唯一的 A 源）。
 
+**`enrich` 命中率低是常态，不是故障**：实测 redash 的 72 张图 md5 只中 3 张，200 张 pixiv 原图里 46 张能解析出 illust id 的只有 6 张在 danbooru 有帖。只发 pixiv 的画师在 booru 上就是没有 ⇒ **A 源稀薄时把力气放到 B 源（看图）**，别反复重跑 `enrich`。命中的那几张是白捡的权威标签，照收。
+
 **dry-run 不算完成**：没写盘的那一跑在 manifest 里记成 `preview`，`anima_status` 里显示 `▷`，`done=[…]` 里也不会出现它。看到 `▷` 就表示「报告看过了、还没落地」，下一步是带 `apply:true` 重跑同一阶段。`↻ stale` 表示上游改过（例如 `text` 修补了图），这条链上的洗标/配置都要重跑。
 
 ### 参数矩阵：哪些阶段不吃 apply（真实使用里靠试错才发现）
@@ -77,6 +79,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | `fetch` / `import` | 也是默认写盘，但用 **`dryRun:true`** 预演（不是 `apply`） |
 | `verify` / `review-list` / `dict-check` | **只读**，没有 `apply`（`verify` 可以 `trigger` 覆盖，`dict-check` 可以只给 `tags` 不给 dataset） |
 | `force` | 只在 `init`、`enrich`、`makecfg` 上存在 |
+| `enrich` 的 `noPixiv` | 关掉「md5 不中就用文件名里的 pixiv id 再兜一次」这条支路（默认开着） |
 
 `fix-caption` 的 `add`/`remove`/`set` 三个参数至少要给一个；`set` 是整条替换，给了它 `add`/`remove` 会被忽略。
 
