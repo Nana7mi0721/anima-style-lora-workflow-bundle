@@ -8,6 +8,7 @@
 
   import  src 传数据集根 -> 必须拒绝（否则 images/thumbs 被卷进 00_raw）
   import  非图文件 -> 不再静默黑洞，报告里要有 skipped-non-image
+  enrich  没有图片 -> 给指引不联网；补标行必须写在 rename_map 的 old_name 上
   thumbs  rename 之后 -> 必须用 images/（旧实现读 00_raw 打印 0 张）
   rename  跑第二批 -> rename_map.csv 只追加 + 留本批快照
   wash    手工删掉的图源标签 -> 默认不复活；--refresh-source 才整体重洗
@@ -92,6 +93,18 @@ code, out = run("init", "--dataset", "t", "--trigger", "@tstyle", "--kind", "sty
 check(code == 0 and (ds_dir / "_pipeline" / "manifest.json").exists(), "init 建出 manifest")
 manifest = json.loads((ds_dir / "_pipeline" / "manifest.json").read_text(encoding="utf-8"))
 check(manifest.get("trigger") == "@tstyle", "manifest 记下触发词 @tstyle")
+
+# --- enrich（离线只验契约：空集给指引 + 补标键必须是 rename_map 的 old_name）--
+
+code, out = run("enrich", "--dataset", "t", "--apply")
+check(code == 0 and "没有图片" in out, "enrich 空集给指引、退出 0（不联网、不炸）")
+
+sys.path.insert(0, str(BUNDLE / "python"))
+from animasl import enrich as _enrich          # noqa: E402
+check(_enrich.lookup_key("0007.png", {"0007.png": {"old_name": "pixiv_a.png"}}) == "pixiv_a.png",
+      "enrich 补标键取 rename_map 的 old_name（否则 wash 静默读不到）")
+check(_enrich.lookup_key("pixiv_a.png", {}) == "pixiv_a.png",
+      "enrich 还没 rename 时就用当前文件名")
 
 code, out = run("import", "--dataset", "t", "--src", str(src))
 raw = sorted((ds_dir / "00_raw").glob("*"))

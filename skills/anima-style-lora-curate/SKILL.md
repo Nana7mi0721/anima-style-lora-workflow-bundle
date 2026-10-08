@@ -22,6 +22,14 @@ anima_stage(stage:"import", dataset:"X", src:"D:/下载/某画师", dryRun:true)
 - 递归时会跳过**数据集内**的保留目录（`00_raw` / `images` / `thumbs` / `masks` / `_pipeline` / `_excluded`）；数据集**外面**的同名目录不跳（那是正常的素材目录）。
 - 非图文件（zip 之外的 mp4/psd 等）不再静默：会打印「跳过非图 N 个」并列前几个扩展名，也不写进 `raw_posts.jsonl`。
 - `fetch` 同样是「默认就下载」，预演用 `dryRun:true`；`import`/`fetch` 都**没有 `apply`**。
+- **导入的图没有 booru 标签**（`import` 只写「从哪来」这行元数据），而 `wash` 的来源 A 全靠 `raw_posts.jsonl` 里的 `tags`。所以素材是本地图/Pixiv/压缩包时，导入后补一步 `enrich`——按文件 md5 去 danbooru 反查原帖：
+
+```
+anima_stage(stage:"enrich", dataset:"X")              # dry-run 只查不写，先看命中率
+anima_stage(stage:"enrich", dataset:"X", apply:true)  # 权威标签补进 raw_posts.jsonl + enrich_report.csv
+```
+
+  实测 72 张本地图全部命中；**要在 `text` 修补之前跑**（修补改像素 ⇒ md5 变），命中率低先怀疑「修补过 / 裁剪重编码过 / 原图没上传」。反查回来的是权威全集（45~65 条），可能超过 §9 的 45 条上限，`enrich` 会把超限张数报出来，按 §2.2 槽位优先级用 `fix-caption` 往下删。
 
 ## §1 去重（dedup）
 

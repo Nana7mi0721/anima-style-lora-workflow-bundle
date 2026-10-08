@@ -35,20 +35,21 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | `images/<stem>.txt` | `wash` / `apply-review` / `fix-caption` | **所有下游**（`verify`、`makecfg`、你自己） | **caption 的唯一权威副本**。要改 caption 走 `fix-caption`，不要手改文件再重跑 `wash`（重跑会按图源重建） |
 | `_pipeline/per_image.json` | `rename` / `wash` / `apply-review` / `fix-caption` | 引擎自己 + 你排查时 | **只追加**：`old_names`/`merged_tags` 取并集，`history` 保留最近 30 次。它是"这张图经历过什么"的账本，不删记录 |
 | `_pipeline/rename_map.csv` | `rename` | `wash`（按 `old_name` 回查 booru 标签） | **只追加**，多批次共存；每批另留 `rename_map.<first>-<last>.csv` 快照。**不要读它的 `tags_full` 当标签来源**（那是抓取当时的快照，可能已被清洗） |
-| `raw_posts.jsonl` | `fetch` / `import` | `rename`（写进对照表）、`wash`（图源标签 A） | 只追加，按 `(filename, post_id)` 去重合并 |
+| `raw_posts.jsonl` | `fetch` / `import` / `enrich` | `rename`（写进对照表）、`wash`（图源标签 A） | 只追加，按 `(filename, post_id)` 去重合并。**行键是文件名**：`enrich` 补的行必须落在 `rename_map.csv` 的 `old_name` 上，否则 `wash` 静默读不到（它自己按这条选键） |
 | `manifest.json` | 每个阶段 | `anima_status`、`wash.resolve_trigger` | 触发词/类型的权威来源 |
 
 **推论**：`wash` 默认**不会复活**你删掉的图源标签（它拿 `per_image.json` 的 `merged_tags` 与当前 caption 比对，差值视为人工删除）；确实想按图源整体重洗时用 `refreshSource:true`。这条就是"手工改完 caption 一重跑全回来"那个坑的修法。
 
 ## §2 阶段表与 I/O 契约
 
-**15 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
+**16 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
 
 | 阶段 | 工具调用 | 输入 | 产出 | 重跑会覆盖什么 |
 |---|---|---|---|---|
 | init | `anima_stage(stage:"init", dataset:"X")` | — | 目录骨架 + manifest | 不重建已存在的 manifest（`force:true` 就地改触发词/类型并保留阶段记录；`reset:true`+`yes:true` 才推倒重来） |
 | fetch | `anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"artist_name", limit:250)` | 图源 | `00_raw/*` + raw_posts.jsonl | 只追加：同名文件跳过，元数据按 `(filename, post_id)` 去重合并。**默认就下载**，`dryRun:true` 只列清单 |
 | import | `anima_stage(stage:"import", dataset:"X", src:"D:/下载/xxx")` | 素材目录/压缩包 | `00_raw/*`（zip/rar/7z 自动解） | 只追加（重名加 `__n`）。**`src` 不能是数据集目录本身或它的上级**，会被拒绝；非图文件会报"跳过 N 个"，不进 `00_raw` |
+| enrich | `anima_stage(stage:"enrich", dataset:"X")` → `apply:true` | `images/`（没重排就是 `00_raw/`） | raw_posts.jsonl + enrich_report.csv | 只追加（按 `(filename, post_id)` 合并；`force:true` 才重查已有标签的图）。**默认 dry-run 只查不写**，但**仍会发请求**——就是给你看命中率。**必须在 `text` 修补之前跑**（改过像素 md5 就对不上） |
 | dedup | `anima_stage(stage:"dedup", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 连 `images/`） | dedup_report.csv | 覆盖报告；apply 时把重复图**移动**到 `_excluded/duplicates/` |
 | screen | `stage:"screen"` → 视觉复核 → `apply:true` | `00_raw/` | screen_report.csv + review_queue.csv | 覆盖报告；apply 时移入 `_excluded/<reason>/` |
 | thumbs | `anima_stage(stage:"thumbs", dataset:"X")` | `images/` 有就用它，否则 `00_raw/` | `_pipeline/thumbs/*.jpg` | 覆盖已有缩略图（**不吃 apply**，写盘是默认行为）；已是最新的跳过，`prune:true` 清掉没有对应图的陈旧缩略图 |
@@ -62,7 +63,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | dict-check | `anima_stage(stage:"dict-check", dataset:"X")` / `tags:"a, b"` | caption 或显式标签 | 终端输出（不写盘） | — |
 | makecfg | `anima_stage(stage:"makecfg", dataset:"X", kind:"style", trigger:"@xxx", subdirs:"before,latest,present")` | `images/` + manifest | `train_configs/X/` 四件套 + **preflight.txt** | 覆盖已有配置（旧文件先改名成 `.bak<时分秒>` 备份；`force:true` 则不备份）。**LR 超出该 rank 的建议区间直接报错**，除非 `allowOutOfBand:true` |
 
-顺序不是死板的：`text` 必须在 `rename` 前（rename 后文件名与 raw_posts.jsonl 的对应关系会断，text 报告就不好回溯）；`wash` 必须在 `rename` 后（caption 文件名跟新编号走）；`thumbs` 可以在 `screen` 前先跑一遍用于人工看。
+顺序不是死板的：`text` 必须在 `rename` 前（rename 后文件名与 raw_posts.jsonl 的对应关系会断，text 报告就不好回溯）；`wash` 必须在 `rename` 后（caption 文件名跟新编号走）；`thumbs` 可以在 `screen` 前先跑一遍用于人工看；**`enrich` 要在 `text` 之前**（修补改像素 ⇒ md5 变了对不上原帖；local 图源没有 booru 标签时它是唯一的 A 源）。
 
 **dry-run 不算完成**：没写盘的那一跑在 manifest 里记成 `preview`，`anima_status` 里显示 `▷`，`done=[…]` 里也不会出现它。看到 `▷` 就表示「报告看过了、还没落地」，下一步是带 `apply:true` 重跑同一阶段。`↻ stale` 表示上游改过（例如 `text` 修补了图），这条链上的洗标/配置都要重跑。
 
@@ -75,7 +76,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | `init` / `thumbs` | **不吃 `apply`** —— 写盘就是它们的默认行为 |
 | `fetch` / `import` | 也是默认写盘，但用 **`dryRun:true`** 预演（不是 `apply`） |
 | `verify` / `review-list` / `dict-check` | **只读**，没有 `apply`（`verify` 可以 `trigger` 覆盖，`dict-check` 可以只给 `tags` 不给 dataset） |
-| `force` | 只在 `init` 与 `makecfg` 上存在 |
+| `force` | 只在 `init`、`enrich`、`makecfg` 上存在 |
 
 `fix-caption` 的 `add`/`remove`/`set` 三个参数至少要给一个；`set` 是整条替换，给了它 `add`/`remove` 会被忽略。
 

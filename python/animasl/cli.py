@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from . import config as cfgmod
-from . import curate, dicts, fetch, makecfg, manifest, net, wash
+from . import curate, dicts, enrich, fetch, makecfg, manifest, net, wash
 
 
 def _ds(args) -> cfgmod.Dataset:
@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--move", action="store_true")
     sp.add_argument("--no-unpack", action="store_true")
     sp.add_argument("--dry-run", action="store_true")
+
+    sp = add("enrich", "按 md5 去 danbooru 反查原帖，把权威标签补进 raw_posts.jsonl")
+    sp.add_argument("--limit", type=int, default=0, help="最多查几张（0=全部）")
+    sp.add_argument("--force", action="store_true",
+                    help="已有标签的也重查 / 覆盖同键旧行")
+    _apply(sp)
 
     sp = add("dedup", "md5 + pHash/SSIM 去重")
     sp.add_argument("--phash-distance", type=int, default=4)
@@ -381,6 +387,15 @@ def _config_report(home: str | None, as_json: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # 中文 Windows 控制台默认 GBK，而进度行里有 ✓/✗/→ 这类 GBK 编码不了的符号：
+    # 插件 spawn 时设了 PYTHONIOENCODING=utf-8，手跑 CLI 时没有 ⇒ print 直接抛
+    # UnicodeEncodeError，一个符号掀翻整个阶段。保留控制台自己的编码，
+    # 只把编不出的字符替换掉。
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
     args = build_parser().parse_args(argv)
     cmd = args.cmd
 
@@ -511,6 +526,11 @@ def main(argv: list[str] | None = None) -> int:
         curate.cmd_import(ds, args.src, unpack=not args.no_unpack, move=args.move,
                           dry_run=args.dry_run)
         _mark(ds, "import", _applied(args))
+        return 0
+
+    if cmd == "enrich":
+        enrich.cmd_enrich(ds, limit=args.limit, apply=args.apply, force=args.force)
+        _mark(ds, "enrich", _applied(args))
         return 0
 
     if cmd == "dedup":

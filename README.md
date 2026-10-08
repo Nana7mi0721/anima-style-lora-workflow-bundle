@@ -13,7 +13,7 @@ DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 →
 | agent 预设 `anima-style-lora`（显示名「Anima风格LoRA全流程」） | 带专属 persona 的 agent 组合；`skill-filesystem` 通过 `customSkillDirs` 挂载本包的 `skills/` |
 | 3 个 skill | `anima-style-lora-pipeline`（总纲）/ `-source`（选源下载）/ `-curate`（筛选 + 文字修补 + 视觉复核） |
 | 设置页（浏览器半侧 + 宿主路由 `/anima-lora/api`） | 在 DSH 设置里直接改全部配置项（含凭据），写进 `<home>/.animasl/animasl.config.json`，下次调用即生效 |
-| Python 工具箱 `python/animasl/` | 15 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
+| Python 工具箱 `python/animasl/` | 16 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
 
 ## 安装
 
@@ -67,7 +67,7 @@ npm run test:all      # 上面全部（check:patch + params + client + route + p
 `E:/LoRA_Train/.animasl/venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
 `SKIP` 并返回 0）。
 
-`test/pipeline-offline.py` 是**唯一一条把 15 个阶段串起来跑**的回归：在 `<home>/datasets`
+`test/pipeline-offline.py` 是**唯一一条把 16 个阶段串起来跑**的回归：在 `<home>/datasets`
 下建 `_pipeoff_*` 临时现场（`_` 前缀，`anima_status` 看不见），用真 CLI 走
 init → import（含"跳过非图"与"拒绝 src=数据集根"）→ rename → thumbs（重排之后仍出图）
 → 第二批 import + rename（验证对照表只追加）→ wash（触发词置首、并入图源标签、
@@ -136,13 +136,14 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 
 插件的 `config`（在 profile 的 `cordis.patch.yml` 里改）：`home` / `pythonDir` / `python` / `mlPython` / `runtimeDir` / `animaLoraDir` / `timeoutMs` / `longTimeoutMs`。
 
-## 十五个阶段
+## 十六个阶段
 
 | stage | 工具参数要点 | 产出 |
 |---|---|---|
 | `init` | `trigger`、`kind`、`force`、`reset`+`yes` | `_pipeline/manifest.json` |
-| `fetch` | `source=yandere\|danbooru\|pawchive\|exhentai`、`tags`/`creator`/`gallery`、`limit`、`cookies`；`dryRun` 预演 | `00_raw/` + `raw_posts.jsonl` |
+| `fetch` | `source=yandere\|danbooru\|pawchive\|exhentai`、`tags`/`creator`/`gallery`、`limit`、`cookies`；`dryRun` 预演 | `00_raw/` + `raw_posts.jsonl`（含每帖 `tags[]`） |
 | `import` | `src=<素材目录或压缩包>`、`move`、`noUnpack`；`dryRun` 预演 | 解包/收编进 `00_raw/` |
+| `enrich` | `limit`、`force`；`apply` 才写盘 | 按文件 md5 去 danbooru 反查原帖，把权威 `tag_string` 补进 `raw_posts.jsonl`（来源 A）+ `enrich_report.csv` |
 | `dedup` | `phashDistance`(4)、`ssim`(0.995)、`includeImages` | `dedup_report.csv`，`apply` 时移入 `_excluded/duplicates/` |
 | `screen` | `minShortSide`(512)、`minBytes`(102400)、`earliest`(2015-01-01) | `screen_report.csv` + `review_queue.csv` |
 | `thumbs` | `maxSide`(1536)、`prune`、`includeImages` | `_pipeline/thumbs/`（视觉子代理只能看这个） |
@@ -161,7 +162,7 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 |---|---|---|
 | 写盘是默认行为 | `init`、`thumbs` | **不吃 `apply`**；`init` 靠 `force`/`reset` 控制 |
 | 默认写盘、`dryRun` 反转 | `fetch`、`import` | 预演用 `dryRun:true` |
-| 默认 dry-run、要 `apply:true` | `dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`makecfg` | 不带就只出报告 |
+| 默认 dry-run、要 `apply:true` | `enrich`、`dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`makecfg` | 不带就只出报告（`enrich` 的 dry-run **仍会发请求**——它就是给你看命中率的） |
 | 只读 | `status`、`review-list`、`verify`、`dict-check` | 没有 `apply` |
 
 **dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子）。
@@ -239,14 +240,17 @@ koharu 0.83.1 是 GUI-only（CLI 是空的 Cli{}，无 HTTP/MCP），所以直�
 
 ```
 fetch  →  _pipeline/raw_posts.jsonl      每个下载文件的 post_id / tags / created_at / 宽高
+enrich →  _pipeline/raw_posts.jsonl      本地图的 md5 反查原帖，补上同样的行（source=danbooru-md5）
 rename →  _pipeline/rename_map.csv       new_name → old_name + post 元数据 + tags_full
 wash   →  caption 的来源 A（booru 标签）+ 来源 C（同名 .txt sidecar）
 ```
 
 - `screen` 从 `raw_posts.jsonl` 读 `created_at` 判"过老"，`dedup` 读宽高决定保留哪张，`rename` 按 `created_at` 排序编号。
 - **标签一律用 danbooru 下划线原形**（`hakurei_reimu`、`long_hair`），不是空格形：`raw_posts.jsonl` 的 `tags` 是 list（边界无歧义，`wash` 优先读它）；`rename_map.csv` 只能存字符串，`rename` 会写 `tags_full` = 下划线形空格拼接。历史上这里有个坑——CSV 里存空格形多词标签，下游 `.split()` 会把它切成 `hakurei` + `reimu` 两个词，且**不会报错**。
-- 本地 `import` 进来的图只有"从哪来"这一行元数据（`source=import`），**没有 booru 标签**：要么自带 `.txt`，要么先用 `anima-lora-auto-caption` 打标再洗。
+- 本地 `import` 进来的图只有"从哪来"这一行元数据（`source=import`），**没有 booru 标签**：要么自带 `.txt`，要么用 **`enrich`** 按文件 md5 去 danbooru 反查原帖把权威标签补回来（Pixiv 图、压缩包、别人给的素材都能查；实测 72 张 redash 里的图全部命中）。
+- **`enrich` 要在 `text` 修补之前跑**：修补改像素 ⇒ md5 变了就永远查不到。命中率低时先看这三条：跑过 text 修补、裁剪/重编码过、原图本来没上传 danbooru。danbooru 不支持批量 md5 查询（`md5:a,md5:b` 返回 0），所以是一张一次请求，默认 0.35s 间隔。
 - `wash` 有**两个点名报警器**：① "既无来源标签也无既有 caption"（来源链断了）；② "caption 洗完只剩触发词"（来源标签**有**数据，但被整类规则丢光——单画师图源的典型症状，附丢弃理由计数）。`verify` 的 `too-few-tags` 是第三道闸。
+- **反查回来的是权威全集（常见 45~65 条），比"看图精修过的 caption"长得多**：`wash` 会丢光画师/IP/meta 类，但剩下的仍可能超过指南 §9 的 45 条上限（实测一张 63 条源标签丢完还剩 49）。`enrich` 只把超限张数报出来，**不自动裁剪**——按 §2.2 的槽位优先级（人物/服装/动作 > 构图/背景/光影）用 `fix-caption` 往下删才是对的。
 
 `verify` 是**交付前的验收闸门**，按指南 §9 分两层：**形态层**（单行、全小写、无下划线形、` , ` 分隔、无前导逗号、无重复 token、标签数 20~45、触发词唯一且置首、BOM/尾换行/尾标点）与**内容层**（BANNED 令牌零残留＝画师/IP/meta/质量词/文字族/否定式/该换现行形的别名、人数一致性 = `solo` 与 `2girls`/`1boy`/`solo focus` 互斥、图-txt 配对完整含孤儿 `.txt`）。内容层是给"人工编辑过、或别的打标工具写的"caption 兜底的：`wash` 跑完再手改，画师/IP/质量词就会悄悄回来。`--online` 再用 danbooru `search[name_comma]` 复核"词典里没有"的标签是否真实存在（每批 120）。实测在用户的 63 张既有 caption 上查出 23 种残留（`explicit`×30、`sensitive`×17、`nsfw`×15、`blue archive`×9、`(series)`×8、`pantsu→panties`/`garter→garter belt`/`swimsuits→swimsuit` 等别名形）。
 
@@ -268,7 +272,7 @@ wash   →  caption 的来源 A（booru 标签）+ 来源 C（同名 .txt sideca
 datasets/<name>/
   00_raw/            下载/导入的原始文件
   images/            重排编号后的工作集（图片 + 同名 .txt caption）★ caption 权威副本
-  _pipeline/         manifest.json、per_image.json、*_report.csv、masks/、thumbs/、orig_text/、rename_map.csv
+  _pipeline/         manifest.json、per_image.json、raw_posts.jsonl、enrich_report.csv、*_report.csv、masks/、thumbs/、orig_text/、rename_map.csv
   _excluded/         剔除物（按 reason 分子目录）+ _EXCLUDED_MANIFEST.json 证据链
 train_configs/<name>/  <name>_lora_stage1.toml + dataset_<name>.toml + train_<name>.bat + rationale.md + preflight.txt
 ```

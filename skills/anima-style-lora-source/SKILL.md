@@ -91,3 +91,12 @@ anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", li
 ## §7 下载后第一件事
 
 `anima_status(dataset:"X")` 看 `raw` 数量与 `00_raw` 体积，然后立刻跑 `import`/`dedup`——先把重复和坏图清掉再谈别的。跨源混抓一定会带进大量重复（同图在 yande.re 与 danbooru 各一份，pawchive 的差分图）。
+
+**抓下来的图有标签，本地导入的图没有**：`fetch` 把每帖的 `tag_string` 存进 `raw_posts.jsonl`，这就是 `wash` 的来源 A（图源权威标签）；而 `import` 进来的 Pixiv 图/压缩包/别人给的素材只有 `source=import` 一行元数据，**没有任何标签**，caption 会退化成「只有触发词 + 视觉子代理补的几条」。这种素材补一步 `enrich` 即可——按文件 md5 去 danbooru 反查原帖：
+
+```
+anima_stage(stage:"enrich", dataset:"X")              # dry-run 只查不写，先看命中率
+anima_stage(stage:"enrich", dataset:"X", apply:true)  # 把权威标签补进 raw_posts.jsonl
+```
+
+实测 72 张本地图全部命中（danbooru 支持 `md5:<hex>`；不支持 `md5:a,md5:b` 批量，一张一次请求）。**必须在 `text` 修补之前跑**（改过像素 md5 就变），命中率低于一半时先怀疑三件事：跑过修补、裁剪或重编码过、原图本来没上传 danbooru。
