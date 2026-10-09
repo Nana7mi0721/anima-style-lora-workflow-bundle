@@ -18,7 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import net, state
+from . import config, net, state
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".avif"}
 ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".tar", ".gz"}
@@ -686,6 +686,10 @@ def cmd_thumbs(ds, max_side: int = 1536, max_bytes: int = 2_000_000,
     print(f"[thumbs] 新写 {written} 张、跳过 {skipped} 张"
           + (f"、清理陈旧 {pruned} 张" if prune else "")
           + f" -> {ds.thumbs_dir}（平均 {total // max(written, 1) // 1024} KB，长边≤{max_side}）")
+    used = config.dir_bytes(ds.thumbs_dir)
+    if used:
+        print(f"         缩略图目录现在占 {config.human_bytes(used)}"
+              "（看图子代理用的副本，全部可再生；看图复核结束后可以整个删掉）")
     return {"count": written, "skipped": skipped, "pruned": pruned, "dir": str(ds.thumbs_dir)}
 
 
@@ -840,6 +844,40 @@ def cmd_exclude(ds, names="", reason: str = "user", apply: bool = False,
 # --------------------------------------------------------------------------
 # rename
 # --------------------------------------------------------------------------
+def _is_batch_map(name: str) -> bool:
+    """`rename_map.0001-0146.csv` 这类批次快照（权威表 rename_map.csv 不算）。"""
+    if not (name.startswith("rename_map.") and name.endswith(".csv")):
+        return False
+    body = name[len("rename_map."):-len(".csv")]
+    left, _, right = body.partition("-")
+    return bool(left and right and left.isdigit() and right.isdigit())
+
+
+def _prune_batch_maps(ds, keep: int | None = None) -> int:
+    """每批 rename 留一份快照，只保留最近 keep 份（默认 `hygiene.rename_snapshots` = 3）。
+
+    累计的权威表 `rename_map.csv` 一直在（下游读的是它），批次快照只是"这一批搬了谁"的
+    证据——反复重排几十次就会堆几十个几乎一样的 CSV，没必要。
+    """
+    if keep is None:
+        keep = state.hygiene(ds, "rename_snapshots", 3)
+    olds = [p for p in ds.pipe_dir.iterdir()
+            if p.is_file() and _is_batch_map(p.name)]
+    if len(olds) <= keep:
+        return 0
+    olds.sort(key=lambda p: (p.stat().st_mtime, p.name))
+    # keep=0 要全清 —— 注意 olds[:-0] 是空表（切片陷阱），必须单独判
+    victims = olds if keep <= 0 else olds[:-keep]
+    removed = 0
+    for old in victims:
+        try:
+            old.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
                move: bool = True) -> dict:
     ds.ensure_dirs()
@@ -920,6 +958,11 @@ def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
     write_csv(map_path, merged)
     batch_path = ds.pipe_dir / f"rename_map.{first:0{digits}d}-{last:0{digits}d}.csv"
     write_csv(batch_path, rows)
+    pruned = _prune_batch_maps(ds)
+    if pruned:
+        print(f"[rename] 清理了 {pruned} 份过老的批次快照（只留最近 "
+              f"{state.hygiene(ds, 'rename_snapshots', 3)} 份；"
+              f"权威表 {map_path.name} 是累计的，不受影响）")
 
     st = state.load(ds)
     for row in rows:

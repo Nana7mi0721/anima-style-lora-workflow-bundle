@@ -27,6 +27,42 @@ def _has_images(path: Path) -> bool:
         return False
 
 
+def dir_bytes(path: Path) -> int:
+    """目录占用（递归；读不到就当 0）。
+
+    用来在阶段结束时报一句"这个目录现在占多少"：`_pipeline/orig_text/`（修补前原图备份）
+    和 `_pipeline/thumbs/`（看图缩略图）是这条流水线里唯二会长到与图片本体同量级的东西，
+    用户需要知道它们在哪、能不能删。
+    """
+    total = 0
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if entry.is_dir():
+                total += dir_bytes(entry)
+            elif entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def human_bytes(n: int) -> str:
+    """人类可读的字节数（与插件侧 lib/run.js 的 humanSize 同口径）。"""
+    if not n:
+        return "0B"
+    units = ["B", "K", "M", "G", "T"]
+    value = float(n)
+    i = 0
+    while value >= 1024 and i < len(units) - 1:
+        value /= 1024
+        i += 1
+    return f"{round(value)}B" if i == 0 else f"{value:.1f}{units[i]}" if value < 10 else f"{round(value)}{units[i]}"
+
+
 def runtime_dir() -> Path:
     """Heavy runtime state (ML venv, caches) -- kept out of the installed package.
 
@@ -116,6 +152,19 @@ DEFAULTS: dict[str, Any] = {
         "category_drop": [1, 3, 5],
         "category_keep": [],
         "keep_parent_tags": [],
+    },
+    # 空间卫生：这条流水线里所有"备份/快照"类副产物的保留量。
+    # 一次真实使用累积了 6 代 × 5 个训练配置 = 30 个几乎一样的 .bak（其中 25 个是同一个
+    # 配置的不同注脚），所以要"默认最小、需要时再放开"：
+    #   caption_snapshots  每次写 caption 前留的快照代数（1 = 只留上一版；0 = 不留）
+    #   rename_snapshots   每批 rename 的对照表快照份数（权威表 rename_map.csv 不受影响）
+    #   makecfg_backups    训练配置的 .bak 代数（1 = 只留上一代；0 = 不留备份）
+    #   keep_masks         text 修补后是否保留掩膜（默认不留，失败的那些始终保留）
+    "hygiene": {
+        "caption_snapshots": 1,
+        "rename_snapshots": 3,
+        "makecfg_backups": 1,
+        "keep_masks": False,
     },
 }
 

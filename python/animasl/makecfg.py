@@ -16,10 +16,21 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 from pathlib import Path
 
 from . import curate, dicts, state, wash
+
+# 「这一代是什么时候生成的」是元数据，不是配置内容。比对「内容有没有变」时先把它抹掉，
+# 否则光是时间戳往前走一秒，就会让每个文件都算"变了" —— 反复跑 makecfg 白堆备份
+# （真实使用里 6 次 = 30 个 .bak，其中 toml/bat 0 行不同）。
+_STAMP_RX = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
+
+
+def _no_stamp(text: str) -> str:
+    """抹掉生成时间，用于「内容是否真的变了」的比对。"""
+    return _STAMP_RX.sub("<生成时间>", text)
 
 KINDS = {
     "style": {"name": "画师风格", "rank_band": {16: (8e-5, 1.5e-4), 32: (5e-5, 1e-4),
@@ -416,13 +427,42 @@ def _preflight(ds, p: dict, cfg_dir: Path, name: str, stage1_text: str,
     return "\n".join(lines) + "\n"
 
 
+def _prune_backup_generations(cfg_dir: Path, keep: int = 1) -> int:
+    """训练配置的 `.bak<时分>` 按**代**保留，默认只留最新一代（`hygiene.makecfg_backups`）。
+
+    一次 makecfg 只会给四件套（stage1 / dataset / bat / rationale）各留一份备份 —— 它们共享同一个
+    6 位时分后缀，是**同一代**（`preflight.txt` 是报告，原地刷新、不进备份）。
+    真实使用里反复调参跑了 6 次就堆出 6 代 × 5 = 30 个文件（其中 25 个只是同一个配置的
+    不同注脚：`146→142`、`269→251 steps/epoch` 这种一行之差），目录里 35 个文件只有 5 个
+    在用。按代清理之后，最多只多留 4 个（上一代），要更多就把 keep 调大、一个都别留就设 0。
+    """
+    baks = [p for p in cfg_dir.glob("*.bak*") if p.is_file()]
+    if not baks:
+        return 0
+    generations: dict[str, list[Path]] = {}
+    for p in baks:
+        suffix = p.suffix[4:] if p.suffix.startswith(".bak") else ""
+        generations.setdefault(suffix or "?", []).append(p)
+    order = sorted(generations, key=lambda g: (max(x.stat().st_mtime for x in generations[g]), g))
+    removed = 0
+    for gen in (order[:-keep] if keep > 0 else order):
+        for p in generations[gen]:
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                continue
+    return removed
+
+
 def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "style",
                 subdirs: list[str] | None = None, dim: int | None = None,
                 lr: float | None = None, epochs: int | None = None,
                 resolution: int = 1280, batch: int = 1, grad_accum: int = 1,
                 repeats: dict[str, int] | None = None, apply: bool = False,
                 dataset_dir: str | None = None, force: bool = False,
-                allow_out_of_band: bool = False) -> dict:
+                allow_out_of_band: bool = False,
+                keep_backups: int | None = None) -> dict:
     name = name or ds.name
     cfg = ds.cfg
     base = Path(dataset_dir) if dataset_dir else ds.root
@@ -484,14 +524,55 @@ def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "sty
         cfg_dir / f"dataset_{name}.toml": dataset_toml,
         cfg_dir / f"train_{name}.bat": bat,
         cfg_dir / "rationale.md": rationale,
-        cfg_dir / "preflight.txt": preflight,
     }
+    stamp = time.strftime("%H%M%S")
+    written: list[Path] = []
+    unchanged: list[str] = []
+    backups: list[str] = []
     for path, text in targets.items():
-        if path.exists() and not force:
-            backup = path.with_suffix(path.suffix + f".bak{time.strftime('%H%M%S')}")
+        old = path.read_text(encoding="utf-8", errors="replace") if path.exists() else None
+        if old is not None and _no_stamp(old) == _no_stamp(text):
+            # 内容一模一样就别动它（只有生成时间不同也算没变）：反复跑 makecfg 只为看一眼时，
+            # 不该每次都留一份副本。
+            unchanged.append(path.name)
+            continue
+        if old is not None and not force:
+            backup = path.with_suffix(path.suffix + f".bak{stamp}")
             path.rename(backup)
-            print(f"    (已备份旧文件 -> {backup.name})")
+            backups.append(backup.name)
         path.write_text(text, encoding="utf-8", newline="\n")
-    print(f"[makecfg] 已写入 {len(targets)} 个文件 -> {cfg_dir}")
-    print(f"[makecfg] 依据与差异见 {cfg_dir / 'preflight.txt'}")
-    return {"plan": p, "written": [str(t) for t in targets], "preflight": preflight}
+        written.append(path)
+
+    # preflight.txt 是**报告**（跟 wash_report.csv 一样），不是配置：原地覆盖刷新，
+    # 既不进 .bak 备份、也不占一代 —— 它每次都会因为「与上一版配置的差异」这段而变，
+    # 若把它算进「代」，反复跑 makecfg 就会白堆备份（真实使用里 6 次 = 30 个 .bak）。
+    report_path = cfg_dir / "preflight.txt"
+    report_old = report_path.read_text(encoding="utf-8", errors="replace") if report_path.exists() else None
+    report_changed = report_old is None or _no_stamp(report_old) != _no_stamp(preflight)
+    if report_changed:
+        report_path.write_text(preflight, encoding="utf-8", newline="\n")
+
+    keep_backups = keep_backups if keep_backups is not None else \
+        state.hygiene(ds, "makecfg_backups", 1)
+    pruned = _prune_backup_generations(cfg_dir, int(keep_backups))
+    if backups:
+        print(f"    (备份上一代 {len(backups)} 个 -> .bak{stamp}*)")
+    if unchanged:
+        print(f"    (未变动的 {len(unchanged)} 个配置保持原样：{'、'.join(sorted(unchanged))})")
+    if kept := [p.name for p in cfg_dir.glob("*.bak*") if p.is_file()]:
+        print(f"[makecfg] 备份：保留 {len(kept)} 个（{int(keep_backups)} 代）"
+              + (f"，本次清理 {pruned} 个" if pruned else "")
+              + "；要更多历史用 keepBackups:N，不要备份用 keepBackups:0")
+    if written:
+        print(f"[makecfg] 已写入 {len(written)} 个配置 -> {cfg_dir}")
+        if report_changed:
+            print(f"[makecfg] preflight.txt 已刷新（报告类覆盖写，不备份、不占代）")
+    elif report_changed:
+        print(f"[makecfg] 配置与现有文件完全一致，只刷新了 preflight.txt -> {cfg_dir}")
+    else:
+        print(f"[makecfg] 配置与现有文件完全一致，未写盘 -> {cfg_dir}")
+    print(f"[makecfg] 依据与差异见 {report_path}")
+    return {"plan": p, "written": [str(t) for t in written],
+            "unchanged": sorted(unchanged), "backups": backups,
+            "backups_pruned": pruned, "preflight": preflight,
+            "preflight_written": report_changed}

@@ -313,6 +313,30 @@ check(
   JSON.stringify(credWrite && credWrite.payload),
 )
 
+console.log('[client-smoke] 空间与备份分组（hygiene）')
+view = lite.render(entry.component)
+const snapRow = findRow(view, 'hygiene.caption_snapshots')
+check('渲染出 hygiene 分组（caption_snapshots 行）', Boolean(snapRow), snapRow ? '' : '未渲染出该行')
+const snapInput = collect(snapRow, (item) => item.type === 'input')[0]
+check('快照代数是数字框', Boolean(snapInput) && snapInput.props.type === 'number', JSON.stringify(snapInput && snapInput.props.type))
+snapInput.props.onInput({ target: { value: '0' } })
+view = lite.render(entry.component)
+const maskRow = findRow(view, 'hygiene.keep_masks')
+const maskBox = collect(maskRow, (item) => item.type === 'input' && item.props.type === 'checkbox')[0]
+check('掩膜开关是复选框', Boolean(maskBox), JSON.stringify(maskBox && maskBox.props.type))
+maskBox.props.onChange({ target: { checked: true } })
+view = lite.render(entry.component)
+const hygSave = collect(view, (item) => item.type === 'button' && String(item.props.className).includes('asl-save'))[0]
+await hygSave.props.onClick()
+const hygWrite = calls.filter((call) => call.method === 'write').pop()
+check(
+  'hygiene 改动一起写入（0 是数字 0，不是空串）',
+  hygWrite
+    && hygWrite.payload.set['hygiene.caption_snapshots'] === 0
+    && hygWrite.payload.set['hygiene.keep_masks'] === true,
+  JSON.stringify(hygWrite && hygWrite.payload),
+)
+
 console.log('')
 if (failures.length === 0) {
   console.log('[client-smoke] ALL OK')

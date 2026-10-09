@@ -117,6 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="检测类别阈值，如 text=0.15,onomatopoeia=0.12（默认 text=0.30,onomatopoeia=0.25）")
     sp.add_argument("--patch-small", action="store_true",
                     help="连水印等小面积文字也修补（默认只有 >8%% 的大段文字才修补）")
+    sp.add_argument("--keep-masks", action="store_true",
+                    help="修补后保留掩膜（默认清掉本次用过的；失败的掩膜始终保留）")
     _apply(sp)
 
     sp = add("rename", "重排编号为 0001…（下载后、洗标前）")
@@ -141,6 +143,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-tags", type=int, default=0, help="多于这么多标签记 too-many-tags")
     sp.add_argument("--work-set", default="",
                     help="只处理这些图桶（逗号分隔，如 clean 或 clean,latest）；默认自动发现")
+    sp.add_argument("--keep-snapshots", type=int, default=-1,
+                    help="caption 快照保留代数（默认取 hygiene.caption_snapshots，出厂 1；0 = 不留）")
     _apply(sp)
 
     sp = add("review-list", "列出需要看图补全的图")
@@ -193,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true")
     sp.add_argument("--allow-out-of-band", action="store_true",
                     help="明知 LR 超出该 rank 的建议区间也照写（默认报错让你确认）")
+    sp.add_argument("--keep-backups", type=int, default=-1,
+                    help="训练配置的 .bak 保留代数（默认取 hygiene.makecfg_backups，出厂 1；0 = 不留）")
     _apply(sp)
 
     sp = add("doctor", "检查环境：python / torch / rfdetr / 模型 / 代理 / 词典", required=False)
@@ -599,7 +605,8 @@ def main(argv: list[str] | None = None) -> int:
             over["thresholds"] = args.thresholds
         textmod.cmd_text(ds, apply=args.apply, rules_over=over, dilate=args.dilate,
                          device=args.device, classes=args.classes, limit=args.limit,
-                         detect_only=args.detect_only, inpaint_only=args.inpaint_only)
+                         detect_only=args.detect_only, inpaint_only=args.inpaint_only,
+                         keep_masks=True if args.keep_masks else None)
         _mark(ds, "text", _applied(args))
         return 0
 
@@ -618,7 +625,8 @@ def main(argv: list[str] | None = None) -> int:
         wash.cmd_wash(ds, apply=args.apply, trigger=args.trigger, rules_over=extra or None,
                       include_images=not args.no_images, refresh_source=args.refresh_source,
                       work_set=_work_set(args), refresh_booru=args.refresh_booru,
-                      drop_marks=args.drop_marks, prefer=args.prefer)
+                      drop_marks=args.drop_marks, prefer=args.prefer,
+                      keep_snapshots=None if args.keep_snapshots < 0 else args.keep_snapshots)
         _mark(ds, "wash", _applied(args))
         return 0
 
@@ -670,7 +678,8 @@ def main(argv: list[str] | None = None) -> int:
                             batch=args.batch, grad_accum=args.grad_accum,
                             repeats=repeats or None, apply=args.apply,
                             dataset_dir=args.dataset_dir or None, force=args.force,
-                            allow_out_of_band=args.allow_out_of_band)
+                            allow_out_of_band=args.allow_out_of_band,
+                            keep_backups=None if args.keep_backups < 0 else args.keep_backups)
         _mark(ds, "config", _applied(args))
         return 0
 

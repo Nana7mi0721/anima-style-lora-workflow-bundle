@@ -307,22 +307,81 @@ def load(ds) -> State:
 # 快照当前的全部 caption**，并和上一版快照做 diff，产出 `wash_diff.csv`。
 
 SNAPSHOT_DIR = "captions_prev"
-SNAPSHOT_KEEP = 3
+# 默认只留上一版：快照是"洗坏了能回退一格"的保险，不是版本库。想多看几代就调
+# `<home>/.animasl/animasl.config.json` 的 `hygiene.caption_snapshots`（设置页「空间与备份」）。
+SNAPSHOT_KEEP = 1
 
 
 def _snapshot_root(ds) -> Path:
     return ds.pipe_dir / SNAPSHOT_DIR
 
 
-def snapshot_captions(ds, work_set=None, label: str = "", keep: int = SNAPSHOT_KEEP) -> Path | None:
+def hygiene(ds, key: str, default):
+    """读 `hygiene.*` 配置（数据集 → runtime → bundle 三层已由 Config 合并）。
+
+    这些值决定"备份/快照类副产物留多少份"。缺配置、类型不对、连 cfg 都没有时安静回落
+    到 default —— 一个数字不该让控制流崩掉。
+    """
+    try:
+        sec = ds.cfg.get("hygiene", {}) or {}
+        value = sec.get(key, default)
+    except Exception:
+        return default
+    if value is None:
+        return default
+    if isinstance(default, bool):
+        return bool(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _snapshot_rows(ds, work_set=None) -> list[tuple[str, str]]:
+    pairs = [(p, p.with_suffix(".txt")) for p in ds.work_images(work_set)]
+    return [(img.name, txt.read_text(encoding="utf-8", errors="replace"))
+            for img, txt in pairs if txt.exists()]
+
+
+def _same_as_latest(ds, rows: list[tuple[str, str]]) -> bool:
+    """当前 caption 是否与最新那份快照逐字节相同（用来避免"没变也留一份"）。"""
+    latest = latest_snapshot(ds)
+    if latest is None:
+        return False
+    files = [p for p in latest.iterdir() if p.is_file() and p.suffix == ".txt"]
+    if len(files) != len(rows):
+        return False
+    for name, text in rows:
+        try:
+            if (latest / f"{Path(name).stem}.txt").read_text(
+                    encoding="utf-8", errors="replace") != text:
+                return False
+        except OSError:
+            return False
+    return True
+
+
+def snapshot_captions(ds, work_set=None, label: str = "", keep: int | None = None,
+                      skip_if_same: bool = True) -> Path | None:
     """把当前工作集里的 caption 抄一份到 `_pipeline/captions_prev/<时间戳>/`。
 
-    返回快照目录（没有 caption 时返回 None）。只保留最新 keep 份，避免无限堆积。
+    返回**真正写了盘**的那份快照目录；没写就返回 None，三种情况：
+      - 一张 caption 都没有；
+      - `skip_if_same` 且当前 caption 与最新快照逐字节相同（没变化 ⇒ 不留新副本）；
+      - `keep <= 0`（用户明确不要快照）。
+
+    只保留最新 keep 份（默认取 `hygiene.caption_snapshots`，出厂值 1），避免越跑越多。
     """
-    pairs = [(p, p.with_suffix(".txt")) for p in ds.work_images(work_set)]
-    rows = [(img.name, txt.read_text(encoding="utf-8", errors="replace"))
-            for img, txt in pairs if txt.exists()]
+    rows = _snapshot_rows(ds, work_set)
     if not rows:
+        return None
+    if keep is None:
+        keep = hygiene(ds, "caption_snapshots", SNAPSHOT_KEEP)
+    if keep <= 0:
+        _prune_snapshots(ds, 0)
+        return None
+    if skip_if_same and _same_as_latest(ds, rows):
+        _prune_snapshots(ds, keep)
         return None
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dest = _snapshot_root(ds) / stamp
@@ -340,7 +399,9 @@ def snapshot_captions(ds, work_set=None, label: str = "", keep: int = SNAPSHOT_K
     return dest
 
 
-def _prune_snapshots(ds, keep: int = SNAPSHOT_KEEP) -> list[str]:
+def _prune_snapshots(ds, keep: int | None = None) -> list[str]:
+    if keep is None:
+        keep = hygiene(ds, "caption_snapshots", SNAPSHOT_KEEP)
     root = _snapshot_root(ds)
     if not root.exists():
         return []

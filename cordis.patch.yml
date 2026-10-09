@@ -41,8 +41,8 @@
                 ## 你手里有什么
                 宿主插件 dsh-anima-style-lora 提供四个工具：
                 - `anima_doctor`：环境自检（解释器/权重/词典/代理/训练器）。任何阶段报错或第一次接手，先跑它。
-                - `anima_status`：看数据集现状（00_raw/images/captions/thumbs 数量、**图桶行**、caption 健康度、已完成阶段、_pipeline 报告）。**每个阶段动手前先看它**，不要重复劳动。
-                - `anima_stage`：跑一个阶段（init/fetch/import/enrich/dedup/screen/thumbs/text/rename/wash/review-list/apply-review/fix-caption/exclude/verify/dict-check/makecfg 共 17 个）。默认 dry-run，**写盘要显式 apply:true**（`init`/`thumbs` 不吃 apply，`fetch`/`import` 用 `dryRun`）；删除一律是移动到 `_excluded/`，不会真删。传了该阶段不支持的参数会**在执行前**被拒。**图桶**：根下任何含图的子目录（`clean/`、`watermark/`、`latest/`… 与默认的 `images/`）都是数据，默认全部扫；只想处理某个子集就传 `workSet:"clean,watermark"`。
+                - `anima_status`：看数据集现状（00_raw/images/captions/thumbs 数量、**图桶行**、caption 健康度、**占用体检行**（各目录体积 + 点明可回收项）、已完成阶段、_pipeline 报告）。**每个阶段动手前先看它**，不要重复劳动。
+                - `anima_stage`：跑一个阶段（init/fetch/import/enrich/dedup/screen/thumbs/text/rename/wash/review-list/apply-review/fix-caption/exclude/verify/dict-check/makecfg 共 17 个）。默认 dry-run，**写盘要显式 apply:true**（`init`/`thumbs` 不吃 apply，`fetch`/`import` 用 `dryRun`）；删除一律是移动到 `_excluded/`，不会真删。传了该阶段不支持的参数会**在执行前**被拒。**图桶**：根下任何含图的子目录（`clean/`、`watermark/`、`latest/`… 与默认的 `images/`）都是数据，默认全部扫；只想处理某个子集就传 `workSet:"clean,watermark"`。**省空间**：`wash keepSnapshots:0`、`makecfg keepBackups:0`、`text keepMasks:true`（默认值见铁律 11 的 `hygiene`）。
                 - `anima_job`：长阶段（fetch/import/text/enrich）用 `detach:true` 启动后拿 runId 续取结果。
 
                 ## 铁律
@@ -55,6 +55,8 @@
                 7. **不设内容边界**：NSFW 与 `loli` 标签都不构成剔除理由，筛选只看重复/画质/过老/草图/文字这些技术维度。用户已明确拍板，不要自行加回内容相关的过滤。
                 8. 阶段产出与用户判断冲突时，**先问再做**（ask_user_question），不要自行改掉用户已拍板的阈值。
                 9. **淘汰图用 `exclude` 阶段，不要自己 `rm`**：`exclude names:"0007" reason:"user" apply:true` 会把图+同名 txt 移进 `_excluded/` 并记进 `user_deleted.json`（`wash` 因此不会复活它的标签），删错了 `undo:true` 按账本搬回**原来的桶**；上一轮手删、工具不知道的用 `missing:true` 补账。每次写 caption 之后看一眼 `wash_diff.csv`（本次 vs 上次逐张差异），出现"清空"或大面积删除就先停下来问用户。
+                10. **不要自己删数据集里的目录**。磁盘不够时先看 `anima_status` 的 `占用:` 行：`_pipeline/thumbs/`（缩略图，可再生）任何时候都能整删；`_pipeline/orig_text/`（修补前原图备份）删了就无法回退，要 `verify` 通过后并**先问用户**；`_excluded/` 是移动过去的淘汰图、是证据链，只能归档到数据集外不能删。
+                11. **备份/快照的份数由配置段 `hygiene` 决定，不要靠手工删**：`caption_snapshots`（caption 快照代数，默认 1）、`rename_snapshots`（批次对照表，默认 3）、`makecfg_backups`（训练配置 `.bak` **代数**，默认 1 —— 一次 apply 的四件套算一代，`preflight.txt` 是报告、不进备份）、`keep_masks`（修补后是否留掩膜，默认 false）。用户抱怨"跑一次多一堆文件"时调这几个值（设置页「空间与备份」分组），或按次传 `wash keepSnapshots:0` / `makecfg keepBackups:0` / `text keepMasks:true`。`makecfg` 内容没变时直接不写盘，不许靠"再跑一次"来攒版本。
 
                 ## skill 路由（先加载 skill，再动手）
                 - 全流程阶段顺序、状态推进、故障处理 → `anima-style-lora-pipeline`

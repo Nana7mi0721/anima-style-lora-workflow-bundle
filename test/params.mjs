@@ -13,7 +13,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { RUN_OUTPUT_PROPERTIES, STAGE_PARAMS, datasetFacts, stageParamError } from '../lib/run.js'
+import { RUN_OUTPUT_PROPERTIES, STAGE_PARAMS, buildArgs, datasetFacts, stageParamError } from '../lib/run.js'
 import { registerAnimaTools } from '../lib/tools.js'
 
 const errors = []
@@ -59,6 +59,24 @@ check(stageParamError('init', { stage: 'init', dataset: 'd', apply: false }) ===
   'apply:false 视同没传（不误报）')
 check(stageParamError('dict-check', { stage: 'dict-check', tags: '1girl' }) === '',
   'dict-check 可以不带 dataset')
+
+// ---- 2.5 保留策略（hygiene）参数真的下发 ------------------------------------
+// 用户 m05904：反复跑 batch 不该往磁盘堆备份。三个旋钮必须能按次覆盖，
+// 而且 0（= 这次不留）不能被当成"没传"。
+const hygieneRuntime = { config: () => ({ home: 'E:/LoRA_Train' }) }
+const argvOf = (args) => buildArgs(hygieneRuntime, args)
+const valueOf = (argv, name) => argv[argv.indexOf(name) + 1]
+
+let hygArgv = argvOf({ stage: 'wash', dataset: 'd', keepSnapshots: 0 })
+check(hygArgv.includes('--keep-snapshots') && valueOf(hygArgv, '--keep-snapshots') === '0',
+  `wash keepSnapshots:0 会下发（0 不能当成没传：${hygArgv.join(' ')}）`)
+hygArgv = argvOf({ stage: 'makecfg', dataset: 'd', keepBackups: 2 })
+check(valueOf(hygArgv, '--keep-backups') === '2', 'makecfg keepBackups 下发')
+hygArgv = argvOf({ stage: 'text', dataset: 'd', keepMasks: true })
+check(hygArgv.includes('--keep-masks'), 'text keepMasks 下发')
+hygArgv = argvOf({ stage: 'wash', dataset: 'd' })
+check(!hygArgv.includes('--keep-snapshots') && !hygArgv.includes('--keep-backups'),
+  '不传这三个旋钮时不下发（交给配置 hygiene 的默认值）')
 
 // ---- 3. 工具声明 vs STAGE_PARAMS -------------------------------------------
 
@@ -107,6 +125,11 @@ writeFileSync(join(dsRoot, 'watermark', '0002.jpg'), 'jpg')
 writeFileSync(join(dsRoot, 'watermark', '0002.txt'), '@t, 1boy, watermark')
 writeFileSync(join(dsRoot, '00_raw', '149878653_p0.png'), 'png')
 writeFileSync(join(dsRoot, '_pipeline', 'wash_report.csv'), 'file,origin\n0001.png,A=booru\n0002.jpg,A=none\n')
+// 占用体检要能分清"可回收"（缩略图/修补前备份）与"可归档"（淘汰区）
+mkdirSync(join(dsRoot, '_pipeline', 'thumbs'), { recursive: true })
+writeFileSync(join(dsRoot, '_pipeline', 'thumbs', '0001.jpg'), 'thumb')
+mkdirSync(join(dsRoot, '_excluded', 'user'), { recursive: true })
+writeFileSync(join(dsRoot, '_excluded', 'user', '0009.png'), 'excluded')
 
 const facts = datasetFacts({ config: () => ({ home: tmpHome }) }, 't')
 check(facts.buckets.map((b) => b.name).join(',') === 'clean,watermark',
@@ -127,6 +150,12 @@ const statusText = statusTool.output.render({ dataset: 't' }, statusValue)
   .map((part) => part.text).join('\n')
 check(/图桶: clean 1图\/1caption/.test(statusText), `anima_status 渲染出图桶行（${JSON.stringify(statusText.split('\n')[1] ?? '')}）`)
 check(/caption 健康度/.test(statusText), 'anima_status 仍带 caption 健康度')
+// 占用体检：数据 / _pipeline / _excluded 分开报（回答"会不会堆一堆冗余文件"）
+check(facts.disk && facts.disk.data > 0 && facts.disk.total >= facts.disk.data,
+  `datasetFacts 汇总目录占用（data=${facts.disk?.data} total=${facts.disk?.total}）`)
+check(/占用: 共 .+｜ 数据 .+（clean .+、watermark .+）\s*｜\s*_pipeline/.test(statusText),
+  `anima_status 渲染占用行（${JSON.stringify(statusText.split('\n').find((l) => l.startsWith('占用:')) ?? '')}）`)
+check(/可回收\/可归档/.test(statusText), 'anima_status 指出可回收/可归档的部分')
 rmSync(tmpHome, { recursive: true, force: true })
 
 console.log(errors.length === 0

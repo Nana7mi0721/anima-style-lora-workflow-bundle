@@ -19,10 +19,12 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
     per_image.json   ★ 每张图的只追加状态（旧名、写过的标签、人工删掉的标签、所在桶、看图结果、历史）
     user_deleted.json ★ 人工淘汰账本（谁、为什么、归档到哪、能不能搬回）
     rename_map.csv   新名↔旧名↔post_id↔tags_full 对照表（★ 只追加；预演写 rename_map.preview.csv）
-    captions_prev/   写 caption 之前自动留的快照（只留最近 3 份）+ wash_diff.csv（本次 vs 上次的逐张差异）
+    rename_map.<a>-<b>.csv  每批的快照（只留最近 5 份，自动清理）
+    captions_prev/   写 caption 之前自动留的快照（默认只留最近 1 代，内容没变就不新建）+ wash_diff.csv（本次 vs 上次的逐张差异）
     dedup_report.csv / screen_report.csv / text_report.csv / wash_report.csv / review_todo.csv / wash_verify.csv
-    thumbs/          ≤1536px 缩略图（视觉子代理唯一允许看的输入）
-    masks/           文字检测的掩膜与对照图；orig_text/ 是修补前的原图备份
+                     （报告类全部**覆盖写**，一个阶段固定一份，不随跑批次数增长）
+    thumbs/          ≤1536px 缩略图（视觉子代理唯一允许看的输入；**可再生，复核完可整删**）
+    masks/           文字检测的掩膜（修补成功后默认清掉本次用过的；keepMasks:true 才留）；orig_text/ 是修补前的原图备份（**可删，删了就不能回退**）
     wash_rules.json  可选，数据集级洗标规则覆盖（minTags/maxTags/prefer/unknown_policy 都可写这里）
   _excluded/         被剔除的图（按 reason 分子目录），永不删
 ```
@@ -48,10 +50,36 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | `_pipeline/rename_map.csv` | `rename` | `wash`（按 `old_name` 回查 booru 标签） | **只追加**，多批次共存；每批另留 `rename_map.<first>-<last>.csv` 快照。**不要读它的 `tags_full` 当标签来源**（那是抓取当时的快照，可能已被清洗） |
 | `raw_posts.jsonl` | `fetch` / `import` / `enrich` | `rename`（写进对照表）、`wash`（图源标签 A） | 只追加，按 `(filename, post_id)` 去重合并。**行键是文件名**：`enrich` 补的行必须落在 `rename_map.csv` 的 `old_name` 上，否则 `wash` 静默读不到（它自己按这条选键） |
 | `_pipeline/user_deleted.json` | `exclude` / `fix-caption`（`remove`） | `wash`（防复活）、`verify` | 人工淘汰账本：`name`/`old_names`/`archived`/`bucket`/`reason`/`at`，`restored_at` 表示已搬回。**手删图要发 `exclude`，别直接删文件**（否则下一轮只会告诉你"少了几张"） |
-| `_pipeline/captions_prev/` + `wash_diff.csv` | `wash` / `apply-review` / `fix-caption` | 人 | 写 caption **前**自动快照（最近 3 份），写完后出逐张差异（新增/删除/清空）。"这次到底改了什么"不用自己 diff |
+| `_pipeline/captions_prev/` + `wash_diff.csv` | `wash` / `apply-review` / `fix-caption` | 人 | 写 caption **前**自动快照（最近 1 代；内容没变就不新建），写完后出逐张差异（新增/删除/清空）。"这次到底改了什么"不用自己 diff |
 | `manifest.json` | 每个阶段 | `anima_status`、`wash.resolve_trigger` | 触发词/类型的权威来源 |
 
 **推论**：`wash` 默认**不会复活**你删掉的图源标签（它拿 `per_image.json` 的 `merged_tags` 与当前 caption 比对，差值视为人工删除，再并上 `user_deleted.json` 的名单）。三级开关：默认（差集 + 手删名单）→ `refreshBooru:true`（只忽略手删名单）→ `refreshSource:true`（连手删名单都不看，**会复活**）。这条就是"手工改完 caption 一重跑全回来"那个坑的修法。
+
+### 空间与冗余：跑批会不会堆垃圾
+
+**账本与报告几乎不长**：`per_image.json` 约 2.6KB/图（`history` 每张只留最近 30 次）、`rename_map.csv` 约 100B/图、各 `*_report.csv` 一次跑批原地覆盖。所以 142 张的数据集把 15 个阶段来回跑十几遍，`_pipeline/` 里的账本加起来仍是几百 KB。
+
+**真正占空间的是三类有意的副本**（都用"能不能删"来权衡）：
+
+| 目录 | 量级（实测） | 能不能删 |
+|---|---|---|
+| `_pipeline/orig_text/` | 与"被判为有文字需要修补"的图同量级（142 张的数据集里 10.8MB；200 张大图可能上 GB） | **可以整删**（`verify` 通过后）—— 它是 `text` 修补前的原图备份，修补不可逆，删了就无法回退。同一文件名只备份第一次，重复跑不叠加 |
+| `_pipeline/thumbs/` | 约为原图的 10~20%（142 张 = 32MB） | **可以整删**，它只喂视觉子代理；下次要看图会按需重建。`prune:true` 清掉没有对应原图的 |
+| `_excluded/` | 淘汰图的实际体积（`redash` 里 138MB > 在用的 110MB） | 是**移动**不是复制（不占双份），但会一直留着当证据；确认不要了就归档到数据集外 |
+| `_pipeline/masks/` | 几十 KB/张 | 默认**修补成功后就把本次用过的清掉**（要留着 `--inpaint-only` 重跑就传 `keepMasks:true`；失败/未修补的掩膜始终保留） |
+
+**上限已内置**（都在配置段 `hygiene` 里，设置页「空间与备份」分组可改）：caption 快照留 **1** 代（内容与上一版逐字节相同就**不新建**）、`rename_map.<a>-<b>.csv` 批次快照留 **3** 份、`train_configs/<name>/*.bak<时分>` 留 **1 代**（一次 `apply` 的四件套算同一代，不按文件数翻倍；`preflight.txt` 是报告，原地刷新、不进备份）、`masks/` 修补成功后清掉。清理时会打印一行说明（`[rename] 清理了 N 份过老的批次快照…`、`备份：保留 1 个（1 代），本次清理 5 个`）。**一次跑批本身不会留下无上限增长的东西**。
+
+按次覆盖：`wash` 的 `keepSnapshots`、`makecfg` 的 `keepBackups`、`text` 的 `keepMasks`（传 `0` = 这次不留）。`makecfg` 还会**逐文件比对内容**：四件套（stage1 / dataset / bat / rationale）全同就打印「配置与现有文件完全一致，未写盘」，不再生成一代只差几行注释的 `.bak`（`rationale.md` 里的「生成时间」不算内容变化）；**`preflight.txt` 是报告不是配置**，原地覆盖刷新、不进备份也不占一代 —— 真实使用里这里曾 6 次 `apply` 攒出 6 代 × 5 = 30 个文件，其中 toml/bat 0 行不同，只差 preflight 的几行注释。
+
+`anima_status` 最后一行就是这件事的体检结果，直接告诉你哪块能回收：
+
+```
+占用: 共 2.1G ｜ 数据 2.0G（clean 1.6G、watermark 494M） ｜ _pipeline 33M（thumbs 32M） ｜ _excluded 0B
+　可回收/可归档: thumbs 32M（看图子代理用的缩略图，删掉下次按需重建）
+```
+
+**注意 `00_raw/` 与 `_excluded/` 不同**：`import` 默认是**复制**（`move:true` 才是移动），所以素材目录里的原文件通常还在——审计占用时别忘了它。
 
 ## §2 阶段表与 I/O 契约
 
@@ -66,16 +94,16 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | dedup | `anima_stage(stage:"dedup", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 连图桶） | dedup_report.csv | 覆盖报告；apply 时把重复图**移动**到 `_excluded/duplicates/` |
 | screen | `stage:"screen"` → 视觉复核 → `apply:true` | `00_raw/`（`includeImages:true` 连图桶） | screen_report.csv + review_queue.csv | 覆盖报告；apply 时移入 `_excluded/<reason>/` |
 | thumbs | `anima_stage(stage:"thumbs", dataset:"X")` | 图桶（没有才用 `00_raw/`） | `_pipeline/thumbs/*.jpg` | 覆盖已有缩略图（**不吃 apply**，写盘是默认行为）；已是最新的跳过，`prune:true` 清掉没有对应图的陈旧缩略图 |
-| text | `anima_stage(stage:"text", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 处理 `images/`） | 修补后的图 + text_report.csv + `masks/` | **⚠️ 修补不可逆**：apply 就地改写图片（修补前备份在 `_pipeline/orig_text/`），并让 `wash` 及之后全部失效 |
+| text | `anima_stage(stage:"text", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 处理 `images/`） | 修补后的图 + text_report.csv + `masks/`（成功后清掉本次用过的） | **⚠️ 修补不可逆**：apply 就地改写图片（修补前备份在 `_pipeline/orig_text/`），并让 `wash` 及之后全部失效。要留掩膜重跑 `--inpaint-only` 就传 `keepMasks:true` |
 | rename | `anima_stage(stage:"rename", dataset:"X", apply:true)` | `00_raw/`（已重排过会报错） | `images/0001.ext` + rename_map.csv + per_image.json | `rename_map.csv` **只追加**（按 `old_name` 去重，本次为准）+ 本批快照；预演只写 `rename_map.preview.csv`，不碰权威表；同名 `.txt` 边车跟着搬 |
-| wash | `anima_stage(stage:"wash", dataset:"X", trigger:"@xxx")` → `apply:true` | 图桶里的 `*.txt` + raw_posts.jsonl（经 rename_map 的 `old_name` 回查） | 每个桶里的 `NNNN.txt` + wash_report.csv + review_todo.csv + wash_diff.csv + captions_prev/ | 覆盖 caption（**幂等**：同输入重跑结果一致）。默认不复活人工删掉的图源标签（`refreshBooru` / `refreshSource` 逐级放宽）；写盘前自动快照、写盘后出本次 vs 上次的差异 |
+| wash | `anima_stage(stage:"wash", dataset:"X", trigger:"@xxx")` → `apply:true` | 图桶里的 `*.txt` + raw_posts.jsonl（经 rename_map 的 `old_name` 回查） | 每个桶里的 `NNNN.txt` + wash_report.csv + review_todo.csv + wash_diff.csv + captions_prev/（留 1 代） | 覆盖 caption（**幂等**：同输入重跑结果一致）。默认不复活人工删掉的图源标签（`refreshBooru` / `refreshSource` 逐级放宽）；写盘前自动快照（内容没变就不新建，`keepSnapshots:0` 可完全不留）、写盘后出本次 vs 上次的差异 |
 | review-list | `anima_stage(stage:"review-list", dataset:"X")` | wash_report.csv | review_todo.csv | 覆盖清单 |
 | apply-review | `anima_stage(stage:"apply-review", dataset:"X", payload:"...json", apply:true)` | 视觉子代理的补标 JSON | 回填后的 caption | 覆盖这些图的 caption；触发词从 manifest 取（不会丢）；`item.remove` 里的标签进人工删除名单 |
 | fix-caption | `anima_stage(stage:"fix-caption", dataset:"X", name:"0007", add:"…", apply:true)` | `images/<stem>.txt` | 改好的 caption | **只动你点名的那一张**：`add` 补标签 / `remove` 删标签（并记进人工删除名单）/ `set` 整条替换，都要再过一遍洗标 + 形态校验 |
 | exclude | `anima_stage(stage:"exclude", dataset:"X", names:"0007,0012", reason:"user", apply:true)` | 图桶里的图 | 图+同名 txt 移到 `_excluded/<reason>/` + user_deleted.json | **淘汰专用**：`undo:true` 按账本搬回**原来的桶**、`missing:true` 把"账本里有、现在不在图桶里"的记成人工删除（事后补账）、无参数则列清单。别直接删文件 |
 | verify | `anima_stage(stage:"verify", dataset:"X")` / `online:true` | 图桶里的 `*.txt` | wash_verify.csv | 覆盖报告（**只读，不写 caption**，也没有 apply）。查形态 + 内容闸门 + **冲突族** + **水印区与修补状态一致性**；`sample:N` 等距抽查；`trigger:"@yyy"` 可覆盖 |
 | dict-check | `anima_stage(stage:"dict-check", dataset:"X")` / `tags:"a, b"` | caption 或显式标签 | 终端输出（不写盘） | — |
-| makecfg | `anima_stage(stage:"makecfg", dataset:"X", kind:"style", trigger:"@xxx", subdirs:"before,latest,present")` | 图桶 + manifest | `train_configs/X/` 四件套 + **preflight.txt** | 覆盖已有配置（旧文件先改名成 `.bak<时分秒>` 备份；`force:true` 则不备份）。**LR 超出该 rank 的建议区间直接报错**，除非 `allowOutOfBand:true`；自动发现图桶并按内容指纹跨桶去重 |
+| makecfg | `anima_stage(stage:"makecfg", dataset:"X", kind:"style", trigger:"@xxx", subdirs:"before,latest,present")` | 图桶 + manifest | `train_configs/X/` 四件套 + **preflight.txt**（报告） | 覆盖已有配置（旧文件先改名成 `.bak<时分秒>` 备份，**按「代」清理、默认只留 1 代**；`force:true` 则不备份；`keepBackups:0` 完全不留）。**四件套逐文件比对内容，全同就不写盘**；`preflight.txt` 是报告，每次原地刷新、不备份不占代。**LR 超出该 rank 的建议区间直接报错**，除非 `allowOutOfBand:true`；自动发现图桶并按内容指纹跨桶去重 |
 
 顺序不是死板的：`text` 必须在 `rename` 前（rename 后文件名与 raw_posts.jsonl 的对应关系会断，text 报告就不好回溯）；`wash` 必须在 `rename` 后（caption 文件名跟新编号走）；`thumbs` 可以在 `screen` 前先跑一遍用于人工看；**`enrich` 要在 `text` 之前**（修补改像素 ⇒ md5 变了对不上原帖；local 图源没有 booru 标签时它是唯一的 A 源）。
 
@@ -148,6 +176,8 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 9. **淘汰图用 `exclude`，不要直接删文件**：`exclude names:"0007" reason:"user" apply:true` 会把图+同名 txt 移进 `_excluded/`、记进 `user_deleted.json`（`wash` 因此不会复活它的标签）。删错了 `undo:true` 按账本搬回**原来的桶**；上一次跑批里手删的、工具不知道的，用 `missing:true` 补账。
 10. **每次写 caption 后看一眼 `wash_diff.csv`**：它是"本次 vs 上次"的逐张差异（新增/删除/清空），终端也会打印 `本次改动 N 张`。看到"清空"或大面积"删除"就先停下来问用户，别接着往下跑。
 11. **`wash` 报 `A=none` 占一半以上时，先补 A 源再谈洗标**：那条告警意味着这次 wash 只做了"格式化 + 压父标签"，没有 booru 权威标签可依据。修法是 `enrich`（md5 反查）或 `fetch --source danbooru --tags <画师名>`，**都要在 `text` 修补之前做**。
+12. **数据集涨得快先看 `anima_status` 的 `占用:` 行，别急着删**：`_pipeline/orig_text/`（修补前原图，可删但删了不能回退）与 `_pipeline/thumbs/`（缩略图，可再生）是唯二与图片同量级的东西；`_excluded/` 是移动不是复制。要清先跟用户确认，删 `thumbs/` 任何时候都安全。
+13. **想少留副产物就调 `hygiene`（设置页「空间与备份」），别自己删阶段产出**：`caption_snapshots` / `rename_snapshots` / `makecfg_backups` / `keep_masks` 四个键；用户抱怨"跑一次多一堆文件"时先看这几个值，或问他要不要 `keepSnapshots:0` / `keepBackups:0` 按次不留。
 
 ## §4 必须停下来问用户的点
 
@@ -206,3 +236,5 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | 洗完看不到"这次改了什么"（得自己 diff） | 已修：写 caption 前自动快照 `captions_prev/`（留 3 份）、写完后出 `wash_diff.csv` 并打印 `本次改动 N 张（新增/删除/清空）` |
 | 用户手删了 4 张图，工具下一轮只说"少了 4 张"，不知道是谁、也没找回路径 | 已修：`exclude` 阶段（移进 `_excluded/` + 记 `user_deleted.json`，`undo` 能按账本搬回原桶，`missing:true` 给历史手删补账） |
 | `makecfg` 把 142 张算成 284 张（`images/` 与子目录双计） | 已修：按内容指纹跨桶去重；整桶都是副本时跳过并说明"想同时训练两个版本就改文件名，别用硬链接" |
+| 跑了几轮后不知道磁盘被什么占了、也不敢删任何东西 | 已修：`anima_status` 最后一行报 `占用: 共 X ｜ 数据/«_pipeline（thumbs·masks·orig_text·快照）/00_raw/_excluded»` 并**点名可回收的部分**；累积型文件都有上限（配置段 `hygiene`：caption 快照 1 代、批次快照 3 份、makecfg 备份 1 代、掩膜成功后清），`text`/`thumbs` 结束时自报体积 |
+| 反复调参把训练配置目录堆满 `.bak`（6 次 apply = 30 个文件，只有 5 个在用） | 已修：`makecfg` 逐文件比对内容（全同直接不写盘），备份**按「代」清理**、默认只留 1 代；`keepBackups` 按次覆盖，`0` = 完全不留 |

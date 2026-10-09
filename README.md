@@ -101,9 +101,9 @@ verify → dict-check → makecfg（LR 超区间报错、`allowOutOfBand` 放行
 `<home>/.animasl/animasl.config.json`（运行时层），下一次 `anima_*` 调用即生效，
 不用重启：
 
-- 分组：`paths` / `runtime` / `dict` / `creds` / `net` / `screen` / `dedup` / `wash`，
-  每个键都标出来源（`bundle` / `defaults` / 本机覆盖），改动过的键可以一键
-  「恢复默认」（= 从 runtime 层删掉这个键，回落到 bundle/内置默认）。
+- 分组：`paths` / `runtime` / `dict` / `creds` / `net` / `screen` / `dedup` / `wash` /
+  `hygiene`（空间与备份），每个键都标出来源（`bundle` / `defaults` / 本机覆盖），
+  改动过的键可以一键「恢复默认」（= 从 runtime 层删掉这个键，回落到 bundle/内置默认）。
 - `creds` 是**凭据分组**：danbooru 用户名 + API key、exhentai 三项
   （`ipb_member_id` / `ipb_pass_hash` / `igneous`）、curl 兜底 UA。密钥类字段是
   密码框，旁边有「显示」开关。它们只落进你本机的运行时配置（不在仓库里），
@@ -156,15 +156,15 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | `dedup` | `phashDistance`(4)、`ssim`(0.995)、`includeImages` | `dedup_report.csv`，`apply` 时移入 `_excluded/duplicates/` |
 | `screen` | `minShortSide`(512)、`minBytes`(102400)、`earliest`(2015-01-01) | `screen_report.csv` + `review_queue.csv` |
 | `thumbs` | `maxSide`(1536)、`prune`、`includeImages` | `_pipeline/thumbs/`（视觉子代理只能看这个） |
-| `text` | `warnRatio`(0.08)、`dropRatio`(0.30)、`patchSmall`、`thresholds`、`dilate`(6) | `masks/`、`text_report.csv`；修补后自动把 `wash` 标 stale |
+| `text` | `warnRatio`(0.08)、`dropRatio`(0.30)、`patchSmall`、`thresholds`、`dilate`(6)、`keepMasks` | `masks/`（修补成功后清掉本次用过的）、`text_report.csv`；修补后自动把 `wash` 标 stale |
 | `rename` | `start`(1)、`digits`(4)、`move` | `images/0001.ext` + `rename_map.csv`（只追加）+ `per_image.json` |
-| `wash` | `trigger`、`rules`、`minTags`/`maxTags`、`prefer`(A\|C)、`dropMarks`、`refreshBooru`(只忽略手删名单)、`refreshSource`(最狠：连手删名单都不看)、`noImages`、`workSet` | 每个图桶里的 `NNNN.txt` + `wash_report.csv` + `review_todo.csv` + `wash_diff.csv`（本次 vs 上次改了哪些）+ `captions_prev/` 快照 |
+| `wash` | `trigger`、`rules`、`minTags`/`maxTags`、`prefer`(A\|C)、`dropMarks`、`refreshBooru`(只忽略手删名单)、`refreshSource`(最狠：连手删名单都不看)、`keepSnapshots`、`noImages`、`workSet` | 每个图桶里的 `NNNN.txt` + `wash_report.csv` + `review_todo.csv` + `wash_diff.csv`（本次 vs 上次改了哪些）+ `captions_prev/` 快照（留 1 代） |
 | `review-list` / `apply-review` | `payload` | 看图必答字段的往返 |
 | `fix-caption` | `name`(必填)、`add`/`remove`/`set` 三选一 | 只改点名的那一张 caption（写盘前留快照，写盘后出 `wash_diff.csv`） |
 | `exclude` | `names`、`reason`、`note`；`undo` 按账本搬回原桶、`missing` 事后补账、无参数列清单 | 图 + 同名 txt 移进 `_excluded/<reason>/`，并记进手删账本（重跑 `wash` 不复活） |
 | `verify` | `online`、`sample`、`trigger`、`workSet` | `wash_verify.csv`；§3 形态 + §9 内容闸门（BANNED 残留、否定式、质量词、人数一致性、**冲突族**、水印区与修补状态一致性、图-txt 配对、触发词位置） |
 | `dict-check` | 不给 `tags` 就查现有 caption（只按逗号切，多词标签不会被拆） | 终端输出：存在 / 别名可归一 / `post_count=0`（幻觉标签）/ 词典外 + 形近候选，各带"出现在几张图里" |
-| `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution`、`allowOutOfBand` | 四件套 + `preflight.txt`；自动发现图桶 + 跨桶按内容指纹去重 |
+| `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution`、`allowOutOfBand`、`keepBackups` | 四件套 + `preflight.txt`；自动发现图桶 + 跨桶按内容指纹去重；四件套内容没变就不重写、备份按「代」清理（留 1 代），`preflight.txt` 是报告、原地刷新不备份 |
 
 **写盘语义按阶段分三类**（传了不支持的参数会在**执行前**报错，错误里列出该阶段支持的参数）：
 
@@ -175,7 +175,7 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | 默认 dry-run、要 `apply:true` | `enrich`、`dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`exclude`、`makecfg` | 不带就只出报告（`enrich` 的 dry-run **仍会发请求**——它就是给你看命中率的） |
 | 只读 | `status`、`review-list`、`verify`、`dict-check` | 没有 `apply` |
 
-**dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子），数据集用了 `images/` 以外的桶时再多打一行 **图桶**（`图桶: clean 109图/109caption、watermark 33图/33caption`）。
+**dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子），数据集用了 `images/` 以外的桶时再多打一行 **图桶**（`图桶: clean 109图/109caption、watermark 33图/33caption`），最后一行是 **占用体检**（见下）。
 
 **重复 `init` 不会毁掉进度**：数据集已存在时 `init` 只打印提示就返回；`init --force` 是**就地更新**触发词/类型（阶段记录全部保留），只有 `init --reset --yes` 才会丢掉阶段记录从零重建——`--reset` 不带 `--yes` 会先把「当前已完成：init, wash」列出来让你确认。类型（`--kind`）决定 wash 的整类规则，中途改类型是安全的：`--force` 改完从 `wash` 起重跑即可。
 
@@ -190,11 +190,53 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | `_pipeline/rename_map.csv` | `rename` | `wash`（按 `old_name` 回查 booru 标签） | **只追加**，多批次共存 + 每批快照 `rename_map.<first>-<last>.csv`；预演只写 `rename_map.preview.csv` |
 | `raw_posts.jsonl` | `fetch` / `import` / `enrich` | `rename`、`wash`（来源 A） | 只追加，按 `(filename, post_id)` 去重合并 |
 | `_pipeline/user_deleted.json` | `exclude` / `fix-caption`（`remove`） | `wash`（防复活）、`verify` | 人工删除名单：记 `name`/`old_names`/`archived`/`bucket`/`reason`/时间；`restored_at` 标记已恢复。**手删了图就 `exclude`，别直接从磁盘删** —— 否则下一轮工具只会告诉你"少了几张" |
-| `_pipeline/captions_prev/<时间戳>/` | `wash` / `apply-review` / `fix-caption` | 人 | 写盘**前**自动快照（只留最近 3 份），`_meta.json` 记是谁触发的；配套 `wash_diff.csv` 是"本次 vs 上次"的逐张差异（新增/删除/清空） |
+| `_pipeline/captions_prev/<时间戳>/` | `wash` / `apply-review` / `fix-caption` | 人 | 写盘**前**自动快照（默认只留最近 1 代、内容没变就不新建），`_meta.json` 记是谁触发的；配套 `wash_diff.csv` 是"本次 vs 上次"的逐张差异（新增/删除/清空） |
 
 **变更可观测**：任何一次写 caption 的阶段都会先留快照、再写盘、最后出 `wash_diff.csv`，终端直接打印 `本次改动 N 张（新增 x / 删除 y / 清空 z）`；没有差异就明说"与上一版没有差异"。所以"这次 wash 到底改了什么"不用靠 diff 工具或翻聊天记录。
 
 **`wash` 默认不复活人工删掉的图源标签**（拿 `per_image.json` 的 `merged_tags` 与当前 caption 比对，差值即人工删除），确实要按图源整体重洗时用 `refreshSource:true`。这条就是「手改完 caption 一重跑全回来」那个坑的修法。
+
+### 空间与冗余：哪些会累积、哪些是副本
+
+一次跑批的产出分三类，**报告类全部是覆盖写**（同名文件原地更新，不会每次多一份）：
+
+| 类别 | 文件 | 会不会累积 |
+|---|---|---|
+| 账本 | `per_image.json`、`rename_map.csv`、`raw_posts.jsonl`、`user_deleted.json`、`manifest.json` | 单文件，只追加；`per_image.json` 的 `history` 每张图只留最近 30 次 |
+| 报告 | `*_report.csv`、`review_todo.csv`、`review_queue.csv`、`wash_diff.csv`、`preflight.txt` | **覆盖写**，每个阶段固定一份，行数随数据量、不随跑批次数 |
+| 副本/备份 | `_pipeline/thumbs/`、`_pipeline/orig_text/`、`_pipeline/masks/`、`_pipeline/captions_prev/`、`rename_map.<a>-<b>.csv`、`train_configs/<name>/*.bak<时分>` | **有上限或可再生**（见下） |
+
+后三类里真正占空间的只有两个，都为安全性付账：
+
+- **`_pipeline/orig_text/`**：`text` 每次修补前把**原图整份复制**过来（修补不可逆，这是回退凭证）。量级 = 被修补图片的总大小（200 张大图可能上 GB）。同一个文件名只备份第一次，重复跑不会叠加；确认修补结果没问题后**可以整个删掉**（删了就不能回退到修补前）。
+- **`_pipeline/thumbs/`**：给看图子代理用的 ≤1536px JPEG 副本，量级约为原图的 10~20%（实测 142 张 32MB）。已是最新的会跳过，`prune:true` 清掉没有对应原图的；看图复核结束后整个删掉也不影响任何阶段（下次要看图会重建）。
+- `_pipeline/masks/` 是几十 KB/张的掩膜，默认**修补成功后就把本次用过的清掉**（要留着 `--inpaint-only` 重跑就传 `keepMasks:true`；失败/未修补的掩膜始终保留）；`captions_prev/` 是纯文本快照，**默认只留最近 1 代**。
+
+#### `hygiene`：备份/快照留多少份（默认最小）
+
+出厂值刻意压到最小 —— 反复跑批不该往磁盘堆副本。改 `<home>/.animasl/animasl.config.json` 的 `hygiene` 段，或在设置页「空间与备份」分组里改：
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `hygiene.caption_snapshots` | **1** | `wash` 写盘前保留几代 caption 快照；0 = 不留。**内容与上一版逐字节相同就不新建**（反复洗同一批不会堆文件） |
+| `hygiene.rename_snapshots` | **3** | 每批 `rename` 的 `rename_map.<a>-<b>.csv` 快照份数（累计的权威表 `rename_map.csv` 不受影响） |
+| `hygiene.makecfg_backups` | **1** | 训练配置 `.bak<时分>` 保留几**代** —— 一次 `apply` 写的四件套算同一代，所以不会按文件数翻倍（`preflight.txt` 是报告，不进备份） |
+| `hygiene.keep_masks` | **false** | `text` 修补后是否保留掩膜 |
+
+阶段参数可以按次覆盖：`wash` 的 `keepSnapshots`、`makecfg` 的 `keepBackups`、`text` 的 `keepMasks`（传 0 = 这次不留）。
+
+`makecfg` 另外做了三件省事的事：① **逐文件比对内容**，四件套（`<name>_lora_stage1.toml` / `dataset_<name>.toml` / `train_<name>.bat` / `rationale.md`）没变就不重写、也不备份，全都没变就打印「配置与现有文件完全一致，未写盘」；② **文件里的「生成时间」不算内容变化**（否则时间戳每跑一次就往前走一秒，每个文件都会被判成"变了"）；③ **`preflight.txt` 是报告不是配置**，原地覆盖刷新，既不进 `.bak` 也不占一代 —— 它每次都会因为「与上一版配置的差异」这段而变。真要覆盖时旧配置改名成 `.bak<时分>`，整代一起清理。真实使用里这里曾经 6 次 `apply` 攒出 6 代 × 5 = 30 个文件（目录里 35 个只有 5 个在用），其中 toml/bat **0 行不同**，只差 `preflight.txt` 里的几行注释。
+
+累积型文件都设了上限，不会越跑越多：caption 快照留 1 代、`rename_map.<a>-<b>.csv` 批次快照留 3 份、`train_configs/<name>/*.bak<时分>` 留 1 代（清理时会打印一行说明）。这些数字就是上面的 `hygiene` 段。
+
+`_excluded/` 里的淘汰图是**移动**过去的（不是复制，不占双份空间），但会一直留着作为证据——真实数据集里它可能比在用的图还大（`redash`：在用的 110MB，淘汰区 138MB）。确认不再需要就把它归档到数据集外面。
+
+`anima_status` 的最后一行就是这件事的体检结果：
+
+```
+占用: 共 2.1G ｜ 数据 2.0G（clean 1.6G、watermark 494M） ｜ _pipeline 33M（thumbs 32M） ｜ _excluded 0B
+　可回收/可归档: thumbs 32M（看图子代理用的缩略图，删掉下次按需重建）；_excluded 0B（淘汰区的原图，确认不要了可归档到数据集外）
+```
 
 ## 文字检测 + 修补（koharu 能力的复刻）
 
@@ -292,7 +334,7 @@ wash   →  caption 的来源 A（booru 标签）+ 来源 C（同名 .txt sideca
 
 **LR 超出该 rank 的建议区间会直接报错**（不再静默收紧）：报错文案会给出区间，要么用区间内的值，要么显式 `allowOutOfBand:true`——那时**不改值**、只在 preflight 与终端打一行警告。真实使用里给过 `lr 5e-05 / dim 16`，旧版把它悄悄改成 `8e-05`，用户没看见。
 
-`makecfg` 重跑会覆盖已有配置：旧文件先改名成 `<名字>.bak<时分秒>` 备份，`force:true` 则不备份。
+`makecfg` 重跑不会堆垃圾：**四件套逐文件比对内容，没变就不重写、不备份**（`rationale.md` 里的「生成时间」不算内容变化），全都一样就打印「配置与现有文件完全一致，未写盘」；真的变了才把旧文件改名成 `<名字>.bak<时分秒>`（`force:true` 则不备份），并且 `.bak` 按**代**清理（默认只留最近 1 代，`keepBackups` / `hygiene.makecfg_backups` 可调）。**`preflight.txt` 是报告**：原地覆盖刷新，不进备份、不占一代 —— 同一份配置反复跑，磁盘上始终只有四件套 + 一份体检单。
 
 ## 目录契约
 
@@ -302,7 +344,8 @@ datasets/<name>/
   images/            默认工作集（图片 + 同名 .txt caption）★ caption 权威副本
   clean/ watermark/  可选：自己分的图桶 —— 根下**任何含图的子目录**都自动算一个桶
   _pipeline/         manifest.json、per_image.json、user_deleted.json、raw_posts.jsonl、enrich_report.csv、
-                     *_report.csv、wash_diff.csv、captions_prev/、masks/、thumbs/、orig_text/、rename_map.csv
+                     *_report.csv、wash_diff.csv、captions_prev/（留 1 代）、masks/（成功后清）、thumbs/、orig_text/、rename_map.csv（累计）
+                     + rename_map.<a>-<b>.csv（每批快照，留 3 份）
   _excluded/         剔除物（按 reason 分子目录）+ _EXCLUDED_MANIFEST.json 证据链
 train_configs/<name>/  <name>_lora_stage1.toml + dataset_<name>.toml + train_<name>.bat + rationale.md + preflight.txt
 ```

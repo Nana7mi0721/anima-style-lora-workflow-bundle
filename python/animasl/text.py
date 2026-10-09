@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import config as cfgmod
 from . import manifest
+from . import state as pstate
 from .curate import move_excluded, probe_image, write_csv
 
 ML_DIR = Path(__file__).resolve().parent / "ml"
@@ -75,10 +76,15 @@ def _run_safe(py: str, script: Path, args: list[str], timeout: int = 1800) -> tu
 
 def cmd_text(ds, apply: bool = False, rules_over: dict | None = None, dilate: int = 6,
              device: str = "", classes: str = "text,onomatopoeia", limit: int = 0,
-             detect_only: bool = False, inpaint_only: bool = False) -> dict:
+             detect_only: bool = False, inpaint_only: bool = False,
+             keep_masks: bool | None = None) -> dict:
     ds.ensure_dirs()
     cfg = ds.cfg
     rules = dict(rules_over or {})
+    if keep_masks is None:
+        # 掩膜是中间产物：修补成功后它就没人用了（除了 `--inpaint-only` 想复用）。
+        # 默认清理掉本次修补用过的那些，避免 `_pipeline/masks/` 一直躺着几百个文件。
+        keep_masks = pstate.hygiene(ds, "keep_masks", False)
     warn = float(rules.get("text_warn_ratio", cfg.get("screen", {}).get("text_warn_ratio", 0.08)))
     drop = float(rules.get("text_drop_ratio", cfg.get("screen", {}).get("text_drop_ratio", 0.30)))
     # Patching is gated at `warn` by default: a 1 % watermark is handled by the
@@ -111,6 +117,7 @@ def cmd_text(ds, apply: bool = False, rules_over: dict | None = None, dilate: in
 
     rows: list[dict] = []
     drops: list[tuple[Path, str, dict]] = []
+    used_masks: list[Path] = []   # 本次真的拿去修补的掩膜（成功后可清理）
     patched = 0
     failed = 0
     small = 0  # 检出文字但低于修补阈值、只留 note 的张数
@@ -199,6 +206,7 @@ def cmd_text(ds, apply: bool = False, rules_over: dict | None = None, dilate: in
                     tmp.replace(f)
                     patched += 1
                     row["patched"] = 1
+                    used_masks.append(mask_path)
                     # verify: re-detect on the patched pixels
                     vargs = ["--image", str(f), "--out-dir", str(masks_dir / "verify"),
                              "--thresholds", thresholds, "--classes", classes, "--dilate", str(dilate)]
@@ -237,5 +245,32 @@ def cmd_text(ds, apply: bool = False, rules_over: dict | None = None, dilate: in
     print(f"[text] 完成：{len(rows)} 张，keep {kept - patched}，patch {patched}，"
           f"drop {len(drops)}，小字保留 {small}，失败 {failed}；报告 {ds.pipe_dir / 'text_report.csv'}"
           f"{'' if apply else '（dry-run：加 --apply 才写盘）'}")
+    backup_used = cfgmod.dir_bytes(backup_dir)
+    if backup_used:
+        # 唯一会与图片本体同量级的东西：修补是破坏性的，所以每张被修补的图都留了一份原图。
+        print(f"         修补前原图备份 {cfgmod.human_bytes(backup_used)} -> {backup_dir}"
+              "（确认修补结果没问题后可以整个删掉，删了就无法回退到修补前）")
+
+    # 掩膜只在"检测 → 修补"之间活着：修好的那些留着没用（除非想复用 --inpaint-only），
+    # 反复跑 text 会让 masks/ 堆到几百个小文件。所以默认清掉本次修补用掉的那批，
+    # **失败/未修补的掩膜一律保留**（重试还要用）。要全留：keepMasks:true。
+    freed = 0
+    removed = 0
+    if apply and not keep_masks:
+        for mp in used_masks:
+            try:
+                freed += mp.stat().st_size
+                mp.unlink()
+                removed += 1
+            except OSError:
+                continue
+    masks_used = cfgmod.dir_bytes(masks_dir)
+    if removed:
+        print(f"         掩膜已清理 {removed} 个（{cfgmod.human_bytes(freed)}）；"
+              f"masks/ 现在 {cfgmod.human_bytes(masks_used)}"
+              "（要留着重跑 --inpaint-only 就传 keepMasks:true）")
+    elif masks_used and apply and not keep_masks:
+        print(f"         masks/ 现在 {cfgmod.human_bytes(masks_used)}"
+              "（含失败图与未修补图的掩膜，重试要用；要全清就手动删 masks/）")
     return {"count": len(rows), "patched": patched, "dropped": len(drops), "failed": failed,
-            "small": small, "kept": kept}
+            "small": small, "kept": kept, "masks_removed": removed, "masks_freed": freed}

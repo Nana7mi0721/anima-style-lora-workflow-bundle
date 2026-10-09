@@ -981,7 +981,8 @@ def _patched_images(ds, rmap: dict) -> set[str]:
 
 def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None = None,
              include_images: bool = True, refresh_source: bool = False, work_set=None,
-             refresh_booru: bool = False, drop_marks: bool = False, prefer: str = "") -> dict:
+             refresh_booru: bool = False, drop_marks: bool = False, prefer: str = "",
+             keep_snapshots: int | None = None) -> dict:
     rules = load_rules(ds, rules_over)
     if drop_marks:
         # 整族丢外部标识（§8.1）：给 clean/ 这种已经在 PS 里去过签名的桶用
@@ -1048,13 +1049,18 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
               f"（§8.1：能在图像层去掉就去掉，比标出来更好）")
     wm_drop = set(rules["watermark_tags"]) if patched else None
 
-    # 写盘前先给现有 caption 拍一张快照（只留最近 3 份），写盘后跟上一版比 diff ——
+    # 写盘前先给现有 caption 拍一张快照（默认只留上一版），写盘后跟上一版比 diff ——
     # 复盘痛点 11/12：wash 就地覆盖、没有任何"本次 vs 上次"的记录。
+    # 快照已经是默认最小：内容与上一版逐字节相同就不再留副本（反复洗同一批不会堆文件）。
     prev_snap = state.latest_snapshot(ds) if apply else None
     if apply:
-        snap = state.snapshot_captions(ds, work_set=work_set, label="wash")
+        snap = state.snapshot_captions(ds, work_set=work_set, label="wash", keep=keep_snapshots)
         if snap:
-            print(f"[wash] 上一版 caption 已快照到 {snap.relative_to(ds.root)}")
+            print(f"[wash] 上一版 caption 已快照到 {snap.relative_to(ds.root)}"
+                  f"（保留 {state.hygiene(ds, 'caption_snapshots', state.SNAPSHOT_KEEP)} 代，"
+                  f"改 hygiene.caption_snapshots 可调）")
+        else:
+            print("[wash] caption 与上一版快照一致，未新增快照（省一份副本）")
 
     rows: list[dict] = []
     review: list[dict] = []

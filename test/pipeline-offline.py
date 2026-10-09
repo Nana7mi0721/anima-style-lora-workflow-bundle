@@ -329,8 +329,105 @@ if (trainer / "anima_train_network.py").exists():
         code, out = run("makecfg", "--dataset", "t", "--dim", "32", "--force", "--apply")
         text2 = pre.read_text(encoding="utf-8") if pre.exists() else ""
         check(code == 0 and "network_dim" in text2, "第二次 makecfg 的 preflight 列出与上一版的差异")
+        # 第三次完全相同：四件套不许再写盘、更不许再堆一代 .bak（用户 m05904 的痛点）
+        baks_before = sorted(p.name for p in cfg_dir.glob("*.bak*"))
+        code, out = run("makecfg", "--dataset", "t", "--dim", "32", "--apply")
+        baks_after = sorted(p.name for p in cfg_dir.glob("*.bak*"))
+        check(code == 0 and "preflight" in out, "重复 makecfg 只刷新报告（preflight.txt）")
+        check(baks_after == baks_before, f"重复 makecfg 不再堆备份（{len(baks_before)} -> {len(baks_after)}）")
+        check(not any(b.startswith("preflight") for b in baks_after), "preflight.txt 不进备份")
+        # 第四次：连差异段都稳定了 ⇒ 一个字都不用写
+        code, out = run("makecfg", "--dataset", "t", "--dim", "32", "--apply")
+        check(code == 0 and "未写盘" in out, "内容完全一致时打印「配置与现有文件完全一致，未写盘」")
+        check(sorted(p.name for p in cfg_dir.glob("*.bak*")) == baks_before, "第四次也没有新备份")
 else:
     print("  skip  makecfg（找不到训练器 anima_train_network.py）")
+
+# --- 文件卫生：跑批不能无限堆冗余文件 ---------------------------------------
+
+from animasl import config as _config3      # noqa: E402
+from animasl import curate as _curate3      # noqa: E402
+from animasl import makecfg as _makecfg3    # noqa: E402
+from animasl import state as _state3        # noqa: E402
+
+check(_config3.human_bytes(0) == "0B" and _config3.human_bytes(1536) == "1.5K"
+      and _config3.human_bytes(2 * 1024 ** 3) == "2.0G", "human_bytes 口径（B/K/M/G）")
+check(_config3.dir_bytes(base / "_pipeline") == 0 or _config3.dir_bytes(base / "_pipeline") > 0,
+      "dir_bytes 对目录/不存在路径都不炸")
+check(_config3.dir_bytes(base / "no-such-dir") == 0, "dir_bytes 读不到的路径算 0")
+
+# 卫生夹具：一个只有 2 张图的独立数据集
+hyg_dir = home / "datasets" / "hyg"
+(hyg_dir / "images").mkdir(parents=True, exist_ok=True)
+for i, name in enumerate(["0001.png", "0002.png"]):
+    make_png(hyg_dir / "images" / name, color=(20 + i * 30, 120, 90))
+    (hyg_dir / "images" / Path(name).with_suffix(".txt")).write_text("@hyg, 1girl, solo\n", encoding="utf-8")
+hds = _config3.Dataset("hyg", cfg)
+check(_config3.dir_bytes(hyg_dir / "images") > 0, "dir_bytes 能数出图片占用（占用体检的数据源）")
+
+# caption 快照：内容与上一版一模一样就不新建；默认只留 1 代（反复洗同一批不堆副本）
+class _FakeDs:  # 只为测 hygiene() 的读配置/回落行为
+    cfg = {"hygiene": {"rename_snapshots": 7, "keep_masks": True}}
+check(_state3.hygiene(_FakeDs(), "rename_snapshots", 3) == 7
+      and _state3.hygiene(_FakeDs(), "keep_masks", False) is True
+      and _state3.hygiene(_FakeDs(), "caption_snapshots", 1) == 1
+      and _state3.hygiene(_FakeDs(), "nope", 2) == 2, "hygiene 读配置 + 缺键回落默认")
+check(_state3.hygiene(hds, "caption_snapshots", 1) == 1, "hygiene 出厂默认 caption_snapshots=1")
+
+first = _state3.snapshot_captions(hds, label="hyg-0")
+check(first is not None and Path(first).is_dir(), "第一次快照会写盘")
+check(_state3.snapshot_captions(hds, label="hyg-same") is None,
+      "caption 没变时不再新建快照（反复洗同一批不堆文件）")
+for i in range(3):
+    (hyg_dir / "images" / "0001.txt").write_text(f"@hyg, 1girl, solo, v{i}\n", encoding="utf-8")
+    _state3.snapshot_captions(hds, label=f"hyg-{i + 1}")
+snaps = sorted(p.name for p in (hds.pipe_dir / "captions_prev").iterdir() if p.is_dir())
+check(len(snaps) == 1, f"caption 快照默认只留最近 1 代（实际 {len(snaps)}）")
+
+# rename 批次快照只留最近 3 份，累计的权威表不受影响
+for i in range(7):
+    (hds.pipe_dir / f"rename_map.{i:04d}-{i + 2:04d}.csv").write_text("new_name,old_name\n", encoding="utf-8")
+(hds.pipe_dir / "rename_map.csv").write_text("new_name,old_name\n0001.png,a.png\n", encoding="utf-8")
+(hds.pipe_dir / "rename_map.preview.csv").write_text("new_name,old_name\n", encoding="utf-8")
+_curate3._prune_batch_maps(hds)
+left = sorted(p.name for p in hds.pipe_dir.glob("rename_map.*-*.csv"))
+check(len(left) == 3, f"rename 批次快照默认只留 3 份（实际 {len(left)}）")
+check((hds.pipe_dir / "rename_map.csv").exists() and (hds.pipe_dir / "rename_map.preview.csv").exists(),
+      "清理批次快照不动权威表与预演表")
+_curate3._prune_batch_maps(hds, keep=0)
+check(len(list(hds.pipe_dir.glob("rename_map.*-*.csv"))) == 0, "rename_snapshots=0 时批次快照全清")
+
+# makecfg 的 .bak 按「代」清理：一次 apply 的 5 个文件算一代，默认只留 1 代
+cfg_bak = base / "cfgbak"
+cfg_bak.mkdir(parents=True, exist_ok=True)
+for gen in range(6):
+    stamp = f"{180000 + gen * 100:06d}"
+    for name in ("x_lora_stage1.toml", "dataset_x.toml", "train_x.bat", "rationale.md", "preflight.txt"):
+        p = cfg_bak / f"{name}.bak{stamp}"
+        p.write_text("x\n", encoding="utf-8")
+        os.utime(p, (1_700_000_000 + gen, 1_700_000_000 + gen))
+_makecfg3._prune_backup_generations(cfg_bak)
+baks = sorted(p.name for p in cfg_bak.glob("*.bak*"))
+check(len(baks) == 5 and all(name.endswith(".bak180500") for name in baks),
+      f"makecfg 备份默认只留最近 1 代（5 个文件，实际 {len(baks)} 个）")
+check(_makecfg3._prune_backup_generations(cfg_bak, keep=0) == 5 and not list(cfg_bak.glob("*.bak*")),
+      "makecfg_backups=0 时备份全清")
+
+# 保留策略的三个旋钮：cli 必须收，且默认交给配置（-1 / False）
+from animasl import cli as _cli3        # noqa: E402
+
+_cli_parser = _cli3.build_parser()
+_a = _cli_parser.parse_args(["text", "--dataset", "d", "--keep-masks"])
+check(_a.keep_masks is True, "cli: text --keep-masks")
+_a = _cli_parser.parse_args(["text", "--dataset", "d"])
+check(_a.keep_masks is False, "cli: text 默认不留掩膜")
+_a = _cli_parser.parse_args(["wash", "--dataset", "d", "--keep-snapshots", "0"])
+check(_a.keep_snapshots == 0, "cli: wash --keep-snapshots 0（本次不留）")
+_a = _cli_parser.parse_args(["makecfg", "--dataset", "d", "--keep-backups", "2"])
+check(_a.keep_backups == 2, "cli: makecfg --keep-backups N")
+_a = _cli_parser.parse_args(["makecfg", "--dataset", "d"])
+check(_a.keep_backups == -1 and _cli_parser.parse_args(["wash", "--dataset", "d"]).keep_snapshots == -1,
+      "cli: 不传时是 -1（交给配置 hygiene）")
 
 # --- 收尾 -------------------------------------------------------------------
 
