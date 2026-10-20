@@ -57,7 +57,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 ### 空间与冗余：跑批会不会堆垃圾
 
-**账本与报告几乎不长**：`per_image.json` 约 2.6KB/图（`history` 每张只留最近 30 次）、`rename_map.csv` 约 100B/图、各 `*_report.csv` 一次跑批原地覆盖。所以 142 张的数据集把 18 个阶段来回跑十几遍，`_pipeline/` 里的账本加起来仍是几百 KB。
+**账本与报告几乎不长**：`per_image.json` 约 2.6KB/图（`history` 每张只留最近 30 次）、`rename_map.csv` 约 100B/图、各 `*_report.csv` 一次跑批原地覆盖。所以 142 张的数据集把 19 个阶段来回跑十几遍，`_pipeline/` 里的账本加起来仍是几百 KB。
 
 **真正占空间的是三类有意的副本**（都用"能不能删"来权衡）：
 
@@ -83,7 +83,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 ## §2 阶段表与 I/O 契约
 
-**18 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
+**19 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
 
 | 阶段 | 工具调用 | 输入 | 产出 | 重跑会覆盖什么 |
 |---|---|---|---|---|
@@ -95,6 +95,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | screen | `stage:"screen"` → 视觉复核 → `apply:true` | `00_raw/`（`includeImages:true` 连图桶） | screen_report.csv + review_queue.csv | 覆盖报告；apply 时移入 `_excluded/<reason>/` |
 | thumbs | `anima_stage(stage:"thumbs", dataset:"X")` | 图桶（没有才用 `00_raw/`） | `_pipeline/thumbs/*.jpg` | 覆盖已有缩略图（**不吃 apply**，写盘是默认行为）；已是最新的跳过，`prune:true` 清掉没有对应图的陈旧缩略图 |
 | text | `anima_stage(stage:"text", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 处理 `images/`） | 修补后的图 + text_report.csv + `masks/`（成功后清掉本次用过的） | **⚠️ 修补不可逆**：apply 就地改写图片（修补前备份在 `_pipeline/orig_text/`），并让 `wash` 及之后全部失效。要留掩膜重跑 `--inpaint-only` 就传 `keepMasks:true` |
+| text-rollback | `anima_stage(stage:"text-rollback", dataset:"X")` → `apply:true`（`names` 只恢复某几张） | 图桶 | 用 `_pipeline/orig_text/` 里的原图覆盖回去；恢复后 `wash` 及之后全部标 stale | **text 补坏了的唯一后路**。RF-DETR 会把纯白 censor bar（大面积平坦色块）与裸露皮肤/肢体（抬起的小腿＋黑高跟鞋）误判成文字，LaMa 一补就不可逆——真实使用里那两张是人工重下原始字节救回来的，其实备份一直躺着。所以跑 `text --apply` 前先 `detectOnly:true` + 看图确认 |
 | rename | `anima_stage(stage:"rename", dataset:"X", apply:true)` | `00_raw/`（已重排过会报错） | `images/0001.ext` + rename_map.csv + per_image.json | `rename_map.csv` **只追加**（按 `old_name` 去重，本次为准）+ 本批快照；预演只写 `rename_map.preview.csv`，不碰权威表；同名 `.txt` 边车跟着搬 |
 | wash | `anima_stage(stage:"wash", dataset:"X", trigger:"@xxx")` → `apply:true` | 图桶里的 `*.txt` + raw_posts.jsonl（经 rename_map 的 `old_name` 回查） | 每个桶里的 `NNNN.txt` + wash_report.csv + review_todo.csv + wash_diff.csv + captions_prev/（留 1 代） | 覆盖 caption（**幂等**：同输入重跑结果一致）。默认不复活人工删掉的图源标签（`refreshBooru` / `refreshSource` 逐级放宽）；写盘前自动快照（内容没变就不新建，`keepSnapshots:0` 可完全不留）、写盘后出本次 vs 上次的差异 |
 | review-list | `anima_stage(stage:"review-list", dataset:"X")` | wash_report.csv | review_todo.csv | 覆盖清单 |

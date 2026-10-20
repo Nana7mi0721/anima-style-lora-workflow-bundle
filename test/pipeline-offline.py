@@ -144,6 +144,24 @@ code, out = run("screen", "--dataset", "t")
 check(code == 0 and "sketch-tags 完全没参与判定" in out,
       "screen 在无图源元数据时明说 sketch-tags 空转")
 
+# text-rollback：修复不可逆误检的后路（fanzzz 那两张就是这么救回来的）
+bk_dir = ds_dir / "_pipeline" / "orig_text"
+bk_dir.mkdir(parents=True, exist_ok=True)
+img0 = sorted((ds_dir / "00_raw").glob("*.png"))[0]
+shutil.copy2(img0, bk_dir / img0.name)
+img0.write_bytes(b"patched-bytes-not-the-original")
+code, out = run("text-rollback", "--dataset", "t")
+check(code == 0 and "会恢复" in out and "dry-run" in out,
+      "text-rollback dry-run 只报告不动文件")
+check(img0.read_bytes() == b"patched-bytes-not-the-original", "text-rollback dry-run 没写盘")
+code, out = run("text-rollback", "--dataset", "t", "--apply")
+check(code == 0 and img0.read_bytes() != b"patched-bytes-not-the-original",
+      "text-rollback --apply 把原图恢复了")
+check("标记为 stale" in out, "text-rollback 让 caption 阶段重跑（图变了）")
+code, out = run("text-rollback", "--dataset", "t", "--apply")
+check(code == 0 and ("没有" in out or "对不上" in out or "orig_text" in out),
+      "text-rollback 没备份时给指引而不是崩")
+
 code, out = run("import", "--dataset", "t", "--src", str(ds_dir), expect=1)
 check("数据集目录本身" in out or "拒绝执行" in out, "import 拒绝数据集根（src 红线）")
 

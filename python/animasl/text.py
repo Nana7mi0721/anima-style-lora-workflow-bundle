@@ -74,6 +74,60 @@ def _run_safe(py: str, script: Path, args: list[str], timeout: int = 1800) -> tu
         return None, str(exc)[:300]
 
 
+def cmd_text_rollback(ds, names: str = "", apply: bool = False, work_set=None) -> dict:
+    """把 `orig_text/` 里的原图搬回去（撤销 text 阶段的修补）。
+
+    真实使用踩过的坑（fanzzz 复盘点名）：RF-DETR 会把两样东西当成文字 ———
+    纯白 censor bar（大面积平坦色块）与抬起的小腿 + 黑高跟鞋（大面积裸露皮肤/肢体），
+    LaMa 一补就不可逆。当时那两张是人工从 danbooru 重下原始字节救回来的，而
+    `_pipeline/orig_text/` 里本来就躺着**修补前的原图**，只是没有回去的路。
+    修补成功的那一刻 `images/<stem>.txt` 描述的仍是修补前的图，所以回滚后
+    必须让依赖 caption 的阶段重跑（这里 invalidate_from("wash")）。
+    """
+    backup_dir = ds.pipe_dir / "orig_text"
+    if not backup_dir.exists():
+        print(f"[rollback] 没有 {backup_dir} —— 这个数据集没跑过 text --apply（或备份已被删）")
+        return {"count": 0, "restored": 0}
+
+    wanted = [n.strip() for n in names.split(",") if n.strip()] if names else []
+    files = ds.work_images(work_set) if work_set else (ds.images() or ds.raw_images())
+
+    def _match(img: Path) -> bool:
+        if not wanted:
+            return True
+        return any(w in (img.name, img.stem) for w in wanted)
+
+    todo: list[tuple[Path, Path]] = []
+    for bak in sorted(backup_dir.iterdir()):
+        if not bak.is_file() or ".inpainted-bad" in bak.name:
+            continue
+        target = (next((f for f in files if f.name == bak.name), None)
+                  or next((f for f in files if f.stem == bak.stem), None))
+        if target is not None and _match(target):
+            todo.append((bak, target))
+
+    if not todo:
+        n_all = len([p for p in backup_dir.iterdir() if p.is_file()])
+        print(f"[rollback] orig_text/ 里有 {n_all} 个备份，但没有一个对得上当前图桶"
+              + (f"（筛选 names={names}）" if names else "（图可能已被 rename/exclude）"))
+        return {"count": 0, "restored": 0}
+
+    print(f"[rollback] {len(todo)} 张会从 orig_text/ 恢复到修补前"
+          + ("" if apply else "（dry-run：加 --apply 才写盘）"))
+    for bak, target in todo:
+        print(f"  {'恢复' if apply else '会恢复'} {target.name}  <-  orig_text/{bak.name}")
+        if apply:
+            shutil.copy2(bak, target)
+
+    if apply:
+        mf = manifest.load(ds)
+        mf.invalidate_from("wash")
+        mf.save()
+        print("[rollback] 已恢复原图 -> wash/review/config 标记为 stale"
+              "（caption 描述的仍是修补前的图，接着跑 wash 或 review-list）")
+    return {"count": len(todo), "restored": len(todo) if apply else 0}
+
+
 def cmd_text(ds, apply: bool = False, rules_over: dict | None = None, dilate: int = 6,
              device: str = "", classes: str = "text,onomatopoeia", limit: int = 0,
              detect_only: bool = False, inpaint_only: bool = False,

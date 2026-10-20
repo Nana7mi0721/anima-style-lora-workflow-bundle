@@ -1,6 +1,6 @@
 ---
 name: anima-style-lora-curate
-description: Anima 风格 LoRA 训练集的筛选与清理指南：导入素材的 src 红线、md5/pHash/SSIM 三级去重阈值、"低质量/过老/草图/非完整制作"的判定规则与视觉复核协议、图片文字与拟声词的检测（RF-DETR-Seg）与修补（LaMa-manga）流程、koharu GUI 半自动回退、单张/批量改 caption（fix-caption）与查标签是否真实存在（dict-check、synonyms 别名表）、剔除清单的写法。用户要求"筛选数据集/去重/删掉低质量或草图/去掉图里的文字/清理训练集/改某张图的标签/查这个标签有没有"时使用。
+description: Anima 风格 LoRA 训练集的筛选与清理指南：导入素材的 src 红线、md5/pHash/SSIM 三级去重阈值、"低质量/过老/草图/非完整制作"的判定规则与视觉复核协议、图片文字与拟声词的检测（RF-DETR-Seg）与修补（LaMa-manga）流程、补坏了怎么回退（text-rollback）、koharu GUI 半自动回退、单张/批量改 caption（fix-caption）与查标签是否真实存在（dict-check、synonyms 别名表）、剔除清单的写法。用户要求"筛选数据集/去重/删掉低质量或草图/去掉图里的文字/清理训练集/改某张图的标签/查这个标签有没有"时使用。
 ---
 
 # SKILL：数据集筛选与清理
@@ -116,7 +116,7 @@ anima_stage(stage:"text", dataset:"X", apply:true)             # 检测 + LaMa �
   - `> 30%`（`text_drop_ratio`）→ 打印警告，交用户决定是否剔除（通常是漫画页/设定表）；
   - 修补后要复检一次（修补区域是否留下糊斑）。
 - **修补后 caption 必须重洗**：自动打标工具描述的是修补前的原图，文字相关的 tag/描述全部作废。流程上 `text` 排在 `rename`/`wash` 之前就是为了这个。
-- **修补是不可逆的，所以它留了退路**：apply 前把原图整份复制到 `_pipeline/orig_text/`（同一文件名只备份第一次，重复跑不叠加），跑完自报 `修补前原图备份 10.8M -> <dir>`。这是整个流程里唯一与图片同量级的副本 —— **`verify` 通过、确认不用回退之后可以整个删掉**，删了就不能再回到修补前。
+- **修补是不可逆的，所以它留了退路**：apply 前把原图整份复制到 `_pipeline/orig_text/`（同一文件名只备份第一次，重复跑不叠加），跑完自报 `修补前原图备份 10.8M -> <dir>`。这是整个流程里唯一与图片同量级的副本 —— **`verify` 通过、确认不用回退之后可以整个删掉**，删了就只能从 danbooru 重下原始字节了。**要回退用 `text-rollback`**（`apply:true` 才写盘，`names` 指定某几张），恢复后 `wash` 及之后全部标 stale。
 - **掩膜默认不留**：修补成功后 `text` 会把**本次真的用过的**掩膜删掉（失败/未修补的始终保留），跑完打印 `掩膜已清理 N 个（X）`。要留着事后 `--inpaint-only` 重跑就传 `keepMasks:true`；想让以后默认就留，改配置 `hygiene.keep_masks`（设置页「空间与备份」）。
 
 ### koharu 回退（半自动）

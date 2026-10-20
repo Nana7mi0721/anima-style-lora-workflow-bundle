@@ -13,7 +13,7 @@ DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 →
 | agent 预设 `anima-style-lora`（显示名「Anima风格LoRA全流程」） | 带专属 persona 的 agent 组合；`skill-filesystem` 通过 `customSkillDirs` 挂载本包的 `skills/` |
 | 3 个 skill | `anima-style-lora-pipeline`（总纲）/ `-source`（选源下载）/ `-curate`（筛选 + 文字修补 + 视觉复核） |
 | 设置页（浏览器半侧 + 宿主路由 `/anima-lora/api`） | 在 DSH 设置里直接改全部配置项（含凭据），写进 `<home>/.animasl/animasl.config.json`，下次调用即生效 |
-| Python 工具箱 `python/animasl/` | 18 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
+| Python 工具箱 `python/animasl/` | 19 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
 
 ## 安装
 
@@ -67,7 +67,7 @@ npm run test:all      # 上面全部（check:patch + params + client + route + p
 `E:/LoRA_Train/.animasl/venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
 `SKIP` 并返回 0）。
 
-`test/pipeline-offline.py` 是**唯一一条把 18 个阶段串起来跑**的回归：在 `<home>/datasets`
+`test/pipeline-offline.py` 是**唯一一条把 19 个阶段串起来跑**的回归：在 `<home>/datasets`
 下建 `_pipeoff_*` 临时现场（`_` 前缀，`anima_status` 看不见），用真 CLI 走
 init → import（含"跳过非图"与"拒绝 src=数据集根"）→ rename → thumbs（重排之后仍出图）
 → 第二批 import + rename（验证对照表只追加）→ 图桶布局（`clean/` + `watermark/` + 硬链接副本
@@ -157,6 +157,7 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | `screen` | `minShortSide`(512)、`minBytes`(102400)、`earliest`(2015-01-01) | `screen_report.csv` + `review_queue.csv` |
 | `thumbs` | `maxSide`(1536)、`prune`、`includeImages` | `_pipeline/thumbs/`（视觉子代理只能看这个） |
 | `text` | `warnRatio`(0.08)、`dropRatio`(0.30)、`patchSmall`、`thresholds`、`dilate`(6)、`keepMasks` | `masks/`（修补成功后清掉本次用过的）、`text_report.csv`；修补后自动把 `wash` 标 stale |
+| `text-rollback` | `names`（只恢复这几张，省略则全部） | 从 `_pipeline/orig_text/` 把修补前的原图搬回去。**`text --apply` 是不可逆的**——RF-DETR 会把纯白 censor bar（平坦色块）与裸露皮肤/肢体（抬起的小腿＋黑高跟鞋）误当文字，LaMa 一补就回不去；这是唯一的后路，恢复后自动把 `wash` 标 stale |
 | `rename` | `start`(1)、`digits`(4)、`move` | `images/0001.ext` + `rename_map.csv`（只追加）+ `per_image.json` |
 | `wash` | `trigger`、`rules`、`minTags`/`maxTags`、`prefer`(A\|C)、`dropMarks`、`refreshBooru`(只忽略手删名单)、`refreshSource`(最狠：连手删名单都不看)、`keepSnapshots`、`noImages`、`workSet` | 每个图桶里的 `NNNN.txt` + `wash_report.csv` + `review_todo.csv` + `wash_diff.csv`（本次 vs 上次改了哪些）+ `captions_prev/` 快照（留 1 代） |
 | `review-list` / `apply-review` | `payload` | 看图必答字段的往返 |

@@ -123,6 +123,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="修补后保留掩膜（默认清掉本次用过的；失败的掩膜始终保留）")
     _apply(sp)
 
+    sp = add("text-rollback", "把 text 阶段修补过的图从 orig_text/ 恢复成修补前（撤销不可逆的误检修补）")
+    sp.add_argument("--names", default="", help="只恢复这些图（名字或编号，逗号分隔）；省略则全部对得上的")
+    _apply(sp)
+
     sp = add("rename", "重排编号为 0001…（下载后、洗标前）")
     sp.add_argument("--start", type=int, default=1)
     sp.add_argument("--digits", type=int, default=4)
@@ -670,6 +674,12 @@ def main(argv: list[str] | None = None) -> int:
                          detect_only=args.detect_only, inpaint_only=args.inpaint_only,
                          keep_masks=True if args.keep_masks else None)
         _mark(ds, "text", _applied(args))
+        return 0
+
+    if cmd == "text-rollback":
+        from . import text as textmod
+        textmod.cmd_text_rollback(ds, names=args.names, apply=args.apply)
+        _mark(ds, "text-rollback", _applied(args))
         return 0
 
     if cmd == "rename":
