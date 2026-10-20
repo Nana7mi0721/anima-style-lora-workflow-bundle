@@ -650,7 +650,7 @@ def cmd_screen(ds, rules: dict | None = None, apply: bool = False,
             notes.append("sketch-tags:" + "|".join(hit))
             review.append({"file": f.name, "why": "sketch-tags", "detail": ",".join(hit),
                            "width": w, "height": h, "date": date})
-        if not m:
+        if not tags:
             notes.append("no-booru-metadata")
 
         row = {"file": f.name, "decision": "drop" if reasons else "keep",
@@ -666,6 +666,17 @@ def cmd_screen(ds, rules: dict | None = None, apply: bool = False,
 
     write_csv(ds.pipe_dir / "screen_report.csv", rows)
     write_csv(ds.pipe_dir / "review_queue.csv", review)
+
+    # g4ku 复盘 5.1 #10：没有图源标签的数据集上，screen 里的 sketch-tags 判定完全空转，
+    # 最后照样打印「保留 N / N」，agent 会以为筛选做过了。这里把「这一跑其实没筛草图」说清楚。
+    no_meta = sum(1 for r in rows if "no-booru-metadata" in r["notes"])
+    if rows and no_meta == len(rows):
+        print(f"[screen] ! {no_meta}/{len(rows)} 张都没有图源标签——"
+              f"本次只有分辨率/体积/年代三条规则生效，sketch-tags 完全没参与判定。"
+              f"想按草图标签筛，先跑 enrich 补 booru 标签，或直接看 review_queue.csv 人工判。")
+    elif no_meta:
+        print(f"[screen] {no_meta}/{len(rows)} 张没有图源元数据，"
+              f"这些图的 sketch-tags 判定为空（其余 {len(rows) - no_meta} 张正常）")
 
     if apply and drops:
         n = move_excluded(ds, drops)

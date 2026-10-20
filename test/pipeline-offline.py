@@ -138,6 +138,12 @@ raw = sorted((ds_dir / "00_raw").glob("*"))
 check(code == 0 and len([p for p in raw if p.suffix == ".png"]) == 3, "import 收进 3 张图")
 check("clip.mp4" in out and "非图" in out, "import 报告跳过非图片（不再静默黑洞）")
 
+# screen 在没有图源标签的数据集上必须说自己空转（g4ku 复盘 5.1 #10：
+# 它原来照样打印「保留 N / N」，agent 会以为按草图标签筛过了）
+code, out = run("screen", "--dataset", "t")
+check(code == 0 and "sketch-tags 完全没参与判定" in out,
+      "screen 在无图源元数据时明说 sketch-tags 空转")
+
 code, out = run("import", "--dataset", "t", "--src", str(ds_dir), expect=1)
 check("数据集目录本身" in out or "拒绝执行" in out, "import 拒绝数据集根（src 红线）")
 
