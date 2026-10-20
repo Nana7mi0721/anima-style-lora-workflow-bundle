@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
+import time
 from pathlib import Path
 
 from . import curate, dicts, manifest as manifest_mod, net, state
@@ -808,11 +810,25 @@ def validate(line: str, rules: dict, tag_count: int, td=None) -> list[str]:
 _SOLO = "solo"
 _MULTI_COUNT = ("2girls", "3girls", "4girls", "5girls", "6+girls", "multiple girls",
                 "1boy", "2boys", "3boys", "multiple boys", "solo focus")
+# 画面里有 ≥2 个人：发色/瞳色/发长/胸围这些"每人一个"的族不做互斥检查
+# （不用单独的常量，人数统一由 _people_count 从标签估算）
 
-
-# 语义冲突族：同一族里出现 ≥2 个不同取值 = 冲突。旧实现只查人数（复盘痛点 2：146 张里
+# 冲突族：同一族里出现 ≥2 个不同取值 = 冲突。旧实现只查人数（复盘痛点 2：146 张里
 # 发色/瞳色冲突 32+38 张、`no panties` vs `panties` 5 张都是靠人肉看出来的）。
 # 注意 **`1girl` 与 `1boy` 不是冲突**（同人图常态），所以没有 gender 组。
+#
+# 三个豁免是真实的误报来源（fanzzz 复盘 §4.3：verify 报 11 张冲突，**11 张全是误报**）：
+#   ① 多角色图（`2girls` 等）里两个角色各一种发色/瞳色 —— 不是冲突；
+#   ② caption 带 `multicolored hair` / `two-tone hair` / `gradient hair` 这类标记时，
+#      同一人本来就双色 —— hair-color 族不互斥；
+#   ③ `no panties` 与 `no bra` 是两件独立的衣物，不该同族。
+# 豁免只关掉**提示**，不改变 wash 的任何裁剪行为（冲突本来也只报不裁）。
+MULTICOLOR_MARKERS = ("multicolored hair", "two-tone hair", "gradient hair",
+                      "colored inner hair", "streaked hair", "multicolored eyes",
+                      "gradient eyes", "heterochromia", "two-tone eyes")
+# 族 -> 需要几"个人"才豁免；None 表示不看人数
+_PEOPLE_SENSITIVE = {"hair-color", "eye-color", "hair-length", "breast-size"}
+
 CONFLICT_GROUPS: dict[str, tuple[str, ...]] = {
     "hair-color": ("black hair", "brown hair", "blonde hair", "red hair", "pink hair",
                    "purple hair", "blue hair", "green hair", "orange hair", "white hair",
@@ -826,10 +842,30 @@ CONFLICT_GROUPS: dict[str, tuple[str, ...]] = {
                     "absurdly long hair", "floor-length hair"),
     "breast-size": ("flat chest", "small breasts", "medium breasts", "large breasts",
                     "huge breasts", "gigantic breasts"),
-    "underwear": ("panties", "no panties", "bra", "no bra", "underwear", "no underwear"),
+    # 衣物是"一件一件"的：`panties`/`no panties` 互斥，`bra`/`no bra` 互斥，
+    # 但这四者彼此之间**不是**冲突（穿了内裤却没穿胸罩很常见）。
+    "underwear-bottom": ("panties", "no panties"),
+    "underwear-top": ("bra", "no bra"),
+    "underwear-full": ("underwear", "no underwear"),
     # count 只查 solo 与多数人/`solo focus` 的互斥（`1girl`+`1boy` 是常态，不算冲突）
     "count": (_SOLO,) + _MULTI_COUNT,
 }
+
+
+def _people_count(have: set[str]) -> int:
+    """从人数标签估画面里有几个人（估不出来返回 0，不豁免）。"""
+    n = 0
+    for tag in have:
+        m = re.fullmatch(r"(\d)\+?(girls|boys|others)", tag)
+        if m:
+            n += int(m.group(1))
+        elif tag.startswith("multiple "):
+            n += 2
+        elif tag in ("1girl", "1boy", "1other"):
+            n += 1
+        elif tag == "solo focus":
+            n += 1
+    return n
 
 
 def conflict_issues(names: list[str], rules: dict | None = None) -> list[str]:
@@ -841,6 +877,8 @@ def conflict_issues(names: list[str], rules: dict | None = None) -> list[str]:
     for g, vals in ((rules or {}).get("conflict_groups") or {}).items():
         groups[str(g)] = tuple(str(v) for v in vals)
     have = set(names)
+    people = _people_count(have)
+    multicolor = any(t in have for t in MULTICOLOR_MARKERS)
     out: list[str] = []
     for group, values in groups.items():
         hit = [v for v in values if v in have]
@@ -850,8 +888,15 @@ def conflict_issues(names: list[str], rules: dict | None = None) -> list[str]:
                 if clash:
                     out.append("count-conflict(solo vs " + ", ".join(clash) + ")")
             continue
-        if len(hit) >= 2:
-            out.append(f"conflict-{group}(" + " vs ".join(hit[:3]) + ")")
+        if len(hit) < 2:
+            continue
+        # ① 多角色：每人可以有自己的发色/瞳色/发长
+        if group in _PEOPLE_SENSITIVE and people >= 2:
+            continue
+        # ② 双色设计标记：hair-color / eye-color 本来就不该互斥
+        if multicolor and group in ("hair-color", "eye-color"):
+            continue
+        out.append(f"conflict-{group}(" + " vs ".join(hit[:3]) + ")")
     return out
 
 
@@ -1165,13 +1210,19 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
     print("[wash] 标签来源：" + ("、".join(f"{k} {v}" for k, v in sorted(origin_counts.items()))
                                  or "（无）"))
     none_n = origin_counts.get("A=none", 0)
-    if include_images and total and none_n * 2 >= total:
-        print(f"[wash] ! {none_n}/{total} 张没有图源标签（A=none）——这次 wash 实际上只做了"
-              f"「格式化 + 压父标签」，规则里那些『丢画师/IP/质量词』的分支没东西可丢。"
-              f"\n        补 A 源两条路：① `enrich`（按文件 md5 反查 danbooru 原帖；"
-              f"文件名是 `<pixiv_id>_p<页>` 时还会用 pixiv_id 兜一次）"
-              f"\n                      ② `fetch --source danbooru --tags <画师名>` 抓该画师帖再 import"
-              f"（标签靠 md5 匹配回来）。两条都建议在 `text` 之前做。")
+    # 沉默降级是真实使用里最伤的一条（小叶子miv 复盘：「插件原生 wash 在无源场景
+    # 几乎什么都没做却照样报 ok」）。所以这里**不看 include_images**：处理 00_raw
+    # 也一样要喊出来。判据从「≥50%」放宽到「有任何一张」——一张没源也是信息。
+    if total and none_n:
+        pct = none_n / total
+        lead = "!" if pct >= 0.5 else "注"
+        print(f"[wash] {lead} {none_n}/{total} 张没有图源标签（A=none）——这些图的 wash 只做了"
+              f"「格式化 + 压父标签」，规则里那些『丢画师/IP/质量词』的分支没东西可丢。")
+        if pct >= 0.5:
+            print("        补 A 源两条路：① `enrich`（按文件 md5 反查 danbooru 原帖；"
+                  "文件名是 `<pixiv_id>_p<页>` 时还会用 pixiv_id 兜一次）"
+                  "\n                      ② `fetch --source danbooru --tags <画师名>` 抓该画师帖再 import"
+                  "（标签靠 md5 匹配回来）。两条都建议在 `text` 之前做。")
     if diff_rows:
         print("[wash] 与上一版的差异：" + state.diff_line(ds, diff_rows, prev_snap)
               + "（详见 _pipeline/wash_diff.csv）")
@@ -1317,25 +1368,111 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True, trigger: str =
     return {"updated": updated, "trigger": trigger}
 
 
-def cmd_set_caption(ds, name: str, add: str = "", remove: str = "", set_text: str = "",
-                    trigger: str = "", apply: bool = False) -> dict:
-    """增量修一张图的 caption —— 不再需要外面写 _trim2.py / _add_vision.py。
+def _batch_targets(ds, names: str) -> list[str]:
+    """把 `--names` 展开成图片名列表。
+
+    支持三种写法（可以混用）：
+      - 逗号/空白分隔的名字：`0001,0002.jpg,@old_name`
+      - 编号区间：`0001-0012`
+      - 通配：`0001*`（按 fnmatch，只匹配图桶里的文件）
+
+    真实使用踩到的坑（g4ku 复盘 5.1 #7）：改 48 张要调 48 次 fix-caption，每次都
+    load + save 一遍 `per_image.json`，并发/中断时会把状态文件写坏（那次涨到 14397 行）。
+    批量入口的意义不只是省事，是**一次 load、一次 save**。
+    """
+    import fnmatch
+
+    def has_magic(token: str) -> bool:
+        # fnmatch 模块没有 has_magic（那是 glob 的），这里自己判
+        return any(c in token for c in "*?[")
+
+    all_names = [p.name for p in ds.work_images()]
+    out: list[str] = []
+    for token in re.split(r"[,，\s]+", names.strip()):
+        if not token:
+            continue
+        rng = re.fullmatch(r"(\d+)\s*[-~]\s*(\d+)", token)
+        if rng and not has_magic(token):
+            lo, hi = int(rng.group(1)), int(rng.group(2))
+            lo, hi = min(lo, hi), max(lo, hi)
+            hits = [n for n in all_names
+                    if (m := re.match(r"(\d+)", n)) and lo <= int(m.group(1)) <= hi]
+            out.extend(hits or [token])
+            continue
+        if has_magic(token):
+            hits = [n for n in all_names if fnmatch.fnmatch(n, token)
+                    or fnmatch.fnmatch(os.path.splitext(n)[0], token)]
+            out.extend(hits or [token])
+            continue
+        out.append(token)
+    seen: set[str] = set()
+    uniq = []
+    for n in out:
+        if n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+def cmd_set_caption(ds, name: str = "", add: str = "", remove: str = "", set_text: str = "",
+                    trigger: str = "", apply: bool = False, names: str = "") -> dict:
+    """增量修 caption —— 不再需要外面写 _trim2.py / _add_vision.py。
 
     三种用法可以叠加：
       --add "hat, sitting"    补标签（照样过 wash 规则：别名/蕴含/排序/词典闸门）
       --remove "gloves"       删标签（并记进 per_image.json：重跑 wash 不会复活它）
       --set "@x, 1girl, …"    整条替换（先按 caption 解析，再走同一条规则链）
+
+    批量：`names` 给 `0001,0002` / `0001-0012` / `0001*`，**一次 load、一次 save**，
+    避免逐张调用把 `per_image.json` 写坏（g4ku 复盘 5.1 #7）。
     """
-    target = state.resolve_name(ds, name)
-    hit, where = state.locate(ds, target)
-    if hit is None:
-        raise SystemExit(f"[fix-caption] 找不到图片：{name}"
-                         f"（图桶 " + "、".join(f"{l}/" for l, _ in ds.bucket_dirs())
-                         + " 与 00_raw/ 都没匹配到）")
+    spec = names.strip() or name.strip()
+    if not spec:
+        raise SystemExit("[fix-caption] 要么给 --name（单张），要么给 --names（批量）")
+    targets = _batch_targets(ds, spec)
+    if not targets:
+        raise SystemExit(f"[fix-caption] --names {spec!r} 没匹配到任何图片"
+                         f"（图桶 " + "、".join(f"{l}/" for l, _ in ds.bucket_dirs()) + "）")
     rules = load_rules(ds)
     trigger = resolve_trigger(ds, trigger)
     td = dicts.load(ds.cfg)
     st = state.load(ds)
+    batch = len(targets) > 1
+    prev_snap = state.latest_snapshot(ds) if apply else None
+    if apply and batch:
+        state.snapshot_captions(ds, label="fix-caption")
+    results: list[dict] = []
+    for one in targets:
+        try:
+            results.append(_set_caption_one(ds, one, add, remove, set_text, trigger,
+                                            rules, td, st, apply, batch))
+        except SystemExit as exc:
+            print(f"  ! 跳过 {one}：{exc}")
+            results.append({"file": one, "error": str(exc), "applied": False})
+    good = [r for r in results if r.get("applied")]
+    if not apply:
+        print("  （dry-run：加 --apply 才写盘）")
+    elif good:
+        st.save()
+        rows = state.caption_diff(ds, prev_snap)
+        if rows:
+            curate.write_csv(ds.pipe_dir / "wash_diff.csv", rows)
+            print("[fix-caption] 与上一版的差异："
+                  + state.diff_line(ds, rows, prev_snap) + "（_pipeline/wash_diff.csv）")
+    if batch:
+        print(f"[fix-caption] 批量：{len(results)} 张，成功 {len(good)}，跳过 {len(results) - len(good)}")
+    return {"files": results, "count": len(results), "written": len(good),
+            "applied": bool(apply and good)}
+
+
+def _set_caption_one(ds, name: str, add: str, remove: str, set_text: str, trigger: str,
+                     rules, td, st, apply: bool, quiet: bool) -> dict:
+    target = state.resolve_name(ds, name)
+    hit, where = state.locate(ds, target)
+    if hit is None:
+        raise SystemExit(f"找不到图片：{name}"
+                         f"（图桶 " + "、".join(f"{l}/" for l, _ in ds.bucket_dirs())
+                         + " 与 00_raw/ 都没匹配到）")
     txt = hit.with_suffix(".txt")
     old = ""
     if txt.exists():
@@ -1345,16 +1482,18 @@ def cmd_set_caption(ds, name: str, add: str = "", remove: str = "", set_text: st
     tags, nlp = parse_caption(old)
     if set_text.strip():
         tags, nlp = parse_caption(set_text)
-        print(f"[fix-caption] {hit.name}：整条替换（{len(tags)} 个标签）")
+        if not quiet:
+            print(f"[fix-caption] {hit.name}：整条替换（{len(tags)} 个标签）")
     drop = [t.strip() for t in re.split(r"[,，]", remove) if t.strip()]
     if drop:
         gone = {normalize_tag(t) for t in drop}
         before = len(tags)
         tags = [t for t in tags if normalize_tag(t) not in gone]
-        print(f"[fix-caption] {hit.name}：删 {before - len(tags)} 个（{', '.join(drop)}）"
-              f" -> 记入人工删除名单，重跑 wash 不会复活")
+        if not quiet:
+            print(f"[fix-caption] {hit.name}：删 {before - len(tags)} 个（{', '.join(drop)}）"
+                  f" -> 记入人工删除名单，重跑 wash 不会复活")
     extra = [t.strip() for t in re.split(r"[,，]", add) if t.strip()]
-    if extra:
+    if extra and not quiet:
         print(f"[fix-caption] {hit.name}：补 {len(extra)} 个（{', '.join(extra)}）")
     rep: dict = {}
     merged = wash_tags(tags + extra, rules, td, trigger, rep)
@@ -1366,11 +1505,10 @@ def cmd_set_caption(ds, name: str, add: str = "", remove: str = "", set_text: st
     if issues:
         print(f"  ! 形态约束：{'|'.join(issues)}")
     if not apply:
-        print("  （dry-run：加 --apply 才写盘）")
         return {"file": hit.name, "before": len(tags), "after": rep.get("tag_count", 0),
                 "issues": len(issues), "applied": False}
-    prev_snap = state.latest_snapshot(ds)
-    state.snapshot_captions(ds, label="fix-caption")
+    if not quiet:
+        state.snapshot_captions(ds, label="fix-caption")
     txt.write_text(line, encoding="utf-8", newline="\n")
     st.record(hit.name, caption=line, caption_source="fix-caption",
               tag_count=rep.get("tag_count", 0), history={"what": "fix-caption"})
@@ -1380,12 +1518,6 @@ def cmd_set_caption(ds, name: str, add: str = "", remove: str = "", set_text: st
         # 补的标签也算"写进去了"：下轮 wash 若发现它不在 caption 里，说明是人又删的
         st.record(hit.name, merged_tags=[t for t in extra if normalize_tag(t) in
                                         {normalize_tag(x) for x in merged}])
-    st.save()
-    rows = state.caption_diff(ds, prev_snap)
-    if rows:
-        curate.write_csv(ds.pipe_dir / "wash_diff.csv", rows)
-        print("[fix-caption] 与上一版的差异："
-              + state.diff_line(ds, rows, prev_snap) + "（_pipeline/wash_diff.csv）")
     return {"file": hit.name, "before": len(tags), "after": rep.get("tag_count", 0),
             "issues": len(issues), "applied": True, "caption": line}
 
@@ -1491,19 +1623,43 @@ def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "",
             "mark_residue": len(mark_residue), "mark_unlabeled": len(plain)}
 
 
-def _online_verify(ds, tags: list[str], batch: int = 120) -> dict:
+def _online_verify(ds, tags: list[str], batch: int = 120, retries: int = 3) -> dict:
+    """在线复核标签是否真实存在。
+
+    真实使用踩到的坑（fanzzz 复盘 §4.3 附近）：`search[name_comma]` 是**逗号分隔**的名单，
+    早先这里用空格拼，danbooru 只把整条当成一个标签名，于是永远查不到 ⇒ 一律返回 0 条，
+    verify 报「在线确认 0/N」，看起来像"这批标签全是假的"。改成 `",".join`。
+
+    另外「请求失败」不等于「标签不存在」：以前 except 里 `continue`，网络一抖就把整批
+    记成未确认。现在失败重试，最终仍失败就记进 `failed_batches`，由调用方打印出来，
+    别让网络问题伪装成数据问题。"""
     s = net.danbooru_session(ds.cfg)
     confirmed: list[str] = []
+    failed_batches: list[tuple[int, str]] = []
     for i in range(0, len(tags), batch):
         chunk = tags[i:i + batch]
-        query = " ".join(lookup_key(t) for t in chunk)
-        try:
-            data = net.get_json(s, "https://danbooru.donmai.us/tags.json",
-                                {"search[name_comma]": query, "limit": batch})
-        except Exception as exc:
-            print(f"  ! online verify batch {i // batch} failed: {exc}")
+        query = ",".join(lookup_key(t) for t in chunk)
+        data = None
+        err = ""
+        for attempt in range(1, max(1, retries) + 1):
+            try:
+                data = net.get_json(s, "https://danbooru.donmai.us/tags.json",
+                                    {"search[name_comma]": query, "limit": batch})
+                break
+            except Exception as exc:
+                err = str(exc)
+                if attempt < retries:
+                    time.sleep(0.8 * attempt)
+        if data is None:
+            failed_batches.append((i // batch, err))
+            print(f"  ! 在线复核第 {i // batch} 批失败（重试 {retries} 次）：{err}")
             continue
-        found = {d["name"].replace("_", " ") for d in data}
-        confirmed.extend(sorted(set(chunk) & found))
-    print(f"[verify] 在线确认 {len(confirmed)}/{len(tags)} 个标签真实存在")
-    return {"confirmed": confirmed}
+        found = {str(d.get("name") or "").replace("_", " ") for d in data}
+        confirmed.extend(sorted({t for t in chunk if t in found}))
+    checked = len(tags) - sum(min(batch, len(tags) - b * batch) for b, _ in failed_batches)
+    tail = ""
+    if failed_batches:
+        tail = (f"（另有 {len(tags) - checked} 个因请求失败未复核，"
+                "不等于它们不存在）")
+    print(f"[verify] 在线确认 {len(confirmed)}/{len(tags)} 个标签真实存在" + tail)
+    return {"confirmed": confirmed, "failed_batches": [b for b, _ in failed_batches]}

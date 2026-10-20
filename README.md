@@ -13,7 +13,7 @@ DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 →
 | agent 预设 `anima-style-lora`（显示名「Anima风格LoRA全流程」） | 带专属 persona 的 agent 组合；`skill-filesystem` 通过 `customSkillDirs` 挂载本包的 `skills/` |
 | 3 个 skill | `anima-style-lora-pipeline`（总纲）/ `-source`（选源下载）/ `-curate`（筛选 + 文字修补 + 视觉复核） |
 | 设置页（浏览器半侧 + 宿主路由 `/anima-lora/api`） | 在 DSH 设置里直接改全部配置项（含凭据），写进 `<home>/.animasl/animasl.config.json`，下次调用即生效 |
-| Python 工具箱 `python/animasl/` | 17 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
+| Python 工具箱 `python/animasl/` | 18 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
 
 ## 安装
 
@@ -67,7 +67,7 @@ npm run test:all      # 上面全部（check:patch + params + client + route + p
 `E:/LoRA_Train/.animasl/venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
 `SKIP` 并返回 0）。
 
-`test/pipeline-offline.py` 是**唯一一条把 17 个阶段串起来跑**的回归：在 `<home>/datasets`
+`test/pipeline-offline.py` 是**唯一一条把 18 个阶段串起来跑**的回归：在 `<home>/datasets`
 下建 `_pipeoff_*` 临时现场（`_` 前缀，`anima_status` 看不见），用真 CLI 走
 init → import（含"跳过非图"与"拒绝 src=数据集根"）→ rename → thumbs（重排之后仍出图）
 → 第二批 import + rename（验证对照表只追加）→ 图桶布局（`clean/` + `watermark/` + 硬链接副本
@@ -163,7 +163,8 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | `fix-caption` | `name`(必填)、`add`/`remove`/`set` 三选一 | 只改点名的那一张 caption（写盘前留快照，写盘后出 `wash_diff.csv`） |
 | `exclude` | `names`、`reason`、`note`；`undo` 按账本搬回原桶、`missing` 事后补账、无参数列清单 | 图 + 同名 txt 移进 `_excluded/<reason>/`，并记进手删账本（重跑 `wash` 不复活） |
 | `verify` | `online`、`sample`、`trigger`、`workSet` | `wash_verify.csv`；§3 形态 + §9 内容闸门（BANNED 残留、否定式、质量词、人数一致性、**冲突族**、水印区与修补状态一致性、图-txt 配对、触发词位置） |
-| `dict-check` | 不给 `tags` 就查现有 caption（只按逗号切，多词标签不会被拆） | 终端输出：存在 / 别名可归一 / `post_count=0`（幻觉标签）/ 词典外 + 形近候选，各带"出现在几张图里" |
+| `dict-check` | 不给 `tags` 就查现有 caption（只按逗号切，多词标签不会被拆） | 终端输出：存在 / 别名可归一 / `post_count=0`（幻觉标签）/ 词典外 + 形近候选或同族高频标签，各带"出现在几张图里" |
+| `synonyms` | `apply`、`refresh`、`limit` | 从 danbooru 拉一份**活跃别名表**（实测 41,423 条 / 42 页）存成 `tag_aliases`；默认 dry-run 只报条数，已有表就跳过（`refresh:true` 才重拉）。拉一次存下来，之后纯离线 |
 | `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution`、`allowOutOfBand`、`keepBackups` | 四件套 + `preflight.txt`；自动发现图桶 + 跨桶按内容指纹去重；四件套内容没变就不重写、备份按「代」清理（留 1 代），`preflight.txt` 是报告、原地刷新不备份 |
 
 **写盘语义按阶段分三类**（传了不支持的参数会在**执行前**报错，错误里列出该阶段支持的参数）：
@@ -173,7 +174,7 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | 写盘是默认行为 | `init`、`thumbs` | **不吃 `apply`**；`init` 靠 `force`/`reset` 控制 |
 | 默认写盘、`dryRun` 反转 | `fetch`、`import` | 预演用 `dryRun:true` |
 | 默认 dry-run、要 `apply:true` | `enrich`、`dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`exclude`、`makecfg` | 不带就只出报告（`enrich` 的 dry-run **仍会发请求**——它就是给你看命中率的） |
-| 只读 | `status`、`review-list`、`verify`、`dict-check` | 没有 `apply` |
+| 只读 | `status`、`review-list`、`verify`、`dict-check` | 没有 `apply`（`synonyms` 的 `apply` 是另一个意思：把拉到的别名表落盘） |
 
 **dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子），数据集用了 `images/` 以外的桶时再多打一行 **图桶**（`图桶: clean 109图/109caption、watermark 33图/33caption`），最后一行是 **占用体检**（见下）。
 
@@ -369,6 +370,18 @@ train_configs/<name>/  <name>_lora_stage1.toml + dataset_<name>.toml + train_<na
   `anima_doctor` 的「ML 依赖」一行报的是 `torch 版本 / CUDA / rfdetr 版本`；缺哪一样它直接给修法。
   也可以什么都不建，把 `ml_python` 指向任意一个 `import torch, rfdetr` 都能过的解释器。
 - 词典：`tags.json` + `danbooru_dataset_general.csv`（合并后 383,196 条）
+- 别名：`animasl synonyms --apply` 从 danbooru 拉**活跃别名表**（实测 41,423 条 / 42 页 / 72s）存成 `tag_aliases`。
+  为什么需要单独一张表：本地 `tags.json` 与 `general.csv` 的 `other_names` 里放的是**日文中文同义写法**
+  （`qipao` 的 other_names = 「チャイナドレス, 旗袍, Cheongsam」），**不含英文别名**。所以
+  `chinese_dress`（→`qipao`）、`sofa`（→`couch`）、`low_angle`（→`from_below`）、`hair_clip`（→`hairclip`）、
+  `gemstone`（→`gem`）这类 danbooru 认可的历史写法，本地词典一条都认不出来。拉一次存下来，之后纯离线。
+- **哪些"词典里没有"其实是对的**（对着 danbooru API 逐条核过）：`bangs`、`cap`、`star`、`night_sky`、
+  `light_blue_hair` 都是 **deprecated 且 `post_count=0`** 的弃用标签——词典不收录它们是正确行为，
+  要写就写同族现行形（`blunt_bangs` 42.9 万帖 / `blue_hair` 120 万帖）。`large_eyes`、`hair_clip`
+  这类 `post_count=0` 但不是 deprecated 的同样不该写。`dict-check` 会把它们分别列进
+  「post_count=0（幻觉标签）」与「词典里没有」，后者在没有形近候选时给出**同族高频标签**
+  （`silver_hair` → `long_hair`/`short_hair`/`black_hair`…，`amber_eyes` → `blue_eyes`/`red_eyes`…），
+  比 `silver_chain` 这种形近噪声有用得多。
 - 下载：danbooru 用设置页的「凭据」分组填用户名 + API key（或 `DANBOORU_LOGIN`/`DANBOORU_API_KEY`）；pawchive/exhentai 需要 cookie，且 **pawchive CDN 必须走代理**（直连被 reset）
 
 跑 `anima_doctor` 可以一次性体检上述每一项（含下面这张表的"凭据配没配"）。

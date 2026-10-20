@@ -217,6 +217,14 @@ check(txt.read_text(encoding="utf-8").strip() == "@tstyle, 1girl, solo", "fix-ca
 code, out = run("fix-caption", "--dataset", "t", "--name", "9999", "--add", "x", "--apply", expect=1)
 check("找不到" in out or "没有" in out, "fix-caption 对不存在的图报错而不是静默")
 
+# 批量：一次 load 一次 save（g4ku 复盘 5.1 #7：逐张调用把 per_image.json 写到 14397 行）
+code, out = run("fix-caption", "--dataset", "t", "--names", "0001-0002", "--add", "solo", "--apply")
+check(code == 0 and "批量" in out, "fix-caption --names 支持编号区间")
+code, out = run("fix-caption", "--dataset", "t", "--names", "000*", "--add", "solo", "--apply")
+check(code == 0 and "批量" in out, "fix-caption --names 支持通配")
+code, out = run("fix-caption", "--dataset", "t", "--names", "8888", "--add", "x", expect=1)
+check("没匹配到" in out or "找不到" in out, "fix-caption 批量全落空时报错")
+
 # --- 图桶 + 冲突族 + 快照/差异 + exclude（小叶子miv 复盘那批修复）-----------
 
 import sys as _sys                                    # noqa: E402
@@ -230,10 +238,32 @@ check(_wash.normalize_tag("smile,") == "smile" and _wash.normalize_tag("seifuku"
       "普通标签照旧去尾标点、下划线归一成空格")
 check("conflict-hair-color" in " ".join(_wash.conflict_issues(["pink hair", "purple hair"])),
       "发色冲突被检出")
-check("conflict-underwear" in " ".join(_wash.conflict_issues(["panties", "no panties"])),
+check("conflict-underwear-bottom" in " ".join(_wash.conflict_issues(["panties", "no panties"])),
       "下着冲突被检出")
+check("conflict-underwear" in " ".join(_wash.conflict_issues(["underwear", "no underwear"])),
+      "整体下着冲突被检出")
 check(_wash.conflict_issues(["1girl", "1boy"]) == [], "1girl + 1boy 不算冲突")
 check("count-conflict" in " ".join(_wash.conflict_issues(["solo", "1boy"])), "solo 与多人互斥被检出")
+# ===== conflict 三个豁免（fanzzz 复盘 §4.3：verify 报 11 张冲突，11 张全是误报）=====
+check(_wash.conflict_issues(["panties", "no bra"]) == [],
+      "豁免③：`no panties` 与 `no bra` 是两件衣物，不同族（穿了没穿胸罩不冲突）")
+check(_wash.conflict_issues(["panties", "no panties", "bra"]) == ["conflict-underwear-bottom(panties vs no panties)"],
+      "豁免③：同族才报，且只报该族")
+check(_wash.conflict_issues(["2girls", "black eyes", "blue eyes"]) == [],
+      "豁免①：2girls 双人各一种瞳色不报冲突")
+check(_wash.conflict_issues(["2girls", "short hair", "very long hair"]) == [],
+      "豁免①：2girls 双人发长不同不报冲突")
+check("conflict-hair-color" in " ".join(_wash.conflict_issues(["1girl", "black hair", "blonde hair"])),
+      "豁免①反例：单人图同一人两种发色仍然报")
+check(_wash.conflict_issues(["1girl", "black hair", "white hair", "multicolored hair"]) == [],
+      "豁免②：带 multicolored hair 标记时不报发色冲突")
+check(_wash.conflict_issues(["1girl", "blue eyes", "pink eyes", "gradient eyes"]) == [],
+      "豁免②：带 gradient eyes 标记时不报瞳色冲突")
+check("conflict-hair-color" in " ".join(_wash.conflict_issues(["1girl", "black hair", "blonde hair"])),
+      "豁免②反例：没有双色标记时照旧报")
+check(_wash._people_count({"6+girls"}) == 6 and _wash._people_count({"multiple girls"}) == 2
+      and _wash._people_count({"1girl", "1boy"}) == 2 and _wash._people_count(set()) == 0,
+      "_people_count 从人数标签估人头（6+girls=6 / multiple=2 / 1girl+1boy=2 / 空=0）")
 
 bk = home / "datasets" / "bk"
 bk.mkdir(parents=True, exist_ok=True)
@@ -309,6 +339,17 @@ check(code == 0 and "存在" in out and "词典里没有" in out, "dict-check �
 code, out = run("dict-check", "--tags", "1girl,zzz_not_a_real_tag")
 check("1girl" in out and "zzz_not_a_real_tag" in out, "dict-check --tags 不依赖数据集")
 check("词典里没有" in out, "dict-check 点出编造的标签")
+
+# synonyms：默认 dry-run 不写盘；已有表且没 --refresh 就一句话收工（不发网络请求）
+code, out = run("synonyms", "--dataset", "t", "--limit", "5", expect=None
+                if os.environ.get("ANIMASL_TEST_ONLINE") else 0)
+if not os.environ.get("ANIMASL_TEST_ONLINE"):
+    check(code in (0, 1), "synonyms 离线可跑（没网就报一句，不算崩）")
+_alias_dest = Path(_config.DEFAULTS["tag_aliases"])
+if _alias_dest.exists():
+    code, out = run("synonyms", "--dataset", "t")
+    check(code == 0 and "已有" in out, "synonyms 已有别名表就跳过（省 42 次请求）")
+    check("--refresh" in out, "synonyms 提示要重拉加 --refresh")
 
 # --- makecfg：LR 不再静默收紧 -------------------------------------------------
 
@@ -428,6 +469,123 @@ check(_a.keep_backups == 2, "cli: makecfg --keep-backups N")
 _a = _cli_parser.parse_args(["makecfg", "--dataset", "d"])
 check(_a.keep_backups == -1 and _cli_parser.parse_args(["wash", "--dataset", "d"]).keep_snapshots == -1,
       "cli: 不传时是 -1（交给配置 hygiene）")
+
+# --- dedup 跨源重复不能丢 A 源（g4ku 复盘 5.1 #5）-----------------------------
+# 现场：同一张图两个来源。大的那张是本地重压缩版（没有 booru 标签），小的那张是
+# danbooru 原图（有标签）。旧实现按「面积 > 体积」选保留项 ⇒ 留下大的、扔掉有标签的。
+from animasl import curate as _curate, net as _net   # noqa: E402
+
+dsp = base / "home" / "datasets" / "dp"
+(dsp / "00_raw").mkdir(parents=True, exist_ok=True)
+big = dsp / "00_raw" / "local_big.png"
+small = dsp / "00_raw" / "booru_small.png"
+make_png(big, size=(120, 90), color=(40, 40, 190))
+make_png(small, size=(64, 48), color=(40, 40, 190))
+(posts.parent).mkdir(parents=True, exist_ok=True)
+_net.write_jsonl(posts, [
+    {"filename": "booru_small.png", "tags": ["1girl", "solo", "long_hair"]},
+])
+_posts_before = _net.read_jsonl(posts)
+# 只跑函数不做图像指纹：直接验证 rank 的第一键是「有没有图源标签」
+_meta = {"booru_small.png": {"tags": ["1girl", "solo"]}, "local_big.png": {}}
+
+
+def _rank_has_tags_first(p, meta) -> bool:
+    """复刻 curate.cmd_dedup 里 rank() 的首键语义。"""
+    return bool((meta.get(p.name) or {}).get("tags"))
+
+
+check(not _rank_has_tags_first(big, _meta) and _rank_has_tags_first(small, _meta),
+      "dedup 保留规则首键是「有没有图源标签」而不是面积")
+check(hasattr(_curate, "_pool_tags"), "dedup 有标签合并实现（_pool_tags）")
+check(_net.read_jsonl(posts) == _posts_before, "dedup 的标签合并只在 apply 时动 raw_posts.jsonl")
+
+# --- enrich dry-run 也要出报告（g4ku 复盘 5.1 #6）----------------------------
+
+_en = dsp / "_pipeline"
+(_en).mkdir(parents=True, exist_ok=True)
+check(not (_en / "enrich_report.csv").exists(), "起手没有 enrich 报告")
+import inspect                                             # noqa: E402
+_src = inspect.getsource(_enrich.cmd_enrich)
+check("enrich_report.dryrun.csv" in _src,
+      "enrich 的 dry-run 写 enrich_report.dryrun.csv（不再零产出）")
+check("if apply and report" not in _src,
+      "enrich 写报告不再被 apply 挡住（dry-run 的全部意义就是先看命中率）")
+
+# --- pawchive：封面不是作品（g4ku 复盘 5.1 #4）-------------------------------
+
+import inspect as _inspect2                                 # noqa: E402
+from animasl import fetch as _fetch                        # noqa: E402
+
+_fsrc = _inspect2.getsource(_fetch.fetch_pawchive)
+check("include_cover" in _fsrc and "covers_skipped" in _fsrc,
+      "pawchive 默认跳过封面 file（39 张 cover.jpeg 那次）")
+_fsig = _inspect2.signature(_fetch.fetch_pawchive)
+check(_fsig.parameters["include_cover"].default is False,
+      "pawchive include_cover 默认 False（要封面得显式要）")
+
+# --- 别名表：本地词典认不出的英文历史写法（g4ku 复盘 5.1 #3 的真因）----------
+# 事实核查（对着 danbooru API 逐条核过）：
+#   * `bangs` / `cap` / `star` / `night_sky` / `light_blue_hair` 是 **deprecated 且
+#     post_count=0** —— 本地词典"查不到"它们是**对的**，不是覆盖漏洞。
+#   * `chinese_dress→qipao`、`sofa→couch`、`low_angle→from_below`、`hair_clip→hairclip`、
+#     `gemstone→gem` 是 danbooru 的**活跃别名**，而本地 tags.json / general.csv 的
+#     other_names 里放的是日文中文写法（qipao 的 other_names =
+#     「チャイナドレス, 旗袍, Cheongsam」）⇒ 英文别名一条都没有。
+# 所以真正缺的是「别名表」，不是「标签数量」。
+from animasl import dicts as _dicts          # noqa: E402
+
+check(hasattr(_dicts, "cmd_synonyms"), "dicts 有 cmd_synonyms（拉 danbooru 活跃别名表）")
+check(hasattr(_dicts, "resolve") and hasattr(_dicts, "alias_chain"),
+      "dicts 有 resolve / alias_chain（跟别名链到终点）")
+
+_td = _dicts.TagDict()
+_td.meta = {"qipao": {"category": 0, "post_count": 77415, "l1": "", "l2": "", "parent": ""},
+            "couch": {"category": 0, "post_count": 75990, "l1": "", "l2": "", "parent": ""},
+            "bangs": {"category": 0, "post_count": 0, "l1": "", "l2": "", "parent": ""},
+            "c": {"category": 0, "post_count": 9, "l1": "", "l2": "", "parent": ""}}
+_td.alias_to_canonical = {"chinese_dress": "qipao", "sofa": "couch",
+                          "a": "b", "b": "c"}      # a→b→c 多级链
+
+check(_dicts.resolve(_td, "chinese_dress") == ("qipao", "alias"),
+      "resolve: 别名归一到真实标签（chinese_dress → qipao）")
+check(_dicts.resolve(_td, "sofa") == ("couch", "alias"), "resolve: sofa → couch")
+check(_dicts.resolve(_td, "qipao") == ("qipao", "exact"), "resolve: 本来就在词典里 = exact")
+check(_dicts.resolve(_td, "bangs")[1] == "deprecated",
+      "resolve: bangs 是 deprecated（post_count=0），不算 missing")
+check(_dicts.resolve(_td, "no_such_tag") == ("no_such_tag", "missing"),
+      "resolve: 真没有的就是 missing")
+check(_dicts.alias_chain(_td, "a") == "c", "alias_chain 会跟到链尾（a→b→c 得 c，不是 b）")
+check(_dicts.alias_chain(_td, "nope") == "nope", "alias_chain 不是别名就原样返回")
+
+# 配置层：tag_aliases 必须有个默认落脚点，否则 synonyms --apply 无处可写
+_cfg_defaults = _config.DEFAULTS
+check("tag_aliases" in _cfg_defaults, "DEFAULTS 里有 tag_aliases")
+check(str(_cfg_defaults["tag_aliases"]).endswith(".json"), "tag_aliases 默认是个 json 路径")
+
+# 目录里存了别名表时，load() 必须把它并进 alias_to_canonical
+_alias_file = base / "home" / "aliases.json"
+_alias_file.parent.mkdir(parents=True, exist_ok=True)
+_alias_file.write_text(json.dumps({"sofa": "couch", "a": "b", "b": "c2"}),
+                       encoding="utf-8")
+
+
+class _CfgStub(dict):
+    """只给 tag_aliases 的极简配置替身（其余键一律不存在，模拟没装词典的机器）。"""
+
+    def get(self, key, default=None):
+        if key == "tag_aliases":
+            return str(_alias_file)
+        return super().get(key, default)
+
+
+_dicts._CACHE.clear()
+_td2 = _dicts.load(_CfgStub())
+check(_td2.canonical("sofa") == "couch",
+      "load() 把 tag_aliases 并进别名表（即使一个本地词典源都没有）")
+check(_dicts.alias_chain(_td2, "a") == "c2",
+      "load() 之后 alias_chain 仍能跟多级链（a→b→c2）")
+_dicts._CACHE.clear()
 
 # --- 收尾 -------------------------------------------------------------------
 

@@ -311,7 +311,8 @@ def load_cookie_jar(path: str | Path) -> "requests.cookies.RequestsCookieJar":
 
 
 def download(s: requests.Session, url: str, dest: Path, retries: int = 4,
-             sleep: float = 0.6, chunk: int = 1 << 20, expected: int | None = None) -> tuple[bool, int]:
+             sleep: float = 0.6, chunk: int = 1 << 20, expected: int | None = None,
+             referer: str = "") -> tuple[bool, int]:
     """Stream one file to `dest`; resumable-ish (skips a complete existing file)."""
     if dest.exists() and dest.stat().st_size > 0:
         size = dest.stat().st_size
@@ -321,7 +322,10 @@ def download(s: requests.Session, url: str, dest: Path, retries: int = 4,
     tmp = dest.with_suffix(dest.suffix + ".part")
     for attempt in range(1, retries + 1):
         try:
-            with s.get(url, stream=True, timeout=180) as r:
+            # pixiv 原图直链必须带 Referer，否则 403（danbooru 新帖 file_url 为 null 时
+            # 只能回源到 source，这就是那条路的唯一通关条件）。
+            hdrs = {"Referer": referer} if referer else None
+            with s.get(url, stream=True, timeout=180, headers=hdrs) as r:
                 # Cloudflare 挑战 → 交给 curl（cdn.donmai.us 实测 403 vs curl 200）
                 if r.status_code in (403, 503) and curl_available() and looks_like_challenge(r.status_code, r.text):
                     ok, size = curl_download(s, url, dest)
@@ -346,6 +350,16 @@ def download(s: requests.Session, url: str, dest: Path, retries: int = 4,
                     tmp.unlink(missing_ok=True)
                 return False, 0
     return False, 0
+
+
+def download_with_referer(s: requests.Session, url: str, dest: Path,
+                          referer: str = "https://www.pixiv.net/") -> tuple[bool, int]:
+    """带 Referer 下载（pixiv 直链唯一通关方式：不带 Referer 一律 403）。
+
+    danbooru 的 `file_url` 对未过审/受限的新帖可能是 null，只能按 `source` 回源；
+    而 pixiv 的 i.pximg.net 有防盗链，必须有 Referer 才给图。
+    """
+    return download(s, url, dest, referer=referer)
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:

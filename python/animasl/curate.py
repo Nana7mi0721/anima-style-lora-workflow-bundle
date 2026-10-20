@@ -486,19 +486,35 @@ def cmd_dedup(ds, phash_distance: int = 4, ssim_threshold: float = 0.995,
         groups.setdefault(find(k), []).append(k)
     near_groups = [sorted(v) for v in groups.values() if len(v) > 1]
 
-    # 3) keep the largest/latest file of each duplicate group
-    def rank(p: Path) -> tuple[int, float]:
+    # 3) keep one file of each duplicate group
+    #    真实使用的坑（g4ku 复盘 5.1 #5）：一组跨源重复里，最大的往往是本地重压缩版，
+    #    而**有 booru 标签的**是另一张小的。按「面积 > 体积」选会把标签一起扔掉——
+    #    那次 10 组里 9 组丢了 A 源，只能事后手写脚本搬回来救回 6 张。
+    #    所以排序第一键是「这文件有没有图源标签」，没标签的大图不能盖掉有标签的小图。
+    def has_tags(p: Path) -> bool:
+        return bool((meta.get(p.name) or {}).get("tags"))
+
+    def rank(p: Path) -> tuple[int, int, float]:
         m = meta.get(p.name, {})
-        return (int(m.get("width") or 0) * int(m.get("height") or 0), p.stat().st_size)
+        return (1 if has_tags(p) else 0,
+                int(m.get("width") or 0) * int(m.get("height") or 0), p.stat().st_size)
 
     rows: list[dict] = []
     dropped: list[Path] = []
     gid = 0
+    merge_plan: dict[str, set[str]] = {}          # keep.name -> 要并进去的完整标签池
 
     def emit(group: list[Path], kind: str) -> None:
         nonlocal gid
         gid += 1
         keep = max(group, key=rank)
+        base = set((meta.get(keep.name) or {}).get("tags") or [])
+        # 被丢掉那几张的图源标签并到留下来的那张名下，A 源不随文件一起消失
+        pool = set(base)
+        for p in group:
+            pool |= set((meta.get(p.name) or {}).get("tags") or [])
+        if pool - base:
+            merge_plan[keep.name] = pool
         for p in group:
             if p is keep:
                 continue
@@ -509,6 +525,7 @@ def cmd_dedup(ds, phash_distance: int = 4, ssim_threshold: float = 0.995,
                 "kept_size": keep.stat().st_size, "ssim": score,
                 "phash_distance": _hamming(fps[keep][0], fps[p][0]) if kind == "near" else 0,
                 "post_id": meta.get(p.name, {}).get("post_id", ""),
+                "tags_kept": len(base), "tags_pooled": len(pool),
             })
             dropped.append(p)
 
@@ -519,6 +536,17 @@ def cmd_dedup(ds, phash_distance: int = 4, ssim_threshold: float = 0.995,
     rows.extend(similar)
 
     write_csv(ds.pipe_dir / "dedup_report.csv", rows)
+
+    # 合并标签**只在 apply 时**做（dry-run 不动 raw_posts.jsonl），
+    # 且必须在 move_excluded 之前 —— 文件一旦移走，被剔除那几张的 filename 就对不上行了。
+    pooled = 0
+    if apply and merge_plan:
+        pooled = _pool_tags(ds, merge_plan)
+        print(f"[dedup] 合并标签：{len(merge_plan)} 组保留项并入了被剔除项的图源标签"
+              f"（{pooled} 条新增 —— 不做这步，跨源重复必然丢 A 源）")
+    elif merge_plan:
+        print(f"[dedup] （dry-run）有 {len(merge_plan)} 组会合并图源标签，"
+              f"加 --apply 才写进 raw_posts.jsonl")
 
     if apply and dropped:
         move_excluded(ds, [(p, "duplicates",
@@ -536,7 +564,37 @@ def cmd_dedup(ds, phash_distance: int = 4, ssim_threshold: float = 0.995,
               f"{'没有需要剔除的' if apply else '未执行删除，加 --apply 才会移动文件'}）")
     return {"groups": len(exact_groups) + len(near_groups), "dropped": len(dropped),
             "exact_groups": len(exact_groups), "near_groups": len(near_groups),
-            "similar_pairs": len(similar), "pairs_compared": pairs}
+            "similar_pairs": len(similar), "pairs_compared": pairs,
+            "tag_merges": len(merge_plan), "tags_pooled": pooled}
+
+
+def _pool_tags(ds, merge_plan: dict[str, set[str]]) -> int:
+    """把 merge_plan 写回 raw_posts.jsonl：保留项的 `tags` 换成并集。
+
+    这件事必须在文件被移走之前做，否则被剔除那张的 `filename` 就再也对不上了。
+    直接改 jsonl 里现存的保留项行；找不到行就新写一条最小行（wash 只读 `tags`）。
+    """
+    if not merge_plan:
+        return 0
+    path = ds.pipe_dir / "raw_posts.jsonl"
+    rows = net.read_jsonl(path)
+    added = 0
+    seen: set[str] = set()
+    for row in rows:
+        name = row.get("filename")
+        if name in merge_plan:
+            seen.add(name)
+            old = set(row.get("tags") or [])
+            new = sorted(old | merge_plan[name])
+            added += len(set(new) - old)
+            row["tags"] = new
+    for name, pool in merge_plan.items():
+        if name in seen:
+            continue
+        rows.append({"filename": name, "tags": sorted(pool), "source": "dedup-merge"})
+        added += len(pool)
+    net.write_jsonl(path, rows)
+    return added
 
 
 

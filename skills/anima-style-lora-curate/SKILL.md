@@ -1,6 +1,6 @@
 ---
 name: anima-style-lora-curate
-description: Anima 风格 LoRA 训练集的筛选与清理指南：导入素材的 src 红线、md5/pHash/SSIM 三级去重阈值、"低质量/过老/草图/非完整制作"的判定规则与视觉复核协议、图片文字与拟声词的检测（RF-DETR-Seg）与修补（LaMa-manga）流程、koharu GUI 半自动回退、单张改 caption（fix-caption）与查标签是否真实存在（dict-check）、剔除清单的写法。用户要求"筛选数据集/去重/删掉低质量或草图/去掉图里的文字/清理训练集/改某张图的标签/查这个标签有没有"时使用。
+description: Anima 风格 LoRA 训练集的筛选与清理指南：导入素材的 src 红线、md5/pHash/SSIM 三级去重阈值、"低质量/过老/草图/非完整制作"的判定规则与视觉复核协议、图片文字与拟声词的检测（RF-DETR-Seg）与修补（LaMa-manga）流程、koharu GUI 半自动回退、单张/批量改 caption（fix-caption）与查标签是否真实存在（dict-check、synonyms 别名表）、剔除清单的写法。用户要求"筛选数据集/去重/删掉低质量或草图/去掉图里的文字/清理训练集/改某张图的标签/查这个标签有没有"时使用。
 ---
 
 # SKILL：数据集筛选与清理
@@ -150,7 +150,17 @@ anima_stage(stage:"dict-check", dataset:"X")                 # 检查现有 capt
 anima_stage(stage:"dict-check", tags:"kimono, obi, wide sleeves")   # 查你打算写的几个词（不用 dataset）
 ```
 
-输出分四类：`✓ 存在(名字/类别/出现帖数)`、`↪ 别名可归一`（词典里没有这个写法，但洗标引擎的别名表会把它换成现行形，照写没问题）、`! post_count=0`（danbooru 上**没有这张图** ⇒ 按指南 §7.7 属幻觉标签，**禁止写**）、`! 词典里没有`（拼错或已不是现行形，会给形近候选；多词标签被拆开时会直说"整条不存在，但每个词单独存在"）。从 `--dataset` 收集时每个问题标签还会带上"出现在几张图里"，最普遍的问题排在最前。
+输出分四类：`✓ 存在(名字/类别/出现帖数)`、`↪ 别名可归一`（词典里没有这个写法，但别名表会把它换成现行形，照写没问题）、`! post_count=0`（danbooru 上**没有这张图** ⇒ 按指南 §7.7 属幻觉标签，**禁止写**）、`! 词典里没有`（拼错或已不是现行形）。从 `--dataset` 收集时每个问题标签还会带上"出现在几张图里"，最普遍的问题排在最前。
+
+**先跑一次 `synonyms`，否则「别名可归一」这一整类都是空的**：
+
+```
+anima_stage(stage:"synonyms", apply:true)     # 拉 41k 条 danbooru 活跃别名，存成 tag_aliases（一次即可）
+```
+
+本地 `tags.json` / `danbooru_dataset_general.csv` 的 `other_names` 里放的是**日文中文同义写法**（`qipao` 的 other_names = 「チャイナドレス, 旗袍, Cheongsam」），**一条英文别名都没有**。所以 `chinese_dress`（→`qipao`）、`sofa`（→`couch`）、`low_angle`（→`from_below`）、`hair_clip`（→`hairclip`）、`gemstone`（→`gem`）这些 danbooru 认可的历史写法，不先拉表就一律被报成「词典里没有」，agent 只能猜着改。
+
+**反过来的坑**：`bangs` / `cap` / `star` / `night_sky` / `light_blue_hair` 是 **deprecated 且 `post_count=0`** 的弃用标签（对着 danbooru API 核过），词典不收录**是对的**，要写就写同族现行形（`blunt_bangs`、`blue_hair`）。`dict-check` 在没有形近候选时会给出**同族高频标签**（`silver_hair` → `long_hair`/`short_hair`/`black_hair`…，`amber_eyes` → `blue_eyes`/`red_eyes`…），这比 `silver_chain` 那种形近噪声有用；候选里 `posts` 太少的（<5000）不再显示。
 
 实测过的那三条（用户问过）：`see through` → 归一成 **`transparent`**（danbooru 把 see-through 并进了它，词典里只剩 `see-through_hat` 这类派生）；`fate` → 归一成 **`fate (series)`**，随后被"IP 系列名永不添加"整类丢掉（正解：IP 根本不该写）；`erect nipples` → **不存在这种标签**，归一成 `nipples` 保留可见特征。**注意 `--tags` 只按逗号切**，多词标签请照 caption 的空格形整条写（`amiya (arknights)` 而不是 `amiya`+`(arknights)`）。
 

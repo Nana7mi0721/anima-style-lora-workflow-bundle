@@ -67,6 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--limit", type=int, default=0)
     sp.add_argument("--cookies", default="", help="cookies.txt（Netscape 格式）")
     sp.add_argument("--title-filter", default="", help="pawchive：标题子串过滤")
+    sp.add_argument("--include-cover", action="store_true",
+                    help="pawchive：连封面 file（cover.jpeg，不是作品）一起抓；默认跳过")
     sp.add_argument("--dry-run", action="store_true")
 
     sp = add("import", "把本地文件/压缩包导入 00_raw")
@@ -153,8 +155,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--trigger", default="", help="覆盖触发词（默认取 manifest.trigger）")
     _apply(sp)
 
-    sp = add("fix-caption", "增量修一张图的 caption（补/删/整条替换，不用外面写脚本）")
-    sp.add_argument("--name", required=True, help="图片名或编号（0001 / 0001.jpg / 旧文件名都行）")
+    sp = add("fix-caption", "增量修 caption（补/删/整条替换）；单张 --name，批量 --names")
+    sp.add_argument("--name", default="", help="单张：图片名或编号（0001 / 0001.jpg / 旧文件名）")
+    sp.add_argument("--names", default="",
+                    help="批量：0001,0002 / 0001-0012 / 0001*（一次 load 一次 save）")
     sp.add_argument("--add", default="", help="补标签，逗号分隔；照样过 wash 规则")
     sp.add_argument("--remove", default="", help="删标签，逗号分隔；记入人工删除名单，重跑 wash 不复活")
     sp.add_argument("--set", default="", help="整条替换成这段 caption")
@@ -181,6 +185,13 @@ def build_parser() -> argparse.ArgumentParser:
              required=False)
     sp.add_argument("--tags", default="", help="逗号或空格分隔的标签；省略则读数据集 caption 里的全部标签")
     sp.add_argument("--limit", type=int, default=0, help="最多检查多少个不同的标签")
+
+    sp = add("synonyms", "从 danbooru 拉一份活跃别名表（chinese_dress→qipao 这类），"
+                         "让 dict-check / wash 认得出非规范写法", required=False)
+    sp.add_argument("--apply", action="store_true",
+                    help="落盘到配置里的 tag_aliases（默认 dry-run 只报能拉到多少条）")
+    sp.add_argument("--refresh", action="store_true", help="已有别名表也重拉")
+    sp.add_argument("--limit", type=int, default=0, help="最多拉多少条（调试用）")
 
     sp = add("makecfg", "生成训练配置三件套")
     sp.add_argument("--name", default="")
@@ -250,7 +261,39 @@ def _near_tags(td, tag: str, cache: dict, limit: int = 3) -> list[str]:
     if not pool:
         return []
     scored = sorted(pool, key=lambda n: abs(len(n) - len(key)))[:80]
-    return difflib.get_close_matches(key, scored, n=limit, cutoff=0.6)
+    hits = difflib.get_close_matches(key, scored, n=limit * 3, cutoff=0.6)
+    # 只留下"确实有人用"的候选：`amber_t(22 posts)` / `sparf(16)` 这种形近噪声
+    # 会把真正有用的同族提示挤掉，对判断毫无帮助。没有像样的候选就返回空，
+    # 让调用方改走同族提示（`*_hair` 里高频的前几个）——那才是能直接改对的东西。
+    return [h for h in hits if td.posts(h) >= 5_000][:limit]
+
+
+_FAMILY_SUFFIXES = ("_hair", "_eyes", "_legwear", "_thighhighs", "_dress", "_uniform",
+                    "_background", "_ornament", "_ribbon", "_skirt", "_swimsuit")
+
+
+def _family_hint(td, tag: str, cache: dict, limit: int = 5) -> tuple[str, list[str]]:
+    """`silver_hair` 这类"色名编错了"的标签，前缀桶找不到答案 —— 按同族高频词给路子。
+
+    真实场景：模型写 `silver_hair`，danbooru 上根本没有这个色名（它有 white_hair /
+    grey_hair）。`difflib` 拿 silver 去比 white 永远不中，但告诉 agent
+    「同族 `*_hair` 里高频的是 white_hair / grey_hair …」它立刻就能改对。
+    """
+    key = wash.lookup_key(tag)
+    for suf in _FAMILY_SUFFIXES:
+        if not key.endswith(suf) or len(key) <= len(suf):
+            continue
+        bucket = cache.get(suf)
+        if bucket is None:
+            bucket = sorted(
+                (n for n in td.meta if n.endswith(suf) and td.posts(n) > 50_000),
+                key=lambda n: -td.posts(n))[:400]
+            cache[suf] = bucket
+        head = key[: -len(suf)].split("_")[-1] if "_" in key[: -len(suf)] else key[: -len(suf)]
+        # 同族里"修饰词跟它沾边"的优先（white/grey 之于 silver 是语义替换，只能靠 agent 判断）
+        near = [n for n in bucket if head[:3] in n]
+        return suf, (near[:limit] or bucket[:limit])
+    return "", []
 
 
 def _split_caption_tags(text: str) -> list[str]:
@@ -317,7 +360,15 @@ def _dict_check(cfg, tags: str, limit: int = 0, ds=None) -> int:
             elif raw_tag in drops:
                 aliasable.append((raw_tag, "会被 drop_exact 丢弃"))
             else:
-                missing.append(raw_tag)
+                # danbooru 官方别名表（`animasl synonyms` 拉的 tag_aliases）：
+                # 这是英文历史写法唯一的归一通路，本地 csv 的 other_names 里没有。
+                canon, why = dicts.resolve(td, key)
+                if why == "alias":
+                    aliasable.append((raw_tag, f"{canon}（danbooru 别名）"))
+                elif why == "deprecated":
+                    zombie.append(raw_tag)
+                else:
+                    missing.append(raw_tag)
         elif int(rec.get("post_count") or 0) <= 0:
             zombie.append(raw_tag)
         else:
@@ -351,8 +402,12 @@ def _dict_check(cfg, tags: str, limit: int = 0, ds=None) -> int:
                 line += "最接近：" + "、".join(
                     f"{c}({td.posts(c):,})" if td.posts(c) else c for c in cands)
             else:
+                suf, fam = _family_hint(td, name, near_cache)
                 words = [w for w in name.split() if td.meta.get(wash.lookup_key(w))]
-                if len(words) >= 2:
+                if fam:
+                    line += f"同族 {suf} 里的高频真实标签：" + "、".join(
+                        f"{c}({td.posts(c):,})" for c in fam)
+                elif len(words) >= 2:
                     line += f"整条不存在（但 {'、'.join(words)} 单独存在 —— 像多词标签被拆开了）"
                 else:
                     line += "词典里找不到形近项 —— 确认拼写，或先按画面事实换一个真实标签"
@@ -452,6 +507,12 @@ def main(argv: list[str] | None = None) -> int:
         cfg = cfgmod.Config.load(home=getattr(args, "home", None))
         return _dict_check(cfg, args.tags, getattr(args, "limit", 0), None)
 
+    if cmd == "synonyms":
+        cfg = cfgmod.Config.load(home=getattr(args, "home", None))
+        return dicts.cmd_synonyms(cfg, apply=bool(getattr(args, "apply", False)),
+                                  refresh=bool(getattr(args, "refresh", False)),
+                                  limit=int(getattr(args, "limit", 0) or 0))
+
     ds = _ds(args)
     ds.ensure_dirs()
 
@@ -544,7 +605,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.source == "pawchive":
             res = fetch.fetch_pawchive(cfg, ds, args.creator, service=args.service, limit=args.limit,
                                        dry_run=args.dry_run, cookies_file=args.cookies,
-                                       title_filter=args.title_filter)
+                                       title_filter=args.title_filter,
+                                       include_cover=args.include_cover)
         else:
             res = fetch.fetch_exhentai(cfg, ds, args.gallery, limit=args.limit,
                                        dry_run=args.dry_run, cookies_file=args.cookies)
@@ -642,7 +704,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "fix-caption":
         wash.cmd_set_caption(ds, args.name, add=args.add, remove=args.remove,
-                             set_text=args.set, trigger=args.trigger, apply=args.apply)
+                             set_text=args.set, trigger=args.trigger, apply=args.apply,
+                             names=args.names)
         _mark(ds, "fix-caption", _applied(args))
         return 0
 

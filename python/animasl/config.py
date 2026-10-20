@@ -106,6 +106,10 @@ DEFAULTS: dict[str, Any] = {
     "danbooru_general": "E:/LoRA_Train/BooruDatasetTagManagerPlus/Data/danbooru_dataset_general.csv",
     "danbooru_classified": "E:/LoRA_Train/anima_lora/models/danbooru_tags_classified.csv",
     "character_dict": "E:/LoRA_Train/BooruDatasetTagManagerPlus/Data/danbooru_character_tags.csv",
+    # 在线拉下来的 danbooru 活跃别名表（`animasl synonyms --apply` 写这里）。
+    # 本地 tags.json / general.csv 的 other_names 是日文中文同义写法，**不含英文别名**，
+    # 所以 chinese_dress→qipao / amber_eyes→yellow_eyes 这类只有这张表认得。
+    "tag_aliases": "E:/LoRA_Train/BooruDatasetTagManagerPlus/Data/danbooru_tag_aliases.json",
     # network
     # 直连优先；7897 是本机实测可用的 mixed 端口（pawchive CDN 直连会被 reset）
     "proxy_candidates": ["", "http://127.0.0.1:7897", "http://127.0.0.1:7890",

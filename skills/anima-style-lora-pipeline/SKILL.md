@@ -57,7 +57,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 ### 空间与冗余：跑批会不会堆垃圾
 
-**账本与报告几乎不长**：`per_image.json` 约 2.6KB/图（`history` 每张只留最近 30 次）、`rename_map.csv` 约 100B/图、各 `*_report.csv` 一次跑批原地覆盖。所以 142 张的数据集把 15 个阶段来回跑十几遍，`_pipeline/` 里的账本加起来仍是几百 KB。
+**账本与报告几乎不长**：`per_image.json` 约 2.6KB/图（`history` 每张只留最近 30 次）、`rename_map.csv` 约 100B/图、各 `*_report.csv` 一次跑批原地覆盖。所以 142 张的数据集把 18 个阶段来回跑十几遍，`_pipeline/` 里的账本加起来仍是几百 KB。
 
 **真正占空间的是三类有意的副本**（都用"能不能删"来权衡）：
 
@@ -83,7 +83,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 ## §2 阶段表与 I/O 契约
 
-**17 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
+**18 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
 
 | 阶段 | 工具调用 | 输入 | 产出 | 重跑会覆盖什么 |
 |---|---|---|---|---|
@@ -102,7 +102,8 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | fix-caption | `anima_stage(stage:"fix-caption", dataset:"X", name:"0007", add:"…", apply:true)` | `images/<stem>.txt` | 改好的 caption | **只动你点名的那一张**：`add` 补标签 / `remove` 删标签（并记进人工删除名单）/ `set` 整条替换，都要再过一遍洗标 + 形态校验 |
 | exclude | `anima_stage(stage:"exclude", dataset:"X", names:"0007,0012", reason:"user", apply:true)` | 图桶里的图 | 图+同名 txt 移到 `_excluded/<reason>/` + user_deleted.json | **淘汰专用**：`undo:true` 按账本搬回**原来的桶**、`missing:true` 把"账本里有、现在不在图桶里"的记成人工删除（事后补账）、无参数则列清单。别直接删文件 |
 | verify | `anima_stage(stage:"verify", dataset:"X")` / `online:true` | 图桶里的 `*.txt` | wash_verify.csv | 覆盖报告（**只读，不写 caption**，也没有 apply）。查形态 + 内容闸门 + **冲突族** + **水印区与修补状态一致性**；`sample:N` 等距抽查；`trigger:"@yyy"` 可覆盖 |
-| dict-check | `anima_stage(stage:"dict-check", dataset:"X")` / `tags:"a, b"` | caption 或显式标签 | 终端输出（不写盘） | — |
+| dict-check | `anima_stage(stage:"dict-check", dataset:"X")` / `tags:"a, b"` | caption 或显式标签 | 终端输出（不写盘） | 不存在时给**形近候选**或**同族高频标签**；被 danbooru 别名表能归一的会注明（`chinese_dress → qipao`） |
+| synonyms | `anima_stage(stage:"synonyms", apply:true)` | —（走网络） | `tag_aliases` 那份 json（41k 条，落盘一次） | 拉 danbooru **活跃别名表**；默认 dry-run 只报条数，已有表就跳过（`refresh:true` 重拉）。**新机器/首次做打标前跑一次**，之后 `dict-check` 与 `wash` 就认得出 `chinese_dress`/`sofa`/`low_angle` 这类英文历史写法 |
 | makecfg | `anima_stage(stage:"makecfg", dataset:"X", kind:"style", trigger:"@xxx", subdirs:"before,latest,present")` | 图桶 + manifest | `train_configs/X/` 四件套 + **preflight.txt**（报告） | 覆盖已有配置（旧文件先改名成 `.bak<时分秒>` 备份，**按「代」清理、默认只留 1 代**；`force:true` 则不备份；`keepBackups:0` 完全不留）。**四件套逐文件比对内容，全同就不写盘**；`preflight.txt` 是报告，每次原地刷新、不备份不占代。**LR 超出该 rank 的建议区间直接报错**，除非 `allowOutOfBand:true`；自动发现图桶并按内容指纹跨桶去重 |
 
 顺序不是死板的：`text` 必须在 `rename` 前（rename 后文件名与 raw_posts.jsonl 的对应关系会断，text 报告就不好回溯）；`wash` 必须在 `rename` 后（caption 文件名跟新编号走）；`thumbs` 可以在 `screen` 前先跑一遍用于人工看；**`enrich` 要在 `text` 之前**（修补改像素 ⇒ md5 变了对不上原帖；local 图源没有 booru 标签时它是唯一的 A 源）。
@@ -171,13 +172,14 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 4. **阶段之间不要跨**：不要一边 fetch 一边 rename；`rename_map.csv` 是后续所有阶段的对照基准。
 5. 任何异常先 `anima_doctor`，再决定是否重跑。
 6. **要改 caption 就用 `fix-caption`**，不要手工改 `images/*.txt` 后重跑 `wash`——`wash` 是整条重建的（默认虽不复活你删掉的标签，但你新加的东西它也不认识）。`fix-caption` 只动你点名的那一张，且改动会进 `per_image.json` 的账本。
-7. **补标签前先 `dict-check`**：`anima_stage(stage:"dict-check", dataset:"X")` 会把你 caption 里**词典查不到**和 **post_count=0（danbooru 上不存在 ⇒ 幻觉标签，指南 §7.7 禁止写）**的标签逐条列出来。真实使用里出现过模型凭印象编标签、最后靠 verify 才发现的情况——这一步能提前拦住。
-8. **`anima_status` 现在会报 caption 健康度**（`tags min/avg/max`、缺 txt、孤立 txt、空 caption、<20 标签、>45 标签、触发词缺失/不在首位）**和图桶行**。低于下限的图多半是"洗完只剩触发词"，处置见上文；`图桶:` 那行告诉你数据实际躺在哪些目录（别默认是 `images/`）。
-9. **淘汰图用 `exclude`，不要直接删文件**：`exclude names:"0007" reason:"user" apply:true` 会把图+同名 txt 移进 `_excluded/`、记进 `user_deleted.json`（`wash` 因此不会复活它的标签）。删错了 `undo:true` 按账本搬回**原来的桶**；上一次跑批里手删的、工具不知道的，用 `missing:true` 补账。
-10. **每次写 caption 后看一眼 `wash_diff.csv`**：它是"本次 vs 上次"的逐张差异（新增/删除/清空），终端也会打印 `本次改动 N 张`。看到"清空"或大面积"删除"就先停下来问用户，别接着往下跑。
-11. **`wash` 报 `A=none` 占一半以上时，先补 A 源再谈洗标**：那条告警意味着这次 wash 只做了"格式化 + 压父标签"，没有 booru 权威标签可依据。修法是 `enrich`（md5 反查）或 `fetch --source danbooru --tags <画师名>`，**都要在 `text` 修补之前做**。
-12. **数据集涨得快先看 `anima_status` 的 `占用:` 行，别急着删**：`_pipeline/orig_text/`（修补前原图，可删但删了不能回退）与 `_pipeline/thumbs/`（缩略图，可再生）是唯二与图片同量级的东西；`_excluded/` 是移动不是复制。要清先跟用户确认，删 `thumbs/` 任何时候都安全。
-13. **想少留副产物就调 `hygiene`（设置页「空间与备份」），别自己删阶段产出**：`caption_snapshots` / `rename_snapshots` / `makecfg_backups` / `keep_masks` 四个键；用户抱怨"跑一次多一堆文件"时先看这几个值，或问他要不要 `keepSnapshots:0` / `keepBackups:0` 按次不留。
+7. **第一次做打标前先 `synonyms --apply`**（一次就够，之后纯离线）：本地词典的 `other_names` 只有日文中文写法，英文历史写法（`chinese_dress`/`sofa`/`low_angle`/`hair_clip`/`gemstone`）它一条都认不出。拉完这张 41k 条的别名表，`dict-check` 会把它们标成「别名可归一」而不是「词典里没有」。
+8. **补标签前先 `dict-check`**：`anima_stage(stage:"dict-check", dataset:"X")` 会把你 caption 里**词典查不到**和 **post_count=0（danbooru 上不存在 ⇒ 幻觉标签，指南 §7.7 禁止写）**的标签逐条列出来。真实使用里出现过模型凭印象编标签、最后靠 verify 才发现的情况——这一步能提前拦住。
+9. **`anima_status` 现在会报 caption 健康度**（`tags min/avg/max`、缺 txt、孤立 txt、空 caption、<20 标签、>45 标签、触发词缺失/不在首位）**和图桶行**。低于下限的图多半是"洗完只剩触发词"，处置见上文；`图桶:` 那行告诉你数据实际躺在哪些目录（别默认是 `images/`）。
+10. **淘汰图用 `exclude`，不要直接删文件**：`exclude names:"0007" reason:"user" apply:true` 会把图+同名 txt 移进 `_excluded/`、记进 `user_deleted.json`（`wash` 因此不会复活它的标签）。删错了 `undo:true` 按账本搬回**原来的桶**；上一次跑批里手删的、工具不知道的，用 `missing:true` 补账。
+11. **每次写 caption 后看一眼 `wash_diff.csv`**：它是"本次 vs 上次"的逐张差异（新增/删除/清空），终端也会打印 `本次改动 N 张`。看到"清空"或大面积"删除"就先停下来问用户，别接着往下跑。
+12. **`wash` 报 `A=none` 占一半以上时，先补 A 源再谈洗标**：那条告警意味着这次 wash 只做了"格式化 + 压父标签"，没有 booru 权威标签可依据。修法是 `enrich`（md5 反查）或 `fetch --source danbooru --tags <画师名>`，**都要在 `text` 修补之前做**。
+13. **数据集涨得快先看 `anima_status` 的 `占用:` 行，别急着删**：`_pipeline/orig_text/`（修补前原图，可删但删了不能回退）与 `_pipeline/thumbs/`（缩略图，可再生）是唯二与图片同量级的东西；`_excluded/` 是移动不是复制。要清先跟用户确认，删 `thumbs/` 任何时候都安全。
+14. **想少留副产物就调 `hygiene`（设置页「空间与备份」），别自己删阶段产出**：`caption_snapshots` / `rename_snapshots` / `makecfg_backups` / `keep_masks` 四个键；用户抱怨"跑一次多一堆文件"时先看这几个值，或问他要不要 `keepSnapshots:0` / `keepBackups:0` 按次不留。
 
 ## §4 必须停下来问用户的点
 

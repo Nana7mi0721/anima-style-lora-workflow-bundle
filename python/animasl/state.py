@@ -619,10 +619,13 @@ def caption_health(ds, trigger: str = "", min_tags: int = 20, max_tags: int = 45
             empty.append(path.name)
             continue
         tags = [t.strip() for t in body.split(",") if t.strip()]
-        counts.append(len(tags))
-        if len(tags) < min_tags:
+        # 触发词（`@xxx`）不算进标签数：指南 §3 与用户实测都按「不含触发词」计，
+        # 早先算进去会恒定多报 1 个，45 上限附近全是假越界（g4ku 复盘 5.1 #2）。
+        counted = [t for t in tags if not t.startswith("@")]
+        counts.append(len(counted))
+        if len(counted) < min_tags:
             under.append(path.name)
-        elif len(tags) > max_tags:
+        elif len(counted) > max_tags:
             over.append(path.name)
         if trigger:
             if not body.startswith(trigger) or body.count(trigger) != 1:

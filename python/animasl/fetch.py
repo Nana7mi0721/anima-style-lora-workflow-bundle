@@ -260,20 +260,30 @@ def fetch_danbooru(cfg, ds, tags: str, limit: int, dry_run: bool = False) -> dic
     rows: list[dict] = []
     used: set[str] = set()
     ok = fail = 0
+    from_source = 0
     for idx, post in enumerate(posts, 1):
         url = post.get("file_url") or post.get("large_file_url") or ""
-        if not url:
+        # 新帖常见 `file_url` 为 null（未通过审核的 banned/受限帖，或 API 只给部分字段）。
+        # 这时回源到 `source`（pixiv 原图直链）还能救回来一张图 —— 真实使用里
+        # g4ku 复盘 5.1 #9 就是这么丢了整批新帖。pixiv 直链**必须带 Referer**，
+        # 否则 403（这就是 net.download 之外的专用路径）。
+        src_url = str(post.get("source") or "")
+        pixiv_src = src_url if src_url.startswith("http") and "pixiv" in src_url else ""
+        if not url and not pixiv_src:
             rows.append({"source": "danbooru", "post_id": post.get("id"), "status": "no-file-url"})
             continue
         tag_string = post.get("tag_string") or ""
         tags_all = tag_string.split()
-        ext = "." + (post.get("file_ext") or ext_of(url).lstrip("."))
+        fetch_url = url or pixiv_src                 # 没有 file_url 就回源 pixiv 直链
+        ext = "." + (post.get("file_ext") or ext_of(fetch_url).lstrip("."))
+        if ext in (".", ""):
+            ext = ".jpg"
         fname = build_name("danbooru", post["id"], "_".join(tags_all[:6]), ext, ds.raw_dir, used)
         row = {
             "source": "danbooru",
             "post_id": post["id"],
             "page_url": f"https://danbooru.donmai.us/posts/{post['id']}",
-            "url": url,
+            "url": fetch_url,
             "filename": fname,
             "ext": ext,
             "bytes": int(post.get("file_size") or 0),
@@ -288,18 +298,30 @@ def fetch_danbooru(cfg, ds, tags: str, limit: int, dry_run: bool = False) -> dic
             "parent_id": post.get("parent_id") or None,
             "md5": post.get("md5") or "",
         }
+        if not url:
+            row["from_source"] = True
+            from_source += 1
         if dry_run:
             row["status"] = "planned"
         else:
-            good, size = net.download(s, url, ds.raw_dir / fname)
+            if url:
+                good, size = net.download(s, url, ds.raw_dir / fname)
+            else:
+                # pixiv 直链：不带 Referer 一律 403；用同一 session 起一次带头的请求
+                good, size = net.download_with_referer(
+                    s, fetch_url, ds.raw_dir / fname, referer="https://www.pixiv.net/")
             row["status"] = "ok" if good else "failed"
             row["bytes"] = size or row["bytes"]
             ok, fail = (ok + 1, fail) if good else (ok, fail + 1)
             time.sleep(0.4)
         rows.append(row)
         if idx % 25 == 0 or idx == len(posts):
-            print(f"  [{idx}/{len(posts)}] ok={ok} failed={fail}")
-    return {"rows": rows, "kept": len(posts), "dropped": 0, "ok": ok, "failed": fail}
+            print(f"  [{idx}/{len(posts)}] ok={ok} failed={fail}"
+                  + (f"  (回源 {from_source})" if from_source else ""))
+    if from_source:
+        print(f"  {from_source} 张没有 file_url，已回源到 source（pixiv 直链带 Referer）")
+    return {"rows": rows, "kept": len(posts), "dropped": 0, "ok": ok, "failed": fail,
+            "from_source": from_source}
 
 
 # --------------------------------------------------------------------------
@@ -321,8 +343,17 @@ def pawchive_session(cfg, cookies_file: str = "", user_agent: str = "") -> Any:
 
 def fetch_pawchive(cfg, ds, creator: str, service: str = "patreon",
                    limit: int = 0, dry_run: bool = False, cookies_file: str = "",
-                   user_agent: str = "", title_filter: str = "") -> dict:
-    """`creator` = numeric creator id (the /user/<id> part of a pawchive URL)."""
+                   user_agent: str = "", title_filter: str = "",
+                   include_cover: bool = False) -> dict:
+    """`creator` = numeric creator id (the /user/<id> part of a pawchive URL).
+
+    **`file` 是封面，不是作品**（g4ku 复盘 5.1 #4：一次抓取 39 张 `cover.jpeg` 混进数据集，
+    既没内容也没标签，只能事后手工剔）。现在默认跳过 `file`，只抓 `attachments`
+    （真正的作品图）。确实要封面就传 `include_cover=True`。
+
+    pawchive 的帖子**没有标签**（它不是 booru），所以 `tags` 只能是空列表 ——
+    这个源的打标 100% 依赖后续 enrich（md5/pixiv_id 反查）与看图。
+    """
     s = pawchive_session(cfg, cookies_file, user_agent)
     print(f"[fetch] pawchive  service={service}  creator={creator}  limit={limit or 'all'}  "
           f"proxy={net.proxy_label()}")
@@ -354,10 +385,14 @@ def fetch_pawchive(cfg, ds, creator: str, service: str = "patreon",
     rows: list[dict] = []
     used: set[str] = set()
     ok = fail = 0
+    covers_skipped = 0
     for idx, post in enumerate(posts, 1):
         files = []
         if post.get("file"):
-            files.append(post["file"])
+            if include_cover:
+                files.append(post["file"])
+            else:
+                covers_skipped += 1
         files.extend(post.get("attachments") or [])
         for fobj in files:
             path = fobj.get("path") or ""
@@ -401,7 +436,12 @@ def fetch_pawchive(cfg, ds, creator: str, service: str = "patreon",
             rows.append(row)
         if idx % 10 == 0 or idx == len(posts):
             print(f"  [{idx}/{len(posts)}] files={len(rows)} ok={ok} failed={fail}")
-    return {"rows": rows, "kept": len(posts), "dropped": 0, "ok": ok, "failed": fail}
+    if covers_skipped:
+        print(f"  cover 跳过 {covers_skipped} 张（封面不是作品；要抓就传 includeCover:true）")
+    if rows and not any(r.get("tags") for r in rows):
+        print("  ! pawchive 帖子没有标签（它不是 booru）——这个源的打标要靠 enrich + 看图")
+    return {"rows": rows, "kept": len(posts), "dropped": 0, "ok": ok, "failed": fail,
+            "covers_skipped": covers_skipped}
 
 
 # --------------------------------------------------------------------------

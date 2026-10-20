@@ -27,7 +27,8 @@ danbooru 支持 `md5:<hex>` 搜索。只要手上还有原始字节，就能把�
 已经修补过的老数据集，只能拿没修补过的副本（如 `00_raw/`）来查。
 
 写盘语义：**默认 dry-run（只查不写）**，`apply:true` 才落进 raw_posts.jsonl。
-dry-run 仍然会发请求 —— 它存在的意义就是"先看命中率再决定要不要跑"。
+dry-run 仍然会发请求 —— 它存在的意义就是"先看命中率再决定要不要跑"，所以
+**dry-run 也写报告**（`_pipeline/enrich_report.dryrun.csv`，不覆盖真跑的那份）。
 """
 
 from __future__ import annotations
@@ -262,14 +263,18 @@ def cmd_enrich(ds, limit: int = 0, apply: bool = False, force: bool = False,
               f"{len(row['tags'])} 标签  rating={row['rating'] or '-'}  by={by}")
 
     written = _merge(ds, rows, force=force) if (apply and rows) else 0
-    if apply and report:
-        path = ds.pipe_dir / "enrich_report.csv"
+    # 报告**永远**写（包括 dry-run）。早先只在 apply 时写，真实使用的反馈是
+    # 「dry-run 跑了几分钟，零产出」（g4ku 复盘 5.1 #6）—— 而 dry-run 的全部意义
+    # 就是先看命中率再决定要不要 apply，没有报告等于白跑。
+    # dry-run 写 enrich_report.dryrun.csv，别覆盖上一次真跑的报告。
+    if report:
+        path = ds.pipe_dir / ("enrich_report.csv" if apply else "enrich_report.dryrun.csv")
         with open(path, "w", encoding="utf-8", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=["file", "key", "md5", "by", "status",
                                                "post_id", "tags_n"])
             w.writeheader()
             w.writerows(report)
-        print(f"[enrich] 报告 -> {path}")
+        print(f"[enrich] 报告 -> {path}（{len(report)} 行）")
 
     print(f"[enrich] 命中 {hit}（md5 {by_md5} / pixiv_id {by_pixiv}）　查不到 {miss}　"
           f"跳过 {skipped}（已有标签或已查过）　共查 {queried} 次")
@@ -302,4 +307,5 @@ def cmd_enrich(ds, limit: int = 0, apply: bool = False, force: bool = False,
         if by_pixiv:
             print(f"         其中 {by_pixiv} 张是 pixiv_id 兜回来的（md5 不中但原帖还在）")
     return {"rows": rows, "hit": hit, "miss": miss, "skipped": skipped,
-            "queried": queried, "written": written, "by_md5": by_md5, "by_pixiv": by_pixiv}
+            "queried": queried, "written": written, "by_md5": by_md5, "by_pixiv": by_pixiv,
+            "report": str(path) if report else ""}
