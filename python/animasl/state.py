@@ -337,19 +337,30 @@ def hygiene(ds, key: str, default):
         return default
 
 
-def _snapshot_rows(ds, work_set=None) -> list[tuple[str, str]]:
+def _snapshot_rows(ds, work_set=None, names=None) -> list[tuple[str, str]]:
+    """当前工作集里的 caption（只收已经存在的 txt）。
+
+    `names` 给了就只取这些文件（按 stem 匹配）——fix-caption 只改一两张时不必整库复制。
+    """
+    want: set[str] | None = None
+    if names is not None:
+        want = {Path(str(n)).stem for n in names if str(n).strip()}
+        if not want:
+            return []
     pairs = [(p, p.with_suffix(".txt")) for p in ds.work_images(work_set)]
     return [(img.name, txt.read_text(encoding="utf-8", errors="replace"))
-            for img, txt in pairs if txt.exists()]
+            for img, txt in pairs
+            if txt.exists() and (want is None or Path(img.name).stem in want)]
 
 
 def _same_as_latest(ds, rows: list[tuple[str, str]]) -> bool:
-    """当前 caption 是否与最新那份快照逐字节相同（用来避免"没变也留一份"）。"""
+    """当前 caption 是否与最新那份快照逐字节相同（用来避免"没变也留一份"）。
+
+    只比 `rows` 覆盖到的那些文件，**不要求**份数相等：按文件快照（`names=[...]`）时
+    快照里本来就只有这几张，拿整库份数去比会让每次单文件快照都判成"变了"。
+    """
     latest = latest_snapshot(ds)
     if latest is None:
-        return False
-    files = [p for p in latest.iterdir() if p.is_file() and p.suffix == ".txt"]
-    if len(files) != len(rows):
         return False
     for name, text in rows:
         try:
@@ -362,8 +373,11 @@ def _same_as_latest(ds, rows: list[tuple[str, str]]) -> bool:
 
 
 def snapshot_captions(ds, work_set=None, label: str = "", keep: int | None = None,
-                      skip_if_same: bool = True) -> Path | None:
+                      skip_if_same: bool = True, names=None) -> Path | None:
     """把当前工作集里的 caption 抄一份到 `_pipeline/captions_prev/<时间戳>/`。
+
+    `names` 只备份这些文件（点改场景，例如 fix-caption 只动一两张）：整库复制 283 份
+    caption 只为留一张的旧版本，既慢又把上一份整库快照挤掉（保留代数默认只有 1）。
 
     返回**真正写了盘**的那份快照目录；没写就返回 None，三种情况：
       - 一张 caption 都没有；
@@ -372,7 +386,7 @@ def snapshot_captions(ds, work_set=None, label: str = "", keep: int | None = Non
 
     只保留最新 keep 份（默认取 `hygiene.caption_snapshots`，出厂值 1），避免越跑越多。
     """
-    rows = _snapshot_rows(ds, work_set)
+    rows = _snapshot_rows(ds, work_set, names)
     if not rows:
         return None
     if keep is None:
@@ -383,10 +397,17 @@ def snapshot_captions(ds, work_set=None, label: str = "", keep: int | None = Non
     if skip_if_same and _same_as_latest(ds, rows):
         _prune_snapshots(ds, keep)
         return None
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # 名字精确到**微秒**：同一秒内连写两次（fix-caption 批量、apply-review 紧接 wash）
+    # 不会撞名；而 prune / latest_snapshot 只按目录名排，所以名字的字典序必须就是时间序。
+    # 早先用秒级名 + 撞名加 `-2` 后缀踩过坑：基础名比 "…-2" 排得前，之后再写一份基础
+    # 名，prune 会把**最新的**那份当旧的删掉（离线测试直接抓到了这个）。
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     dest = _snapshot_root(ds) / stamp
-    if dest.exists():                       # 同一秒内两次写盘：加后缀
-        dest = _snapshot_root(ds) / f"{stamp}-{len(list(_snapshot_root(ds).iterdir())) + 1}"
+    if dest.exists():                       # 同一微秒撞名（几乎不可能）：加序号，仍排在后面
+        n = 2
+        while dest.exists():
+            dest = _snapshot_root(ds) / f"{stamp}-{n:02d}"
+            n += 1
     dest.mkdir(parents=True, exist_ok=True)
     for name, text in rows:
         path = dest / f"{Path(name).stem}.txt"
@@ -424,18 +445,36 @@ def latest_snapshot(ds, exclude: Path | None = None) -> Path | None:
     return dirs[-1] if dirs else None
 
 
-def caption_diff(ds, prev: Path | None, work_set=None) -> list[dict]:
-    """逐图比较「上一版 caption」与「现在盘上的 caption」→ 每张一行。"""
+def caption_diff(ds, prev: Path | None, work_set=None, names=None,
+                 before: dict[str, str] | None = None) -> list[dict]:
+    """逐图比较「上一版 caption」与「现在盘上的 caption」→ 每张一行。
+
+    `names` 只比这些文件（按 stem 匹配）——fix-caption 只动一两张，没必要把整库列出来。
+    `before` 是**写盘前读到的文本**（键用图片名或 stem）：快照只留了部分文件、或上一份
+    快照已被保留代数清掉时，仍能拿到真实的 before（否则 diff 会把整库判成 "new"）。
+    """
+    want: set[str] | None = None
+    if names is not None:
+        want = {Path(str(n)).stem for n in names if str(n).strip()}
+        if not want:
+            return []
     rows: list[dict] = []
     for img in ds.work_images(work_set):
+        if want is not None and img.stem not in want:
+            continue
         txt = img.with_suffix(".txt")
-        before = ""
-        if prev is not None:
-            old = prev / f"{img.stem}.txt"
-            if old.exists():
-                before = old.read_text(encoding="utf-8", errors="replace")
+        old_text: str | None = None
+        if before is not None:
+            if img.name in before:
+                old_text = before[img.name]
+            elif img.stem in before:
+                old_text = before[img.stem]
+        if old_text is None and prev is not None:
+            snap = prev / f"{img.stem}.txt"
+            if snap.exists():
+                old_text = snap.read_text(encoding="utf-8", errors="replace")
         after = txt.read_text(encoding="utf-8", errors="replace") if txt.exists() else ""
-        b = before.strip()
+        b = (old_text or "").strip()
         a = after.strip()
         if b == a:
             continue

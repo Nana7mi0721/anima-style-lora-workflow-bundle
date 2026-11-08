@@ -9,6 +9,7 @@ Working directories
 from __future__ import annotations
 
 import csv
+import fnmatch
 import hashlib
 import json
 import math
@@ -691,24 +692,73 @@ def cmd_screen(ds, rules: dict | None = None, apply: bool = False,
 # --------------------------------------------------------------------------
 # thumbs (for the vision subagents -- never let them read 30MB originals)
 # --------------------------------------------------------------------------
+def _name_tokens(names) -> list[str]:
+    """`names` 拆成匹配项：逗号分隔；`0001-0012` 是编号区间，其余按 glob 走。"""
+    if isinstance(names, (list, tuple, set)):
+        raw = [str(n) for n in names]
+    else:
+        raw = str(names or "").split(",")
+    return [t.strip() for t in raw if t.strip()]
+
+
+def _as_range(token: str) -> tuple[int, int] | None:
+    """`0001-0012` -> (1, 12)；不是纯数字区间就返回 None。"""
+    left, _, right = token.partition("-")
+    if left.isdigit() and right.isdigit():
+        return int(left), int(right)
+    return None
+
+
+def _match_name(name: str, tokens: list[str]) -> bool:
+    """stem 是否命中任一匹配项（不区分大小写；写全名带扩展名也行）。"""
+    stem = Path(name).stem.casefold()
+    full = name.casefold()
+    for tok in tokens:
+        rng = _as_range(tok)
+        if rng is not None:
+            if stem.isdigit() and rng[0] <= int(stem) <= rng[1]:
+                return True
+            continue
+        pat = Path(tok.replace("\\", "/")).name.casefold()   # 全名 -> 只留文件名
+        if fnmatch.fnmatchcase(stem, pat) or fnmatch.fnmatchcase(stem, Path(pat).stem):
+            return True
+        if fnmatch.fnmatchcase(full, pat):
+            return True
+    return False
+
+
 def cmd_thumbs(ds, max_side: int = 1536, max_bytes: int = 2_000_000,
                include_images: bool = False, prune: bool = False,
-               force: bool = False, work_set=None) -> dict:
+               force: bool = False, work_set=None, names="") -> dict:
     """生成缩略图（视觉子代理只能看这个）。
 
     真实使用踩过的坑：thumbs 默认读 00_raw，而 rename 之后 00_raw 已经空了 ⇒
     第二次 thumbs 打印「0 张」，agent 只能自己拿 Pillow 造缩略图。现在：
       * 工作集 = 所有成品图桶（images/、clean/、watermark/ …，见 Dataset.bucket_dirs）；
       * 已存在且比原图新、长边也不超标的缩略图跳过（重跑不再白算几百张）；
-      * --prune 清掉没有对应图的陈旧缩略图（改名后残留的旧编号）。
+      * `names` 只给指定的几张出图（`"0001,0002"`、区间 `"0001-0012"`、glob `"0001*"`，
+        按 stem 匹配，带扩展名也行）——复核阶段常常只改了几张，没必要重算整库；
+      * --prune 清掉没有对应图的陈旧缩略图（改名后残留的旧编号）。**prune 永远按全量
+        工作集核对**，`names` 只决定这一跑写谁、不决定删谁（否则过滤一次就把别的图的
+        缩略图清空了）。
     """
     ds.ensure_dirs()
     ds.thumbs_dir.mkdir(parents=True, exist_ok=True)
-    files = ds.work_images(work_set)
-    if not files:
+    all_files = ds.work_images(work_set)
+    if not all_files:
         print("[thumbs] 工作集是空的：没有含图的桶（images/ 是空的？）。"
               "先 fetch/import，或 rename 之后再跑 thumbs；成品图放数据集根下任意子目录都行。")
         return {"count": 0, "skipped": 0, "pruned": 0, "dir": str(ds.thumbs_dir)}
+
+    files = all_files
+    tokens = _name_tokens(names)
+    if tokens:
+        files = [f for f in all_files if _match_name(f.name, tokens)]
+        print(f"[thumbs] names={names}：命中 {len(files)}/{len(all_files)} 张")
+        if not files:
+            sample = "、".join(f.stem for f in all_files[:8])
+            print(f"[thumbs] 没有图命中 names={names}。工作集里的编号举例：{sample}"
+                  "（写法：0001,0002 / 0001-0012 / 0001*）")
 
     written = 0
     skipped = 0
@@ -742,7 +792,9 @@ def cmd_thumbs(ds, max_side: int = 1536, max_bytes: int = 2_000_000,
 
     pruned = 0
     if prune:
-        keep = {f.stem for f in files}
+        # keep 取全量工作集（不是 names 过滤后的）—— prune 只删「没有对应图」的陈旧缩略图，
+        # 跟这一跑给没给 names 无关，否则过滤一次就把别的图的缩略图全清空。
+        keep = {f.stem for f in all_files}
         for out in sorted(ds.thumbs_dir.glob("*.jpg")):
             if out.stem in keep:
                 continue
@@ -753,18 +805,61 @@ def cmd_thumbs(ds, max_side: int = 1536, max_bytes: int = 2_000_000,
                 pass
 
     print(f"[thumbs] 新写 {written} 张、跳过 {skipped} 张"
-          + (f"、清理陈旧 {pruned} 张" if prune else "")
+          + (f"（names={names}：{len(files)}/{len(all_files)} 张）" if tokens else "")
+          + (f"、清理陈旧 {pruned} 张（按全量 {len(all_files)} 张核对）" if prune else "")
           + f" -> {ds.thumbs_dir}（平均 {total // max(written, 1) // 1024} KB，长边≤{max_side}）")
     used = config.dir_bytes(ds.thumbs_dir)
     if used:
         print(f"         缩略图目录现在占 {config.human_bytes(used)}"
               "（看图子代理用的副本，全部可再生；看图复核结束后可以整个删掉）")
-    return {"count": written, "skipped": skipped, "pruned": pruned, "dir": str(ds.thumbs_dir)}
+    return {"count": written, "skipped": skipped, "pruned": pruned,
+            "dir": str(ds.thumbs_dir), "matched": len(files)}
 
 
 # --------------------------------------------------------------------------
 # exclude: 人工淘汰（带清单与回滚）
 # --------------------------------------------------------------------------
+def _names_from_file(ds, spec: str) -> list[str]:
+    """`@清单.txt` -> 逐行读名字（# 注释、空行、BOM 都能扛）。"""
+    spec = spec.strip().strip('"').strip("'")
+    if not spec:
+        raise SystemExit('[exclude] names="@…" 后面要跟清单文件路径，'
+                         '例如 names="@E:/tmp/list.txt"')
+    raw = Path(spec).expanduser()
+    if raw.is_absolute():
+        tried = [raw]
+    else:
+        # 相对路径先按当前工作目录找（命令行里敲的最自然），找不到再按数据集根找
+        tried = [Path.cwd() / spec, ds.root / spec]
+    hit = next((p for p in tried if p.is_file()), None)
+    if hit is None:
+        raise SystemExit(
+            "[exclude] 清单文件不存在：" + spec + "\n"
+            "         试过：" + "、".join(str(p) for p in tried) + "\n"
+            '         写法：names="@E:/tmp/list.txt"（一行一个名字，也可以逗号分隔；# 开头是注释）')
+    names: list[str] = []
+    for line in hit.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        names.extend(t.strip() for t in line.split(",") if t.strip())
+    if not names:
+        raise SystemExit(f"[exclude] 清单文件 {hit} 里没有有效名字（{hit.stat().st_size} 字节；"
+                         "# 开头是注释、空行会被跳过）")
+    print(f"[exclude] 从清单文件读了 {len(names)} 个名字：{hit}")
+    return names
+
+
+def _expand_names(ds, names) -> list[str]:
+    """names 可以是 list、`0001,0002`，或 `@清单文件`（见 _names_from_file）。"""
+    if isinstance(names, (list, tuple, set)):
+        return [str(n).strip() for n in names if str(n).strip()]
+    text = str(names or "").strip()
+    if text.startswith("@"):
+        return _names_from_file(ds, text[1:])
+    return [n.strip() for n in text.split(",") if n.strip()]
+
+
 def cmd_exclude(ds, names="", reason: str = "user", apply: bool = False,
                 undo: bool = False, missing: bool = False, work_set=None,
                 note: str = "") -> dict:
@@ -775,6 +870,8 @@ def cmd_exclude(ds, names="", reason: str = "user", apply: bool = False,
 
       * `names` 里每张图 → 移动到 `_excluded/<reason>/`，`_pipeline/user_deleted.json`
         只追加一条（记当前文件名、所有旧名、归档路径、原因、时间）；
+      * `names` 也可以写 `"@E:/tmp/list.txt"`：从文件逐行读名字（# 注释、空行、BOM 都处理），
+        批量淘汰几十张时不用在命令行里拼一长串；
       * `missing: true` 是**事后补账**：把 per_image.json / rename_map.csv 里知道、
         但工作集里已经不在的图补进清单（archived 为空，只留证据不搬文件）；
       * `undo: true` → 按清单里的归档路径搬回**原来的桶**（entries 里记了 bucket），并标记
@@ -784,8 +881,7 @@ def cmd_exclude(ds, names="", reason: str = "user", apply: bool = False,
     """
     ds.ensure_dirs()
     st = state.load(ds)
-    want = names if isinstance(names, (list, tuple, set)) else str(names or "").split(",")
-    want = [str(n).strip() for n in want if str(n).strip()]
+    want = _expand_names(ds, names)   # "@清单.txt" 也在这里展开
     rows: list[dict] = []
 
     if undo:
@@ -947,56 +1043,178 @@ def _prune_batch_maps(ds, keep: int | None = None) -> int:
     return removed
 
 
-def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
-               move: bool = True) -> dict:
-    ds.ensure_dirs()
-    files = ds.raw_images()
-    if not files:
-        files = ds.images()
-        if files:
-            raise SystemExit("[rename] 00_raw 为空，而 images/ 已有内容——数据集似乎已重排过")
-        raise SystemExit("[rename] 00_raw 为空，先下载或导入图片")
-    meta = load_meta(ds)
+def _rename_order(meta: dict, files: list[Path]) -> list[Path]:
+    """重排顺序：有图源元数据的按 created_at（再按文件名），没有的按文件名。
 
-    # keep the booru ordering (newest first) when metadata is available
-    def sort_key(p: Path):
+    桶布局下大多数图已经是 `0001.png` 这种编号名，`meta` 里查不到（raw_posts 记的是下载
+    时的文件名）⇒ 退化成按名字排，编号原样保留；只有 `clean/a.png` 这类还没改过名的图才会
+    按图源时间排序。
+    """
+    def key(p: Path):
         m = meta.get(p.name, {})
         return (str(m.get("created_at") or "0000-00-00"), p.name)
 
-    files = sorted(files, key=sort_key)
-    rows: list[dict] = []
+    return sorted(files, key=key)
+
+
+def _rename_row(f: Path, new_name: str, meta: dict, bucket: str) -> dict:
+    """对照表的一行。`bucket` 是这一跑结束时它所在的桶（老表没这列照样能读）。"""
+    m = meta.get(f.name, {})
+    return {
+        "new_name": new_name, "old_name": f.name, "post_id": m.get("post_id", ""),
+        "source": m.get("source", ""), "created_at": m.get("created_at", ""),
+        "rating": m.get("rating", ""), "width": m.get("width", ""), "height": m.get("height", ""),
+        "bytes": f.stat().st_size, "url": m.get("url", ""),
+        # danbooru/yande.re 的原形是**下划线** tag（多词标签 `hakurei_reimu`），CSV 里只能存
+        # 字符串，所以统一写成下划线形：空格形会在下游 `.split()` 时被切成两个词。
+        "tags_full": " ".join(str(t).replace(" ", "_") for t in (m.get("tags") or [])),
+        "category": m.get("category", ""), "bucket": bucket,
+    }
+
+
+def _staging_path(src: Path, i: int) -> Path:
+    """桶内两段式改名的中转名（不撞已有文件，崩溃留下的也能让开）。"""
+    n = 0
+    while True:
+        tail = f"-{n}" if n else ""
+        cand = src.with_name(f"{src.stem}.__renaming{i}{tail}{src.suffix}")
+        if not cand.exists():
+            return cand
+        n += 1
+
+
+def _rename_in_place(pairs: list[tuple[Path, Path]]) -> int:
+    """桶内就地改名（两段式），返回跟着搬的 .txt 边车数。
+
+    为什么两段：桶里 0002/0003 要变成 0001/0002 时，单段直接 `0003 -> 0002` 会撞上还没搬走
+    的 0002（Windows 上 rename 到已存在文件直接失败，POSIX 上静默覆盖 = 丢图）。先把这次要
+    改的图全部挪到中转名，再落到目标名，任何顺序都不互相踩。中途崩了留下的
+    `0001.__renaming0.png` 还是图，下次 rename 会把它重新编号收回来。
+    """
+    todo = [(src, dest) for src, dest in pairs if src != dest]
+    if not todo:
+        return 0
+    staged: list[tuple[Path, Path, Path | None, Path | None]] = []
+    for i, (src, dest) in enumerate(todo):
+        tmp = _staging_path(src, i)
+        src.rename(tmp)
+        side = src.with_suffix(".txt")
+        side_tmp = side_dest = None
+        if side.exists():
+            side_tmp = tmp.with_suffix(".txt")
+            side.rename(side_tmp)
+            side_dest = dest.with_suffix(".txt")
+        staged.append((tmp, dest, side_tmp, side_dest))
     sidecars = 0
-    for idx, f in enumerate(files):
-        n = start + idx
-        new_name = f"{n:0{digits}d}{f.suffix.lower()}"
-        m = meta.get(f.name, {})
-        rows.append({
-            "new_name": new_name, "old_name": f.name, "post_id": m.get("post_id", ""),
-            "source": m.get("source", ""), "created_at": m.get("created_at", ""),
-            "rating": m.get("rating", ""), "width": m.get("width", ""), "height": m.get("height", ""),
-            "bytes": f.stat().st_size, "url": m.get("url", ""),
-            # danbooru/yande.re 的原形是**下划线** tag（多词标签 `hakurei_reimu`），CSV 里只能存
-            # 字符串，所以统一写成下划线形：空格形会在下游 `.split()` 时被切成两个词。
-            "tags_full": " ".join(str(t).replace(" ", "_") for t in (m.get("tags") or [])),
-            "category": m.get("category", ""),
-        })
-        if apply:
-            dest = ds.images_dir / new_name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if move:
-                shutil.move(str(f), str(dest))
+    for tmp, dest, side_tmp, side_dest in staged:
+        try:
+            tmp.rename(dest)
+        except OSError as exc:
+            print(f"  ! 改名失败 {tmp.name} -> {dest.name}：{exc}"
+                  "（中转名留在桶里，下次 rename 会重新编号）")
+            continue
+        if side_tmp is not None and side_tmp.exists():
+            if side_dest.exists():
+                print(f"  ! {side_dest.name} 已存在，{side_tmp.name} 留在桶里（不覆盖）")
             else:
-                shutil.copy2(f, dest)
-            # 原图旁边的 .txt（早期手工补的 / import 带进来的）跟着搬，别留在 00_raw 里成孤儿
-            side = f.with_suffix(".txt")
-            if side.exists():
-                target = dest.with_suffix(".txt")
-                if not target.exists():
-                    try:
-                        shutil.move(str(side), str(target)) if move else shutil.copy2(side, target)
-                        sidecars += 1
-                    except Exception:
-                        pass
+                side_tmp.rename(side_dest)
+                sidecars += 1
+    return sidecars
+
+
+def _print_rename_ranges(ranges: list[dict], digits: int, in_buckets: bool) -> None:
+    """打印每个桶的编号区间（桶布局下「我这几张去哪儿了」是最高频的疑问）。"""
+    total = sum(r["count"] for r in ranges)
+    if in_buckets:
+        print(f"[rename] {len(ranges)} 个图桶、{total} 张，桶内就地重排"
+              "（编号跨桶连续，但文件不跨桶搬）：")
+    else:
+        print(f"[rename] {total} 张 -> images/，编号区间：")
+    for r in ranges:
+        print(f"  {r['bucket']:<10} {r['first']:0{digits}d}…{r['last']:0{digits}d}"
+              f"（{r['count']} 张）")
+
+
+def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
+               move: bool = True, work_set=None) -> dict:
+    """重排编号：`00_raw/` -> `images/`，或**成品图桶内就地重排**。
+
+    真实使用踩过的坑：成品被人工分进 clean/ watermark/ diff1… 之后 images/ 是空的，老的
+    rename 只认 00_raw，于是 153 张只能先全扁平化、再手工拆回桶里。现在按数据形态自动选路：
+
+      * `00_raw/` 还有待整理的图 -> 老路径：按图源时间编号，搬进 `images/`（move:false 为复制）；
+      * `00_raw/` 空了（成品都在桶里）-> **桶内就地重排**：按桶分组、桶内按图源时间排序，
+        文件**不跨桶搬**（桶归属是用户的分组语义），只把一个桶里的编号重排干净；
+      * 显式给 `workSet` -> 只重排这几个桶（此时 00_raw/ 不动：显式意图优先）。
+
+    编号为什么跨桶连续、而不是每个桶都从 `start` 重来：`_pipeline/thumbs`、`masks`、
+    `orig_text` 全是**按 stem 扁平命名**的（`0001.jpg` / `0001.mask.png`），跨桶重号会让
+    两张不同图的缩略图/掩膜/修补前备份互相踩，`text --inpaint-only` 与 `text-rollback`
+    就会张冠李戴。所以每个桶各占一段、段与段不重叠：clean 0001…0109、watermark 0110…0142。
+
+    `_pipeline/rename_map.csv` 仍然只追加、记 `old_name -> new_name`，另加 `bucket` 列
+    （老表没这列照样读；同名旧行按桶区分，clean/a.png 与 watermark/a.png 不会互相顶掉）。
+    """
+    ds.ensure_dirs()
+    meta = load_meta(ds)
+
+    # ---- 这一跑处理「00_raw 待整理」还是「成品图桶」 --------------------------
+    buckets: list[tuple[str, Path]] = []
+    raw: list[Path] = []
+    if work_set:
+        buckets = ds.bucket_dirs(work_set)   # 给错名字在这里就报错并列出自动发现的桶
+        leftover = ds.raw_images()
+        if leftover:
+            print(f"[rename] 指定了 workSet={work_set}：只重排这些桶，"
+                  f"00_raw/ 里还有 {len(leftover)} 张这次不动")
+    else:
+        raw = ds.raw_images()
+        if not raw:
+            buckets = ds.discover_buckets()
+    if not raw and not buckets:
+        raise SystemExit("[rename] 00_raw 为空，也没有含图的桶（images/、clean/、watermark/ …）"
+                         "——先下载或导入图片")
+
+    rows: list[dict] = []
+    ranges: list[dict] = []
+    plan: list[tuple[Path, Path]] = []
+
+    if raw:
+        files = _rename_order(meta, raw)
+        for idx, f in enumerate(files):
+            n = start + idx
+            new_name = f"{n:0{digits}d}{f.suffix.lower()}"
+            rows.append(_rename_row(f, new_name, meta, "images"))
+            plan.append((f, ds.images_dir / new_name))
+        ranges.append({"bucket": "images", "count": len(files), "first": start,
+                       "last": start + len(files) - 1})
+    else:
+        n = start
+        for name, base in buckets:
+            files = _rename_order(meta, [p for p in base.iterdir()
+                                         if p.is_file() and p.suffix.lower() in IMG_EXTS])
+            if not files:
+                continue
+            first = n
+            for f in files:
+                new_name = f"{n:0{digits}d}{f.suffix.lower()}"
+                rows.append(_rename_row(f, new_name, meta, name))
+                plan.append((f, base / new_name))
+                n += 1
+            ranges.append({"bucket": name, "count": len(files), "first": first, "last": n - 1})
+
+    if not raw and work_set:
+        # 只重排部分桶时，编号可能撞上没参与这次重排的桶（thumbs/masks/orig_text 按 stem 平铺）
+        selected = {name for name, _ in buckets}
+        other_stems = {p.stem for name, base in ds.discover_buckets() if name not in selected
+                       for p in base.iterdir() if p.is_file() and p.suffix.lower() in IMG_EXTS}
+        clash = sorted({dest.stem for src, dest in plan if src != dest} & other_stems)
+        if clash:
+            raise SystemExit(
+                "[rename] 编号会撞上没参与这次重排的桶：" + ", ".join(clash[:8])
+                + (" …" if len(clash) > 8 else "") + "\n"
+                "         缩略图/掩膜/修补备份是按 stem 扁平存的，跨桶重号会张冠李戴。\n"
+                "         换一个 --start 避开这些编号，或对整个数据集重排（不传 workSet）。")
 
     total_rows = len(rows)
     first, last = start, start + total_rows - 1
@@ -1004,24 +1222,58 @@ def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
         # 预演不碰权威对照表（load_rename_map 读的就是它，别让预演污染下游的标签来源）
         preview = ds.pipe_dir / "rename_map.preview.csv"
         write_csv(preview, rows)
-        print(f"[rename] 预演：{total_rows} 张将重排为 {first:0{digits}d}…{last:0{digits}d}"
-              f"；对照表 {preview}（加 --apply 执行；权威表 rename_map.csv 不动）")
-        return {"count": total_rows, "map": str(preview), "applied": False}
+        _print_rename_ranges(ranges, digits, in_buckets=not raw)
+        print(f"[rename] 预演：{total_rows} 张将重排；对照表 {preview}"
+              "（加 --apply 执行；权威表 rename_map.csv 不动）")
+        return {"count": total_rows, "map": str(preview), "applied": False, "ranges": ranges}
+
+    sidecars = 0
+    if raw:
+        for src, dest in plan:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if move:
+                shutil.move(str(src), str(dest))
+            else:
+                shutil.copy2(src, dest)
+            # 原图旁边的 .txt（早期手工补的 / import 带进来的）跟着搬，别留在 00_raw 里成孤儿
+            side = src.with_suffix(".txt")
+            if side.exists():
+                target = dest.with_suffix(".txt")
+                if not target.exists():
+                    try:
+                        if move:
+                            shutil.move(str(side), str(target))
+                        else:
+                            shutil.copy2(side, target)
+                        sidecars += 1
+                    except Exception:
+                        pass
+    else:
+        if not move:
+            print("[rename] 桶内重排是就地改名（move 只对 00_raw -> images 那批有意义，这里仍就地）")
+        sidecars = _rename_in_place(plan)
 
     # 只追加（真实使用踩过）：早先这里直接覆盖 rename_map.csv，第二批 rename
     # （--start 27）一跑，第一批 26 行的 post_id/tags_full 就没了。
     map_path = ds.pipe_dir / "rename_map.csv"
     merged: list[dict] = []
-    seen_old: set[str] = set()
+    seen: set[tuple[str, str]] = set()
+    new_olds = {(r["bucket"], r["old_name"]) for r in rows}
+    new_old_names = {r["old_name"] for r in rows}
     if map_path.exists():
         with open(map_path, encoding="utf-8", newline="") as fh:
             for old_row in csv.DictReader(fh):
-                key = old_row.get("old_name", "")
-                if key and key in {r["old_name"] for r in rows}:
-                    continue          # 同一张图重排过：以本次为准
-                if key and key in seen_old:
+                old = old_row.get("old_name", "")
+                if not old:
                     continue
-                seen_old.add(key)
+                b = str(old_row.get("bucket") or "").strip()
+                # 同一张图重排过：以本次为准。老表没有 bucket 列时按旧名认；
+                # 有桶列时按 (桶, 旧名) 认，免得 clean/a.png 与 watermark/a.png 互相顶掉。
+                if (b, old) in new_olds if b else old in new_old_names:
+                    continue
+                if (b, old) in seen:
+                    continue
+                seen.add((b, old))
                 merged.append(old_row)
     merged.extend(rows)
     write_csv(map_path, merged)
@@ -1035,23 +1287,26 @@ def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
 
     st = state.load(ds)
     for row in rows:
-        st.link_rename(
-            row["new_name"], row["old_name"],
-            post_id=row["post_id"], source=row["source"], created_at=row["created_at"],
-            width=row["width"], height=row["height"], url=row["url"],
-            origin="A+booru" if row["tags_full"] else "A=none",
-            history={"what": "rename", "from": row["old_name"]},
-        )
+        facts = dict(post_id=row["post_id"], source=row["source"],
+                     created_at=row["created_at"], width=row["width"],
+                     height=row["height"], url=row["url"], bucket=row["bucket"],
+                     origin="A+booru" if row["tags_full"] else "A=none")
+        if row["old_name"] == row["new_name"]:
+            # 编号没变（重跑同一批）：别把新名字当旧名塞进 old_names
+            st.record(row["new_name"], history={"what": "rename", "note": "编号未变"}, **facts)
+        else:
+            st.link_rename(row["new_name"], row["old_name"],
+                           history={"what": "rename", "from": row["old_name"]}, **facts)
     st.add_batch(first, last, total_rows, batch_path.name)
     st.save()
 
-    print(f"[rename] {total_rows} 张已重排为 {first:0{digits}d}…{last:0{digits}d} -> {ds.images_dir}")
+    _print_rename_ranges(ranges, digits, in_buckets=not raw)
     print(f"         对照表 {map_path}（累计 {len(merged)} 行，只追加）　本批快照 {batch_path.name}")
     if sidecars:
         print(f"         随图搬运的 .txt 边车：{sidecars} 个")
     print(f"         状态 {st.path.name}（per_image.json：编号/来源/post_id/旧名的唯一事实来源）")
     return {"count": total_rows, "map": str(map_path), "batch": str(batch_path),
-            "rows": len(merged), "state": str(st.path), "applied": True}
+            "rows": len(merged), "state": str(st.path), "applied": True, "ranges": ranges}
 
 
 def load_rename_map(ds) -> dict[str, dict]:

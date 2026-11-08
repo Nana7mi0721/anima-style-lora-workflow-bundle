@@ -1,6 +1,6 @@
 ---
 name: anima-style-lora-source
-description: Anima 风格 LoRA 训练集的下载来源指南：yande.re / danbooru / pawchive.pw / exhentai 四个源的 API 用法与标签语义、认证方式（设置页「凭据」分组的 danbooru 用户名+API key / exhentai 三项，或 cookies.txt）、danbooru 的 Cloudflare 403 与 curl 兜底、必须走代理的域名、父子投稿去重、原图选择、文件名标签不完整等坑，以及按画师类型选源的判断。用户要求"下载数据集/抓某画师的图/从 danbooru 或 yande.re 下载/补充素材"时使用。
+description: Anima 风格 LoRA 训练集的下载来源指南：yande.re / danbooru / pawchive.pw / exhentai 四个源的 API 用法与标签语义、认证方式（设置页「凭据」分组的 danbooru 用户名+API key / exhentai 三项，或 cookies.txt）、danbooru 的 Cloudflare 403 与 curl 兜底、pawchive 的图片 CDN 已失效与唯一可用的帖子 ZIP 通道（必须自报 UA、ZIP 条目名 GBK/cp437 还原）、必须走代理的域名、父子投稿去重、原图选择、文件名标签不完整等坑，以及按画师类型选源的判断。用户要求"下载数据集/抓某画师的图/从 danbooru 或 yande.re 下载/补充素材"时使用。
 ---
 
 # SKILL：训练集下载来源
@@ -56,11 +56,69 @@ anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"<画师tag>", li
 - 接口：`GET https://pawchive.pw/api/v1/posts?o=0`（50 条/页）、`GET /api/v1/creators`、`GET /api/v1/{service}/user/{creator_id}?q=&o=`、`GET /api/v1/{service}/user/{creator_id}/profile`、`POST /api/v1/{service}/user/{creator_id}/post/{post_id}`。
 - 调用：`anima_stage(stage:"fetch", dataset:"X", source:"pawchive", creator:"<creator_id>", service:"patreon", limit:200, titleFilter:"<可选子串>")`。
 - 帖子结构：`{id, user, service, title, substring, published, file:{name,node,path}, attachments:[…], has_full}`；`path` 形如 `/64/06/<sha>.png`。
-- **原图 URL = `https://n{node}.pawchive.pw/data{path}`**，例如 node=2 → `n2.pawchive.pw`。缩略图是 `https://img.pawchive.pw/thumbnail/data{path}`（**别下缩略图**）。
-- **必须走代理**：`n*.pawchive.pw` 直连会被 `ConnectionResetError(10054)` 重置，实测经 `http://127.0.0.1:7897` 才拿到完整 PNG。`prefer_proxy_hosts` 已包含 pawchive 域。
-- 请求头：`Referer: https://pawchive.pw/` + 浏览器 UA。主域若要 `cf_clearance`，用 `cookies:"<cookies.txt>"` 传 Netscape 格式 cookie（该站与 UA 绑定，工具会统一用固定 UA）。
-- 跳过 `.psd` / `.zip` / 视频（工具内建）；差分图会被当独立帖子下载，交给 dedup 处理。
+- **原图通道已经不是 CDN 了**：`n{node}.pawchive.pw` 在本机全不可用（实测 n1/n3/n4 404、n2 302 跟随后 404、n5 TLS 握手失败），唯一通道是**帖子附件里的 ZIP**——详见下节。缩略图 `https://img.pawchive.pw/thumbnail/data{path}` **别下**（分辨率不够）。
+- 主域若要 `cf_clearance`，用 `cookies:"<cookies.txt>"` 传 Netscape 格式 cookie（该站与 UA 绑定，工具会统一用固定 UA）。
+- 跳过 `.psd` / 视频（ZIP 里常混 PSD 源文件）；**ZIP 本身会被当原图通道解开**，不再是「跳过 zip」。差分图会被当独立帖子下载，交给 `families` / `dedup` 处理。
 - creator_id 怎么找：站内搜索画师名 → URL 里 `/patreon/user/<id>`。也可以先 `web_search` 拿名字再让用户确认。
+
+### 原图怎么下：CDN 全废，只剩帖子附的 ZIP
+
+**坑 1 —— 图片 CDN `n{node}.pawchive.pw` 在本机全不可用。** 实测（UA `animasl/0.1 (+curl)`，直连与 `http://127.0.0.1:7897` 各试一次）：
+
+| 节点 | 直连 | 走代理 |
+|---|---|---|
+| n1 / n3 / n4 | 404（`text/plain` 的 404 页） | 404 |
+| n2 | 302 → `https://n4.pawchive.pw/data/279/<sha>.jpg`（路径里被插进一段 `/279`），跟随 -L 后仍旧 404、body 162 字节 | 同左 |
+| n5 | `ConnectionError`（连接被断） | `SSLError`：**TLS 握手失败** |
+
+n6~n10 未逐个复测，按同批记录同样 404 / 握手失败。`curl --tlsv1.2 -k`、`--insecure`、`--http1.1`、换 UA、带 `Referer` **全无效**——断在握手阶段，跟证书无关。判定一条命令就够（别写成循环去耗时间）：
+
+```
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -A 'anima-style-lora/0.1 (+https://github.com/Nana7mi0721/anima-style-lora-workflow-bundle)' \
+  -x http://127.0.0.1:7897 'https://n2.pawchive.pw/data/<path>'
+# 404 / 000 / curl: (35) 都算不可用；302 且 Location 里多插了一段数字目录的，跟随后还是 404
+```
+
+**坑 2 —— 唯一通道是帖子附的 ZIP，而这条通道认 UA。** URL = `https://file.pawchive.pw/data{attachments[].path}?f=<urlquote(attachments[].name)>`（**与图片 CDN 不同主机**）。同一张 7P 包实测：
+
+| 请求 | 结果 |
+|---|---|
+| UA `anima-style-lora/0.1 (+https://github.com/…)`（或 `animasl/0.1 (+curl)`）+ 代理 | `200 application/zip`，`Content-Length: 76056958` |
+| **Chrome 126 浏览器 UA** + 代理 | **403**（`Server: ddos-guard`），正文原话「Are you a bot or using download tools? … no more than 1 request per second, and 5 active downloads … pretending to be a browser will result in a block.」 |
+| 任意 UA + 直连 | `ReadTimeout` |
+
+所以三件事同时成立才行：**走代理**、**自报家门的 UA**（工具内建 `PAW_UA`，`user_agent` 可覆盖，但**别覆盖成浏览器 UA**）、**频率 ≤1 req/s**。ZIP 是原始无损档，单个包实测 72 MB（7 张）/ 142 MB（14 张）/ 259 MB（14 张），**不要整包下载**：用 HTTP Range 只读两次——尾部 64KB 找 EOCD（`PK\x05\x06`）拿中央目录偏移，再读中央目录（`PK\x01\x02`）挑条目，两次都应回 **206**；然后按 offset 只取选中的条目。内容用 `usize` + `zlib.crc32(data) & 0xFFFFFFFF` 校验——**sha256 ≠ CDN path 名**（CDN 那份是重编码版，同一张图 4.3 MB vs zip 内 10.9 MB），别拿 path 名当哈希。
+
+**坑 3 —— ZIP 条目名是「GBK 被当 cp437 解出来」的乱码，要还原。** 两代包并存，先看 flag 再决定怎么解：
+
+| 包 | `general purpose flag` | bit 11（UTF-8 标志） | 正确的解名方式 |
+|---|---|---|---|
+| 新包（post_id ≥ 168M） | `0x0808` | **置位** | `name_raw.decode("utf-8")` 直接对：`緋雪 03B-7.jpg`、`愛達千琳 01-5.jpg` |
+| 老包（post_id 57M~64M） | `0x0000` | 未置位 | `name_raw.decode("cp437").encode("cp437").decode("gbk")`：`猟━ 06 A-12.jpg` |
+
+判定片段（读中央目录第一条即可，不用整包）：
+
+```python
+off = <该条目 PK\x01\x02 的偏移>
+flag = struct.unpack_from("<H", cd, off + 8)[0]
+nlen = struct.unpack_from("<H", cd, off + 28)[0]
+name = cd[off + 46: off + 46 + nlen]
+print(hex(flag), bool(flag & 0x800))                 # 0x808 True / 0x0 False
+try:
+    print(name.decode("utf-8"))                       # 新包走这条
+except UnicodeDecodeError:
+    print(name.decode("cp437").encode("cp437").decode("gbk", "replace"))   # 老包走这条
+```
+
+实测 40 个包（最新 20 + 最老 20）：`bit11 stats: {True: 17, False: 20}`（另 3 个 HEAD 失败）。**老包里有 6/40 连 cp437→gbk 也解不开**（Shift-JIS 或截断名，如 post 63653860 / 63311159 / 62843536）——这时用「最后一个空格之后的纯 ASCII 尾巴」匹配（`<角色名> 03A-7.jpg` 只拿 `03A-7.jpg` 比对），中文前缀丢了不影响定位。
+
+**绕道步骤**：
+
+1. `anima_stage(stage:"fetch", dataset:"X", source:"pawchive", creator:"<id>", service:"patreon", limit:200)`——默认 `archiveMode:"auto"`：先试 CDN，全失败才转 ZIP。
+2. CDN 已知全废、不想等那段超时：`archiveMode:"zip"` 强制只走 ZIP；`"http"` 只直连（复现坑 1 用）。
+3. 先 `dryRun:true` 看会下多少（`raw_posts.jsonl` 里每个 post 的 `attachments` 数），别一头扎进几十 GB；返回的 `archives` / `zip_posts` / `archive_mode` 字段写清这次用了哪条通道。
+4. 下完 `anima_status(dataset:"X")` 核对张数，再进 `families` / `dedup`。
 
 ## §5 exhentai
 
@@ -102,3 +160,14 @@ anima_stage(stage:"enrich", dataset:"X", apply:true)  # 把权威标签补进 ra
 danbooru 支持 `md5:<hex>`；**不支持 `md5:a,md5:b` 批量**，一张一次请求（默认 0.35s 间隔）。md5 不中时还会用**文件名里的 pixiv illust id** 再兜一次（`<id>_p<页>` 命名，`noPixiv:true` 关掉）：只认「原文件名同名同页」或「该作品只有一帖且本图是 p0」，挑不出同一页就不认（多页作品尺寸常常完全一样，硬贴会串页）。**必须在 `text` 修补之前跑**（改过像素 md5 就变），命中率低于一半时先怀疑三件事：跑过修补、裁剪或重编码过、原图本来没上传 danbooru。
 
 但**命中率天生可能很低**：实测 redash 的 72 张图 md5 只中 3 张（都是当初从 danbooru 抓下来的），200 张 pixiv 原图里能解析出 id 的 46 张只有 6 张在 danbooru 有帖。**只发 pixiv 的画师，booru 上就是没有**——这时别反复重跑 `enrich`，把力气放到看图（B 源）上。
+
+### yande.re 抓来的图：md5 反查基本无效，改走「帖号 → source URL」
+
+yande.re 的图与 danbooru 是两套文件：实测 253 张里 md5 只重合 **2 张**，source URL 也几乎不重叠。所以对 yande 源别再指望 md5，工具会自动换一条路：从 `raw_posts.jsonl` 的 `page_url` / `post_id` 还原出 `https://yande.re/post/show/<id>`，再用 danbooru 的 `search[url]`（失败再试 `tags:"source:<url>"`）反查原帖，只认 **source 完全相等** 的那一条；查询只回 1 帖时才兜底认它。命中后 `by` 记成 `yande-url` / `yande-source`，从该帖的 `pixiv_id` 还能继续追 pixiv。
+
+```
+anima_stage(stage:"enrich", dataset:"X")              # dry-run：看 enrich_report.dryrun.csv 的 by 列
+anima_stage(stage:"enrich", dataset:"X", apply:true)  # 写回 raw_posts.jsonl
+```
+
+dry-run 结束会按来源打印命中率（`source_rates`：yande / danbooru / other / unknown 各自的 命中/查询/比例），并明确提示「yande 源 md5 命中率≈0，优先用 families 视觉合并」。看到 yande 一行全 0 是正常的，不是网络坏了。

@@ -21,6 +21,11 @@ danbooru 支持 `md5:<hex>` 搜索。只要手上还有原始字节，就能把�
 原文件名与我们的 old_name 同名同页，或该作品只有一帖且我们是 p0 —— 其余不猜，
 错标签比没标签更糟。
 
+**yande 源的 md5 反查几乎无效**（实测 2/253）：yande 的字节在上传链路上被重编码过，
+md5 对不上是常态。对这种来源改走「yande 帖号 → danbooru `source` URL」反查
+（`lookup_yande`），仍查不到就跳过 —— 报告按来源分桶给命中率，并提示优先用
+families 视觉合并补齐（同族/同一张图先按像素匹配合并，再借同源帖的标签）。
+
     fetch/import → **enrich** → dedup → screen → text → rename → wash
 
 顺序红线：`text`（文字修补）会重写像素 ⇒ md5 变 ⇒ 查不到。所以要跑在 text 之前；
@@ -40,13 +45,20 @@ import time
 from pathlib import Path
 
 from . import curate, net
-from .fetch import DANBOORU_API, post_date
+from .fetch import DANBOORU_API, pixiv_id_from_url, post_date
 
 CHUNK = 1 << 20
 SLEEP = 0.35                      # 查询间隔：~3 req/s，远低于 danbooru 认证用户的额度
 IMG_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
 # pixiv 下载器的常见命名：<illust_id>_p<page>-标题.png / <illust_id>_p<page>.jpg
 PIXIV_RX = re.compile(r"^(\d+)_p(\d+)", re.I)
+
+# yande 帖页 URL 里的 post id：报告和反查都靠它把行还原成「哪一帖」。
+YANDE_POST_RX = re.compile(r"yande\.re/post/show/(\d+)", re.I)
+# 分来源统计用固定顺序（yande / danbooru / 其他 / 未知），报告行序才稳定
+SOURCE_KEYS = ("yande", "danbooru", "other", "unknown")
+SOURCE_LABELS = {"yande": "yande 源", "danbooru": "danbooru 源",
+                 "other": "其他 booru", "unknown": "未知来源"}
 
 
 def file_md5(path: Path) -> str:
@@ -129,6 +141,105 @@ def lookup(s, md5: str) -> dict | None:
     return data[0]
 
 
+def source_bucket(row: dict) -> str:
+    """把一行元数据归到报告分桶：yande / danbooru / other / unknown。
+
+    判据优先看 \`source\` 字段（fetch 写着 yandere / danbooru / pawchive / exhentai），
+    再看帖页 URL 的域名，最后认不出来才归 unknown —— 分不清来源就没法解释命中率。
+    """
+    src = str(row.get("source") or "").strip().lower()
+    if "yandere" in src or "yande" in src:
+        return "yande"
+    if "danbooru" in src:
+        return "danbooru"
+    for other in ("pawchive", "exhentai", "e-hentai", "pixiv", "gelbooru", "sankaku",
+                  "konachan", "safebooru", "zerochan", "twitter", "x.com"):
+        if other in src:
+            return "other"
+    for field in ("page_url", "post_url", "source_url", "url"):
+        text = str(row.get(field) or "").lower()
+        if "yande.re" in text:
+            return "yande"
+        if "danbooru.donmai.us" in text:
+            return "danbooru"
+        if text.startswith("http"):
+            return "other"
+    return "unknown"
+
+
+def yande_post_url(row: dict) -> str:
+    """把一行 fetch 元数据还原成 yande 帖页 URL；还原不出来返回 ""。
+
+    yandere 的行里 \`post_id\` 就是 yande 帖号，\`page_url\` 也常带着完整 URL；
+    两者都没有（手改过的行）就放弃，不猜。
+    """
+    for field in ("page_url", "post_url"):
+        m = YANDE_POST_RX.search(str(row.get(field) or ""))
+        if m:
+            return f"https://yande.re/post/show/{m.group(1)}"
+    pid = str(row.get("post_id") or "").strip()
+    if pid.isdigit() and source_bucket(row) == "yande":
+        return f"https://yande.re/post/show/{pid}"
+    return ""
+
+
+def _pick_by_url(posts: list[dict], post_url: str) -> dict | None:
+    """从 danbooru 的查询结果里挑出**确实**指向这条 yande 帖的那一帖。
+
+    只要有一条的 \`source\` 就是这条 yande URL 就用它；一条都没有时，只有「整个查询
+    只返回一帖」才认。多帖时猜错会把别人的标签贴上来 —— 错标签比没标签更糟。
+    """
+    want = post_url.rstrip("/").lower()
+    hits = [p for p in posts if want in str(p.get("source") or "").lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits and len(posts) == 1:
+        return posts[0]
+    return None
+
+
+def lookup_yande(s, post_url: str, limit: int = 5) -> tuple[dict | None, str]:
+    """yande 帖号 → danbooru 原帖：先 \`search[url]\`，再 \`tags=source:<url>\`。
+
+    为什么要有这条路（ruzhai 复盘 D 段）：yande 源的文件字节在上传链路上几乎都被
+    重编码过，\`md5:\` 反查实测只有 2/253 命中。但 yande 与 danbooru 上大量是同一批
+    画师的作品，danbooru 帖的 \`source\` 字段里留着 yande 帖页 URL —— 这条线索跟像素
+    无关，稳得多，命中就能拿回整条 \`tag_string\`。
+
+    两个查询都打空时返回 \`(None, "yande-none")\`，由调用方记成没查到（不猜）。
+    """
+    if not post_url:
+        return None, ""
+    last: Exception | None = None
+    for params, how in (({"search[url]": post_url, "limit": limit}, "yande-url"),
+                        ({"tags": f"source:{post_url}", "limit": limit}, "yande-source")):
+        try:
+            data = net.get_json(s, DANBOORU_API, params)
+        except Exception as exc:                      # 换下一个查询，别整批断掉
+            last = exc
+            continue
+        if not isinstance(data, list) or not data:
+            continue
+        post = _pick_by_url(data, post_url)
+        if post is not None:
+            return post, how
+    if last is not None:                              # 两个查询都是网络错：往上抛，别记成没查到
+        raise last
+    return None, "yande-none"
+
+
+def source_rates(stats: dict[str, dict[str, int]]
+                 ) -> list[tuple[str, str, int, int, float]]:
+    """报告用：(key, label, hit, queried, rate) 固定顺序；没查过的来源也会列出来。"""
+    out = []
+    for key in SOURCE_KEYS:
+        st = stats.get(key) or {}
+        q = int(st.get("queried") or 0)
+        h = int(st.get("hit") or 0)
+        out.append((key, SOURCE_LABELS[key], h, q, (h / q) if q else 0.0))
+    return out
+
+
 def post_row(post: dict, key: str, md5: str, name: str, by: str = "md5",
              pixiv: str = "") -> dict:
     """与 `fetch.py` 的行保持同形，下游（rename / wash / screen）不必知道它从哪来。"""
@@ -180,7 +291,10 @@ def cmd_enrich(ds, limit: int = 0, apply: bool = False, force: bool = False,
                   if p.is_file() and p.suffix.lower() in IMG_EXT) if root.exists() else []
     if not imgs:
         print(f"[enrich] {root.name}/ 里没有图片：先 fetch 或 import")
-        return {"rows": [], "hit": 0, "miss": 0, "skipped": 0, "queried": 0, "written": 0}
+        return {"rows": [], "hit": 0, "miss": 0, "skipped": 0, "queried": 0,
+                "written": 0, "by_md5": 0, "by_pixiv": 0, "by_yande": 0,
+                "by_source": {k: {"queried": 0, "hit": 0} for k in SOURCE_KEYS},
+                "report": ""}
 
     rmap = curate.load_rename_map(ds)
     meta = curate.load_meta(ds)
@@ -197,70 +311,103 @@ def cmd_enrich(ds, limit: int = 0, apply: bool = False, force: bool = False,
     rows: list[dict] = []
     report: list[dict] = []
     hit = miss = skipped = queried = 0
-    by_md5 = by_pixiv = 0
+    by_md5 = by_pixiv = by_yande = 0
+    # 分来源统计：yande 源的 md5 命中率≈0（2/253），混在总命中率里会被彻底掩盖，
+    # 所以每张图先定来源桶，查询次数/命中数都记到桶上，报告按桶给命中率。
+    stats: dict[str, dict[str, int]] = {k: {"queried": 0, "hit": 0} for k in SOURCE_KEYS}
     for idx, p in enumerate(imgs, 1):
         if limit and queried >= limit:
             print(f"  （--limit {limit} 已用完，剩 {len(imgs) - idx + 1} 张没查）")
             break
         key = lookup_key(p.name, rmap)
         prev = meta.get(key) or {}
+        bucket = source_bucket(prev)
         if not force and prev.get("tags"):
             skipped += 1
             report.append({"file": p.name, "key": key, "md5": "", "by": "",
-                           "status": "has-tags", "post_id": prev.get("post_id") or "",
+                           "status": "has-tags", "source": bucket,
+                           "post_id": prev.get("post_id") or "",
                            "tags_n": len(prev["tags"])})
             continue
         md5 = file_md5(p)
         if not force and prev.get("post_id") and str(prev.get("md5") or "") == md5:
             skipped += 1
             report.append({"file": p.name, "key": key, "md5": md5, "by": "",
-                           "status": "same-md5", "post_id": prev.get("post_id") or "",
-                           "tags_n": 0})
+                           "status": "same-md5", "source": bucket,
+                           "post_id": prev.get("post_id") or "", "tags_n": 0})
             continue
         queried += 1
+        stats[bucket]["queried"] += 1
         by, post, pixiv_id = "md5", None, ""
         try:
             post = lookup(s, md5)
             time.sleep(sleep)
-            # md5 查不到时，用文件名里的 pixiv illust id 再试一次。命中率差别很大：
-            # 同一张图被 danbooru 重编码过就永远 md5 不中，但 pixiv_id 还在。
+            # 第一条支路（yande 源专用）：yande 帖号 → danbooru 的 source URL。
+            # yande 的字节几乎都被重编码过，md5 查不到是常态（实测 2/253），这条才是主路。
+            if post is None and bucket == "yande":
+                yurl = yande_post_url(prev)
+                if yurl:
+                    queried += 1
+                    post, by = lookup_yande(s, yurl)
+                    time.sleep(sleep)
+            # 第二条支路：文件名里的 pixiv illust id。同一张图被 danbooru 重编码过就永远
+            # md5 不中，但 pixiv_id 还在；yande 行还能从 source_url 里取到这个 id。
             if post is None and not no_pixiv:
                 info = pixiv_of(key)
+                page = info[1] if info else 0
                 if info:
                     pixiv_id = info[0]
+                elif bucket == "yande":
+                    pixiv_id = (str(prev.get("pixiv_id") or "")
+                                or pixiv_id_from_url(str(prev.get("source_url") or "")))
+                if pixiv_id:
                     queried += 1
                     cands = lookup_pixiv(s, pixiv_id)
                     time.sleep(sleep)
-                    post, how = pick_pixiv(cands, key, info[1], _size(p))
+                    post, how = pick_pixiv(cands, key, page, _size(p))
                     by = how
-                    if post is None and how.endswith("none") and not cands:
-                        by = "md5"          # 该作品在 danbooru 一帖都没有：还是记成没查到
+                    if post is not None and bucket == "yande":
+                        by = "yande-pixiv"          # yande 源靠作品 id 找回来，单独计数
+                    elif post is None and how.endswith("none") and not cands:
+                        # 该作品在 danbooru 一帖都没有：还是记成没查到
+                        by = "yande-none" if bucket == "yande" else "md5"
         except Exception as exc:                       # 网络/风控失败不该中断整批
             print(f"  ! {p.name}: {type(exc).__name__}: {exc}")
             report.append({"file": p.name, "key": key, "md5": md5, "by": "",
-                           "status": f"error:{type(exc).__name__}", "post_id": "", "tags_n": 0})
+                           "status": f"error:{type(exc).__name__}", "source": bucket,
+                           "post_id": "", "tags_n": 0})
             time.sleep(sleep)
             continue
         if post is None:
             miss += 1
-            note = f"（{by}）" if by.startswith("pixiv") else f"（md5 {md5[:8]}…）"
+            if by.startswith("pixiv"):
+                note, status = f"（{by}）", by
+            elif by.startswith("yande-"):
+                note, status = f"（{bucket} 反查未中）", "no-match"
+            else:
+                note, status = f"（md5 {md5[:8]}…）", "no-match"
             report.append({"file": p.name, "key": key, "md5": md5, "by": by,
-                           "status": by if by.startswith("pixiv") else "no-match",
+                           "status": status, "source": bucket,
                            "post_id": "", "tags_n": 0})
             print(f"  [{idx}/{len(imgs)}] {p.name}  ✗ danbooru 上没有这张图 {note}")
             continue
         hit += 1
+        stats[bucket]["hit"] += 1
         row = post_row(post, key, md5, p.name, by=by, pixiv=pixiv_id)
+        row["lookup"]["from_source"] = bucket    # 记下这行是从哪一类来源补出来的
         rows.append(row)
         if by == "md5":
             by_md5 += 1
-        else:
+        elif by.startswith("pixiv") or by == "yande-pixiv":
             by_pixiv += 1
+        else:                                    # yande-url / yande-source
+            by_yande += 1
         report.append({"file": p.name, "key": key, "md5": md5, "by": by,
-                       "status": "match", "post_id": post.get("id"),
+                       "status": "match", "source": bucket, "post_id": post.get("id"),
                        "tags_n": len(row["tags"])})
         print(f"  [{idx}/{len(imgs)}] {p.name}  ✓ post {post.get('id')}  "
-              f"{len(row['tags'])} 标签  rating={row['rating'] or '-'}  by={by}")
+              f"{len(row['tags'])} 标签  rating={row['rating'] or '-'}  by={by}  "
+              f"source={bucket}")
 
     written = _merge(ds, rows, force=force) if (apply and rows) else 0
     # 报告**永远**写（包括 dry-run）。早先只在 apply 时写，真实使用的反馈是
@@ -271,12 +418,13 @@ def cmd_enrich(ds, limit: int = 0, apply: bool = False, force: bool = False,
         path = ds.pipe_dir / ("enrich_report.csv" if apply else "enrich_report.dryrun.csv")
         with open(path, "w", encoding="utf-8", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=["file", "key", "md5", "by", "status",
-                                               "post_id", "tags_n"])
+                                               "source", "post_id", "tags_n"])
             w.writeheader()
             w.writerows(report)
         print(f"[enrich] 报告 -> {path}（{len(report)} 行）")
 
-    print(f"[enrich] 命中 {hit}（md5 {by_md5} / pixiv_id {by_pixiv}）　查不到 {miss}　"
+    print(f"[enrich] 命中 {hit}（md5 {by_md5} / pixiv_id {by_pixiv} / "
+          f"yande 帖号 {by_yande}）　查不到 {miss}　"
           f"跳过 {skipped}（已有标签或已查过）　共查 {queried} 次")
     if hit:
         if apply:
@@ -306,6 +454,25 @@ def cmd_enrich(ds, limit: int = 0, apply: bool = False, force: bool = False,
                       "（文件名形如 <illust_id>_p<page> 时它能救回重编码过的图）")
         if by_pixiv:
             print(f"         其中 {by_pixiv} 张是 pixiv_id 兜回来的（md5 不中但原帖还在）")
+        if by_yande:
+            print(f"         其中 {by_yande} 张是 yande 帖号反查 danbooru source URL 命中的")
+
+    # 分来源命中率：总命中率会把「yande 几乎全灭、danbooru 正常」糊成一团，
+    # 看不出该换哪条路。这里按桶列清楚，再给一句结论。
+    rates = source_rates(stats)
+    if any(q for _k, _lbl, _h, q, _r in rates):
+        print("[enrich] 分来源命中率：")
+        for _k, label, h, q, r in rates:
+            if q:
+                print(f"         {label}  {h}/{q}  {r:.0%}")
+        yd = next((r for r in rates if r[0] == "yande"), None)
+        if yd and yd[3]:
+            print("         ! yande 源 md5 命中率≈0，优先用 families 视觉合并：yande 的字节"
+                  "几乎都被重编码过，md5 必然对不上（实测 2/253）。")
+            print("           本次已改走「yande 帖号 → danbooru source URL」反查；仍补不上就别硬凑，"
+                  "交给 families 按族合并后用同源帖的标签。")
     return {"rows": rows, "hit": hit, "miss": miss, "skipped": skipped,
-            "queried": queried, "written": written, "by_md5": by_md5, "by_pixiv": by_pixiv,
+            "queried": queried, "written": written, "by_md5": by_md5,
+            "by_pixiv": by_pixiv, "by_yande": by_yande,
+            "by_source": {k: dict(v) for k, v in stats.items()},
             "report": str(path) if report else ""}

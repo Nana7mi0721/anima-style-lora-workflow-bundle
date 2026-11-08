@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -69,6 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--title-filter", default="", help="pawchive：标题子串过滤")
     sp.add_argument("--include-cover", action="store_true",
                     help="pawchive：连封面 file（cover.jpeg，不是作品）一起抓；默认跳过")
+    sp.add_argument("--archive-mode", default="auto", choices=["auto", "zip", "http"],
+                    help="pawchive：auto=先直连 CDN、失败再走帖子 ZIP；zip=强制 ZIP+Range；http=只直连")
+    sp.add_argument("--families", action="store_true",
+                    help="yandere：保留整族（parent + 若干 child），默认只留最新一张")
+    sp.add_argument("--take", default="",
+                    help="yandere --families 的取法：整数，或 \"max(2,n//2)\"（默认每族 2~一半）")
+    sp.add_argument("--min-id", type=int, default=0,
+                    help="yandere：只收 id >= min-id 的帖子")
+    sp.add_argument("--since", default="",
+                    help="yandere：只收 created_at >= since（YYYY-MM-DD）")
     sp.add_argument("--dry-run", action="store_true")
 
     sp = add("import", "把本地文件/压缩包导入 00_raw")
@@ -104,6 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-side", type=int, default=1536)
     sp.add_argument("--include-images", action="store_true")
     sp.add_argument("--prune", action="store_true", help="删掉没有对应原图的陈旧缩略图")
+    sp.add_argument("--names", default="",
+                    help="只生成这些图：0001,0002 / 0001-0012 / 0001*（省略=全部）")
     sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
 
     sp = add("text", "检测图中文字并修补（rfdetr + lama）")
@@ -119,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
                     help="检测类别阈值，如 text=0.15,onomatopoeia=0.12（默认 text=0.30,onomatopoeia=0.25）")
     sp.add_argument("--patch-small", action="store_true",
                     help="连水印等小面积文字也修补（默认只有 >8%% 的大段文字才修补）")
+    sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
     sp.add_argument("--keep-masks", action="store_true",
                     help="修补后保留掩膜（默认清掉本次用过的；失败的掩膜始终保留）")
     _apply(sp)
@@ -127,9 +141,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--names", default="", help="只恢复这些图（名字或编号，逗号分隔）；省略则全部对得上的")
     _apply(sp)
 
-    sp = add("rename", "重排编号为 0001…（下载后、洗标前）")
+    sp = add("rename", "重排编号为 0001…（下载后、洗标前；认图桶，桶内就地重排）")
     sp.add_argument("--start", type=int, default=1)
     sp.add_argument("--digits", type=int, default=4)
+    sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
+    _apply(sp)
+
+    sp = add("families", "差分家族：跨源合并 + 同图去重 + 按族建 diff<k> 桶（默认 dry-run）")
+    sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
+    sp.add_argument("--phash-distance", type=int, default=6, help="同图判重的 pHash 汉明距离")
+    sp.add_argument("--ssim", type=float, default=0.995, help="同图判重的 SSIM 阈值")
+    sp.add_argument("--corr", type=float, default=0.85, help="跨源同族合并的灰度相关系数阈值")
+    sp.add_argument("--rebuild", action="store_true",
+                    help="忽略已有 families.json，重新分组")
     _apply(sp)
 
     sp = add("wash", "洗标：规则引擎规范化 + 七槽位排序")
@@ -185,6 +209,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--work-set", default="", help="只在这些图桶里找（逗号分隔）")
     _apply(sp)
 
+    sp = add("conflicts", "统计 caption 的冲突族（只读；status 的冲突行用它）", required=True)
+    sp.add_argument("--trigger", default="", help="覆盖触发词（默认取 manifest.trigger）")
+    sp.add_argument("--work-set", default="", help="只处理这些图桶（逗号分隔）；默认自动发现")
+    sp.add_argument("--json", action="store_true", help="输出 JSON（status 工具解析用）")
+
     sp = add("dict-check", "查一批标签在词典里的真实存在性与 category/post_count（消灭编造标签）",
              required=False)
     sp.add_argument("--tags", default="", help="逗号或空格分隔的标签；省略则读数据集 caption 里的全部标签")
@@ -214,6 +243,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="明知 LR 超出该 rank 的建议区间也照写（默认报错让你确认）")
     sp.add_argument("--keep-backups", type=int, default=-1,
                     help="训练配置的 .bak 保留代数（默认取 hygiene.makecfg_backups，出厂 1；0 = 不留）")
+    sp.add_argument("--dedup-mode", default="fingerprint",
+                    choices=["fingerprint", "content", "none"],
+                    help="跨桶去重方式：fingerprint=(大小,前256KB md5)，认硬链接但对"
+                         "「同一张图不同编码」无效；content=感知哈希，认得出不同编码；none=不跨桶去重")
+    sp.add_argument("--phash-distance", type=int, default=4,
+                    help="--dedup-mode content 的汉明距离阈值（默认 4，与 dedup 阶段一致）")
     _apply(sp)
 
     sp = add("doctor", "检查环境：python / torch / rfdetr / 模型 / 代理 / 词典", required=False)
@@ -346,15 +381,27 @@ def _dict_check(cfg, tags: str, limit: int = 0, ds=None) -> int:
         if extra.get("from"):
             aliases.setdefault(extra["from"], extra.get("to"))
     drops = set(rules.get("drop_exact") or [])
+    # 评级词（safe/sensitive/explicit/nsfw…）是 Anima 打标器的 rating 值，不是 danbooru 标签，
+    # 本来就不在词典里。每次都让用户自己判断「这两个不用管」是纯噪音 —— 内置白名单，
+    # 只在报告里单独列一行。
+    rating: set[str] = set()
+    for t in (rules.get("rating_tags") or []):
+        if isinstance(t, str) and t.strip():
+            rating.add(t.strip().lower())
+            rating.add(wash.lookup_key(t.strip().lower()))
 
     ok: list[tuple[str, str, int]] = []
     zombie: list[str] = []
     missing: list[str] = []
+    rating_hit: list[str] = []
     aliasable: list[tuple[str, str]] = []
     near_cache: dict = {}
     for raw_tag in wanted:
         key = wash.lookup_key(raw_tag)
         rec = td.meta.get(key)
+        if rec is None and (key in rating or raw_tag.strip().lower() in rating):
+            rating_hit.append(raw_tag)
+            continue
         if rec is None:
             tgt = aliases.get(raw_tag) or aliases.get(raw_tag.replace("_", " "))
             if isinstance(tgt, list):
@@ -384,11 +431,15 @@ def _dict_check(cfg, tags: str, limit: int = 0, ds=None) -> int:
     counts_of = lambda t: f"×{counts[t]} 张" if counts.get(t) else ""  # noqa: E731
     print(f"[dict-check] 查 {len(wanted)} 个标签（{source}；词典 {td.size()} 条）")
     print(f"  存在 {len(ok)}　别名可归一 {len(aliasable)}　词典里没有 {len(missing)}　"
-          f"post_count=0（幻觉标签）{len(zombie)}")
+          f"post_count=0（幻觉标签）{len(zombie)}"
+          + (f"　评级词（约定保留）{len(rating_hit)}" if rating_hit else ""))
     for name, cat, posts in sorted(ok, key=lambda r: -r[2])[:show]:
         print(f"  ✓ {name:<38} {cat:<10} {posts:>10,} posts")
     if len(ok) > show:
         print(f"  … 另有 {len(ok) - show} 个存在（省略；要看全部就调大 limit）")
+    if rating_hit:
+        print(f"\n  · 评级词 {len(rating_hit)} 个（Anima 打标器的 rating 值，不是 danbooru 标签，"
+              f"约定保留、无需处理）：" + "、".join(sorted(rating_hit)))
     if aliasable:
         print(f"\n  ↪ 词典里没有，但别名表会归一成现行形（可以照写）：")
         for name, tgt in sorted(aliasable, key=lambda kv: -counts.get(kv[0], 0)):
@@ -520,6 +571,23 @@ def main(argv: list[str] | None = None) -> int:
     ds = _ds(args)
     ds.ensure_dirs()
 
+    if cmd == "conflicts":
+        m = manifest.ensure(ds)
+        fn = getattr(wash, "conflict_counts", None)
+        if fn is None:
+            print("[conflicts] 当前 wash 模块没有 conflict_counts（安装副本与源码版本不一致？）")
+            return 1
+        fam = fn(ds, work_set=_work_set(args), trigger=args.trigger or m.trigger) or {}
+        rows = sorted(((str(k), int(v)) for k, v in fam.items()), key=lambda kv: -kv[1])
+        total = sum(v for _, v in rows)
+        if args.json:
+            print(json.dumps({"total": total, "counts": dict(rows)}, ensure_ascii=False))
+        else:
+            detail = "、".join(f"{k} {v}" for k, v in rows)
+            print(f"[conflicts] 提示 {total} 条" + (f"：{detail}" if rows else "（无）")
+                  + "　—— 只是提示，不是硬约束；分级细节见 wash_verify.csv")
+        return 0
+
     if cmd == "dict-check":
         return _dict_check(ds.cfg, getattr(args, "tags", ""), getattr(args, "limit", 0), ds)
 
@@ -603,14 +671,17 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "fetch":
         cfg = ds.cfg
         if args.source == "yandere":
-            res = fetch.fetch_yandere(cfg, ds, args.tags, limit=args.limit, dry_run=args.dry_run)
+            res = fetch.fetch_yandere(cfg, ds, args.tags, limit=args.limit, dry_run=args.dry_run,
+                                      families=args.families, take=args.take,
+                                      min_id=args.min_id, since=args.since)
         elif args.source == "danbooru":
             res = fetch.fetch_danbooru(cfg, ds, args.tags, limit=args.limit, dry_run=args.dry_run)
         elif args.source == "pawchive":
             res = fetch.fetch_pawchive(cfg, ds, args.creator, service=args.service, limit=args.limit,
                                        dry_run=args.dry_run, cookies_file=args.cookies,
                                        title_filter=args.title_filter,
-                                       include_cover=args.include_cover)
+                                       include_cover=args.include_cover,
+                                       archive_mode=args.archive_mode)
         else:
             res = fetch.fetch_exhentai(cfg, ds, args.gallery, limit=args.limit,
                                        dry_run=args.dry_run, cookies_file=args.cookies)
@@ -655,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "thumbs":
         curate.cmd_thumbs(ds, max_side=args.max_side, include_images=args.include_images,
-                          prune=args.prune, work_set=_work_set(args))
+                          prune=args.prune, work_set=_work_set(args), names=args.names)
         return 0
 
     if cmd == "text":
@@ -672,7 +743,8 @@ def main(argv: list[str] | None = None) -> int:
         textmod.cmd_text(ds, apply=args.apply, rules_over=over, dilate=args.dilate,
                          device=args.device, classes=args.classes, limit=args.limit,
                          detect_only=args.detect_only, inpaint_only=args.inpaint_only,
-                         keep_masks=True if args.keep_masks else None)
+                         keep_masks=True if args.keep_masks else None,
+                         work_set=_work_set(args))
         _mark(ds, "text", _applied(args))
         return 0
 
@@ -683,8 +755,25 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "rename":
-        curate.cmd_rename(ds, start=args.start, digits=args.digits, apply=args.apply)
+        curate.cmd_rename(ds, start=args.start, digits=args.digits, apply=args.apply,
+                          work_set=_work_set(args))
         _mark(ds, "rename", _applied(args))
+        return 0
+
+    if cmd == "families":
+        try:
+            from . import families as familiesmod
+        except ImportError:
+            print("[families] 当前安装副本没有 families 模块（源码落后于安装副本？）")
+            return 1
+        fn = getattr(familiesmod, "cmd_families", None)
+        if fn is None:
+            print("[families] families 模块没有 cmd_families（版本不一致）")
+            return 1
+        fn(ds, apply=args.apply, work_set=_work_set(args),
+           phash_distance=args.phash_distance, ssim=args.ssim, corr=args.corr,
+           rebuild=args.rebuild)
+        _mark(ds, "families", _applied(args))
         return 0
 
     if cmd == "wash":
@@ -751,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
                             batch=args.batch, grad_accum=args.grad_accum,
                             repeats=repeats or None, apply=args.apply,
                             dataset_dir=args.dataset_dir or None, force=args.force,
+                            dedup_mode=args.dedup_mode, phash_distance=args.phash_distance,
                             allow_out_of_band=args.allow_out_of_band,
                             keep_backups=None if args.keep_backups < 0 else args.keep_backups)
         _mark(ds, "config", _applied(args))

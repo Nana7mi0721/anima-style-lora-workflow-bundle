@@ -33,7 +33,34 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 真实使用里出现过 `clean/`（109 张已修水印）+ `watermark/`（33 张未修）、而 `images/` 是空的布局 —— 成品 caption 全在子目录里，工具只数 `images/` 时 `anima_status` 报 `raw=0 images=0 captions=0`，`verify`/`thumbs`/`fix-caption` 对 142 条成品视而不见，`makecfg` 还会把同一张图算两遍。
 
-现在的规则：**根下任何含图的子目录都自动算图桶**（跳过 `_`/`.` 前缀与 `00_raw`/`thumbs`/`masks`/`orig_text`；空目录不算），`images/` 排最前；caption 与图**同目录**；所有阶段默认扫全部桶。只想处理某个子集就传 `workSet:"clean,watermark"`——**给错名字会报错并列出自动发现的桶**（不会静默变成空集）。`makecfg` 另按内容指纹跨桶去重（硬链接/副本只算一次），整桶都是副本时跳过并说明原因。
+现在的规则：**根下任何含图的子目录都自动算图桶**（跳过 `_`/`.` 前缀与 `00_raw`/`thumbs`/`masks`/`orig_text`；空目录不算），`images/` 排最前；caption 与图**同目录**；所有阶段默认扫全部桶。只想处理某个子集就传 `workSet:"clean,watermark"`——**给错名字会报错并列出自动发现的桶**（不会静默变成空集）。`makecfg` 另按内容指纹跨桶去重（见下节「跨桶去重的指纹」），整桶都是副本时跳过并说明原因。
+
+`text` / `text-rollback` 与 `rename` **也认图桶**：前两者的工作集是 `work_images(workSet) or raw_images()`（图桶优先——桶布局下 `images/` 经常是空的，只扫 `00_raw` 会一张都找不到）；`rename` 在 `00_raw/` 还有待整理的图时把它们搬进 `images/`，`00_raw/` 空了就在**桶内就地重排、不跨桶搬文件**，编号**跨桶连续**（`clean 0001…0109`、`watermark 0110…0142`）——因为 `thumbs/`、`masks/`、`orig_text/` 都按 stem 扁平命名，各桶从 0001 重号会互相踩。`rename_map.csv` 多一列 `bucket`，只想重排某个桶就传 `workSet:"clean"`。
+
+### 差分家族与 `diff<k>` 桶（families）
+
+一张画常出 3~15 个差分（表情、服装、裁切），同一族的图内容几乎全同，repeats 必须按「族」摊而不是按张数硬堆。`families` 阶段把这件事固化成一条命令：
+
+```
+anima_stage(stage:"families", dataset:"X")              # dry-run：只算不搬，仍然写两份报告
+anima_stage(stage:"families", dataset:"X", apply:true)  # 建 diff<k>/ 桶、整族搬进去、删同族重复
+```
+
+四步：①**声明家族**——yande.re 用 `parent_id` 链到根（同一棵 parent 树 = 一族）、pawchive 一个 `post_id` = 一族、没有元数据的图各自成族（`rename` 之后靠 `rename_map.csv` 的 `old_name` 找回原帖）。②**跨源合并**——同一族在 yande.re 与 pawchive 各有一份时，用 256×256 灰度去均值签名，`corr >= 0.85` 且分属不同声明家族就并成一族。③**同图去重**——同族内「同分辨率 + pHash ≤ 6 + SSIM ≥ `ssim`（默认 0.995）+ 三道局部差闸」判同一张，只留体积最大那份，**不传递**（A~B~C 不会把 A、C 压成一张，否则三张真差分会被压成一张），apply 时落选者连 `.txt` 进 `_excluded/duplicates-family/`。④**按族建桶**——桶名 `diff<k>`，`k` = 该族去重后的实际张数；`repeats = max(1, round(base/√k))`，`base = repeats_for(去重后总张数)`（<20→6、<50→3、<100→2、否则 1）。
+
+桶名就是 k 的好处：**一个桶里所有族的张数相同**，`makecfg` 一个桶只给一个 `repeats` 就够。算例：去重后 60 张 → `base=2`；某族 k=4 → `round(2/2)=1`；k=9 → `round(0.67)=1`；k=1（单图族）→ 2。k≥5 时 `round` 可能给 0，`max(1, …)` 兜住——**repeats=0 在训练里等于把这组丢了**。ruzhai 那批 283 张的分桶结果就是这样：`diff1 14 / diff2 116 / diff3 66 / diff4 32 / diff5 35 / diff6 6 / diff7 14`。
+
+报告写两份，**dry-run 也写**（预演也要能看结论）：`_pipeline/families_report.csv`（`family, declared_sources, size_before, size_after, bucket, repeats, members`，人看）与 `_pipeline/families.json`（机器读，`rebuild:false` 时下次直接复用；改了分桶规则才传 `rebuild:true`）。先看 `size_before → size_after` 与 `bucket` 列，再决定要不要 apply。
+
+### 跨桶去重的指纹：认硬链接，不认重编码
+
+`makecfg` 自动发现桶后会**跨桶去重**，默认 `dedupMode:"fingerprint"`：指纹 = `(文件大小, 前 256KB 的 md5)`（262144 字节）。
+
+- **认什么**：硬链接、`cp` 出来的副本、改过名的同一份字节——整桶都是副本时跳过该桶并提示「想同时训练两个版本就改文件名，别用硬链接」。代价极低（每张只读 256KB）。
+- **对差分图安全**：差分图任何一块像素都不同，字节大小也几乎不可能撞，指纹必然不同，不会误删。
+- **认不出什么**：**同一张图的不同编码 / 重存**（JPEG 重压、缩放、换格式）——大小和字节全变，指纹完全不同，这类会被当两张不同的图收进配置。要用视觉判定：`families` 阶段的同图去重（SSIM ≥ `ssim` + 三道局部差闸），或 `makecfg` 换 `dedupMode:"content"`（pHash 汉明距离 ≤ `phashDistance`，默认 4；代价是每张图多开一次 PIL）。
+
+「md5 全量 0 对重复」不等于「没有重复」：ruzhai 283 张 md5 一对都没撞，但同族里仍有 6 对是只差一块的真差分（配对表见 curate skill §1）——md5 没撞只说明字节不同，不说明图不同。
 
 `anima_status` 会多打一行 `图桶: clean 109图/109caption、watermark 33图/33caption`——**看到这行就不要再去数 `images/` 了**。
 
@@ -57,7 +84,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 ### 空间与冗余：跑批会不会堆垃圾
 
-**账本与报告几乎不长**：`per_image.json` 约 2.6KB/图（`history` 每张只留最近 30 次）、`rename_map.csv` 约 100B/图、各 `*_report.csv` 一次跑批原地覆盖。所以 142 张的数据集把 19 个阶段来回跑十几遍，`_pipeline/` 里的账本加起来仍是几百 KB。
+**账本与报告几乎不长**：`per_image.json` 约 2.6KB/图（`history` 每张只留最近 30 次）、`rename_map.csv` 约 100B/图、各 `*_report.csv` 一次跑批原地覆盖。所以 142 张的数据集把 20 个阶段来回跑十几遍，`_pipeline/` 里的账本加起来仍是几百 KB。
 
 **真正占空间的是三类有意的副本**（都用"能不能删"来权衡）：
 
@@ -66,6 +93,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | `_pipeline/orig_text/` | 与"被判为有文字需要修补"的图同量级（142 张的数据集里 10.8MB；200 张大图可能上 GB） | **可以整删**（`verify` 通过后）—— 它是 `text` 修补前的原图备份，修补不可逆，删了就无法回退。同一文件名只备份第一次，重复跑不叠加 |
 | `_pipeline/thumbs/` | 约为原图的 10~20%（142 张 = 32MB） | **可以整删**，它只喂视觉子代理；下次要看图会按需重建。`prune:true` 清掉没有对应原图的 |
 | `_excluded/` | 淘汰图的实际体积（`redash` 里 138MB > 在用的 110MB） | 是**移动**不是复制（不占双份），但会一直留着当证据；确认不要了就归档到数据集外 |
+| `_excluded/duplicates-family/` | `families` 判成同族重复的那几张（每个差分族通常 1~2 张，正是「同一幅画的不同编码/重存」里体积较小的那份） | 同上，**移动**不是复制。确认没把真差分误删（对照落选理由里的 SSIM 与局部差）就归档 |
 | `_pipeline/masks/` | 几十 KB/张 | 默认**修补成功后就把本次用过的清掉**（要留着 `--inpaint-only` 重跑就传 `keepMasks:true`；失败/未修补的掩膜始终保留） |
 
 **上限已内置**（都在配置段 `hygiene` 里，设置页「空间与备份」分组可改）：caption 快照留 **1** 代（内容与上一版逐字节相同就**不新建**）、`rename_map.<a>-<b>.csv` 批次快照留 **3** 份、`train_configs/<name>/*.bak<时分>` 留 **1 代**（一次 `apply` 的四件套算同一代，不按文件数翻倍；`preflight.txt` 是报告，原地刷新、不进备份）、`masks/` 修补成功后清掉。清理时会打印一行说明（`[rename] 清理了 N 份过老的批次快照…`、`备份：保留 1 个（1 代），本次清理 5 个`）。**一次跑批本身不会留下无上限增长的东西**。
@@ -83,7 +111,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 ## §2 阶段表与 I/O 契约
 
-**19 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
+**20 个阶段**。最后一列是「重跑会覆盖什么」——决定你能不能放心重跑；标 `只追加` 的多跑一次只是浪费，标 `覆盖` 的会抹掉人工修改。
 
 | 阶段 | 工具调用 | 输入 | 产出 | 重跑会覆盖什么 |
 |---|---|---|---|---|
@@ -91,12 +119,13 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | fetch | `anima_stage(stage:"fetch", dataset:"X", source:"yandere", tags:"artist_name", limit:250)` | 图源 | `00_raw/*` + raw_posts.jsonl | 只追加：同名文件跳过，元数据按 `(filename, post_id)` 去重合并。**默认就下载**，`dryRun:true` 只列清单 |
 | import | `anima_stage(stage:"import", dataset:"X", src:"D:/下载/xxx")` | 素材目录/压缩包 | `00_raw/*`（zip/rar/7z 自动解） | 只追加（重名加 `__n`）。**`src` 不能是数据集目录本身或它的上级**，会被拒绝；非图文件会报"跳过 N 个"，不进 `00_raw` |
 | enrich | `anima_stage(stage:"enrich", dataset:"X")` → `apply:true` | `images/`（没重排就是 `00_raw/`） | raw_posts.jsonl + enrich_report.csv（含 `by` 列） | 只追加（按 `(filename, post_id)` 合并；`force:true` 才重查已有标签的图）。**默认 dry-run 只查不写**，但**仍会发请求**——就是给你看命中率。**必须在 `text` 修补之前跑**（改过像素 md5 就对不上）；md5 不中时用文件名里的 pixiv id 兜一次（只认同名同页/单帖 p0，`noPixiv:true` 可关） |
+| families | `anima_stage(stage:"families", dataset:"X")` → `apply:true` | 图桶（`workSet` 限定）+ raw_posts.jsonl | `diff<k>/` 桶 + families_report.csv + families.json | **默认 dry-run：只算不搬，但仍然写报告**（`_pipeline/families_report.csv` + `families.json`）；`apply:true` 才建 `diff<k>/` 桶、整族搬进去，并把同族重复移进 `_excluded/duplicates-family/`。`rebuild:true` 忽略已有 json 重新分组 |
 | dedup | `anima_stage(stage:"dedup", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 连图桶） | dedup_report.csv | 覆盖报告；apply 时把重复图**移动**到 `_excluded/duplicates/` |
 | screen | `stage:"screen"` → 视觉复核 → `apply:true` | `00_raw/`（`includeImages:true` 连图桶） | screen_report.csv + review_queue.csv | 覆盖报告；apply 时移入 `_excluded/<reason>/` |
 | thumbs | `anima_stage(stage:"thumbs", dataset:"X")` | 图桶（没有才用 `00_raw/`） | `_pipeline/thumbs/*.jpg` | 覆盖已有缩略图（**不吃 apply**，写盘是默认行为）；已是最新的跳过，`prune:true` 清掉没有对应图的陈旧缩略图 |
-| text | `anima_stage(stage:"text", dataset:"X")` → `apply:true` | `00_raw/`（`includeImages:true` 处理 `images/`） | 修补后的图 + text_report.csv + `masks/`（成功后清掉本次用过的） | **⚠️ 修补不可逆**：apply 就地改写图片（修补前备份在 `_pipeline/orig_text/`），并让 `wash` 及之后全部失效。要留掩膜重跑 `--inpaint-only` 就传 `keepMasks:true` |
+| text | `anima_stage(stage:"text", dataset:"X")` → `apply:true` | 图桶（`workSet` 限定；没有桶才用 `00_raw/`，`includeImages:true` 已退役） | 修补后的图 + text_report.csv + `masks/`（成功后清掉本次用过的） | **⚠️ 修补不可逆**：apply 就地改写图片（修补前备份在 `_pipeline/orig_text/`），并让 `wash` 及之后全部失效。要留掩膜重跑 `--inpaint-only` 就传 `keepMasks:true` |
 | text-rollback | `anima_stage(stage:"text-rollback", dataset:"X")` → `apply:true`（`names` 只恢复某几张） | 图桶 | 用 `_pipeline/orig_text/` 里的原图覆盖回去；恢复后 `wash` 及之后全部标 stale | **text 补坏了的唯一后路**。RF-DETR 会把纯白 censor bar（大面积平坦色块）与裸露皮肤/肢体（抬起的小腿＋黑高跟鞋）误判成文字，LaMa 一补就不可逆——真实使用里那两张是人工重下原始字节救回来的，其实备份一直躺着。所以跑 `text --apply` 前先 `detectOnly:true` + 看图确认 |
-| rename | `anima_stage(stage:"rename", dataset:"X", apply:true)` | `00_raw/`（已重排过会报错） | `images/0001.ext` + rename_map.csv + per_image.json | `rename_map.csv` **只追加**（按 `old_name` 去重，本次为准）+ 本批快照；预演只写 `rename_map.preview.csv`，不碰权威表；同名 `.txt` 边车跟着搬 |
+| rename | `anima_stage(stage:"rename", dataset:"X", apply:true)`；`workSet:"clean"` 只重排某个桶 | `00_raw/` 或图桶 | 桶内 `0001.ext`（**编号跨桶连续**）+ rename_map.csv（多一列 `bucket`）+ per_image.json | `rename_map.csv` **只追加**（按 `old_name` 去重，本次为准）+ 本批快照；预演只写 `rename_map.preview.csv`，不碰权威表；同名 `.txt` 边车跟着搬 |
 | wash | `anima_stage(stage:"wash", dataset:"X", trigger:"@xxx")` → `apply:true` | 图桶里的 `*.txt` + raw_posts.jsonl（经 rename_map 的 `old_name` 回查） | 每个桶里的 `NNNN.txt` + wash_report.csv + review_todo.csv + wash_diff.csv + captions_prev/（留 1 代） | 覆盖 caption（**幂等**：同输入重跑结果一致）。默认不复活人工删掉的图源标签（`refreshBooru` / `refreshSource` 逐级放宽）；写盘前自动快照（内容没变就不新建，`keepSnapshots:0` 可完全不留）、写盘后出本次 vs 上次的差异 |
 | review-list | `anima_stage(stage:"review-list", dataset:"X")` | wash_report.csv | review_todo.csv | 覆盖清单 |
 | apply-review | `anima_stage(stage:"apply-review", dataset:"X", payload:"...json", apply:true)` | 视觉子代理的补标 JSON | 回填后的 caption | 覆盖这些图的 caption；触发词从 manifest 取（不会丢）；`item.remove` 里的标签进人工删除名单 |
@@ -111,6 +140,8 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 **`enrich` 命中率低是常态，不是故障**：实测 redash 的 72 张图 md5 只中 3 张，200 张 pixiv 原图里 46 张能解析出 illust id 的只有 6 张在 danbooru 有帖。只发 pixiv 的画师在 booru 上就是没有 ⇒ **A 源稀薄时把力气放到 B 源（看图）**，别反复重跑 `enrich`。命中的那几张是白捡的权威标签，照收。
 
+**yande.re 源别指望 `enrich`**：实测 ruzhai 的 205 张 yande 原图都带 md5，反查 danbooru 仍是 0 命中——两个站存的是各自那份字节，同一幅画在两边 md5 天然不同，`md5:<hex>` 查不到是必然。跨源找「同一张图」要用**视觉匹配**：`families` 的 256×256 灰度去均值签名，`corr >= 0.85` 才合并成同一族（同一张图重编码实测 corr 0.9925~1.0000，不同图 p95 分块差 90+，两类分得很开）；合并后再从有标签的那一侧借标签。
+
 **dry-run 不算完成**：没写盘的那一跑在 manifest 里记成 `preview`，`anima_status` 里显示 `▷`，`done=[…]` 里也不会出现它。看到 `▷` 就表示「报告看过了、还没落地」，下一步是带 `apply:true` 重跑同一阶段。`↻ stale` 表示上游改过（例如 `text` 修补了图），这条链上的洗标/配置都要重跑。
 
 ### 参数矩阵：哪些阶段不吃 apply（真实使用里靠试错才发现）
@@ -124,7 +155,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 | `verify` / `review-list` / `dict-check` | **只读**，没有 `apply`（`verify` 可以 `trigger` 覆盖，`dict-check` 可以只给 `tags` 不给 dataset） |
 | `force` | 只在 `init`、`enrich`、`makecfg` 上存在 |
 | `enrich` 的 `noPixiv` | 关掉「md5 不中就用文件名里的 pixiv id 再兜一次」这条支路（默认开着） |
-| `workSet` | `dedup` / `screen` / `thumbs` / `wash` / `verify` / `exclude` 都能限定只看某些图桶（`"clean,watermark"`）；不传就是全部桶 |
+| `workSet` | `dedup` / `screen` / `thumbs` / `text` / `rename` / `families` / `wash` / `verify` / `exclude` 都能限定只看某些图桶（`"clean,watermark"`）；不传就是全部桶 |
 | `exclude` | 默认 dry-run，要 `apply:true`；没有 `dryRun`（反过来也一样） |
 
 `fix-caption` 的 `add`/`remove`/`set` 三个参数至少要给一个；`set` 是整条替换，给了它 `add`/`remove` 会被忽略。

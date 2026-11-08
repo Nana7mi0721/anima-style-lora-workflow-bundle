@@ -78,13 +78,22 @@ def _fingerprint(p: Path) -> tuple:
     return (p.stat().st_size, h.hexdigest())
 
 
-def dedupe_subsets(subsets: list[dict], verbose: bool = True) -> list[dict]:
-    """跨桶按**内容指纹**去重。
+def dedupe_subsets(subsets: list[dict], verbose: bool = True,
+                   mode: str = "fingerprint", phash_distance: int = 4) -> list[dict]:
+    """跨桶去重，mode 决定「什么算同一张」：
+
+    - `fingerprint`（默认）：(大小, 前 256KB md5)。认硬链接/副本，对差分图安全
+      （差分图任何一块像素不同、大小也不同），但对「同一张图的不同编码/重存」完全无效。
+    - `content`：感知哈希，hamming <= phash_distance 判同。认得出不同编码，代价是每张图
+      多开一次 PIL —— 几百张仍然是一两秒的事。
+    - `none`：只数文件，不做跨桶去重。
 
     复盘痛点 5：上一次真实使用里 `images/` 与 `clean/`+`watermark/` 指向同一批图（硬链接），
     makecfg 把 142 张数成 284 张 ⇒ repeats/epochs/steps 全错。这里按内容去重，
     整桶都是副本的直接跳过（并在输出里说清楚）。"""
+    mode = mode if mode in ("fingerprint", "content", "none") else "fingerprint"
     seen: dict[tuple, str] = {}
+    seen_ph: list[tuple[int, str]] = []
     kept: list[dict] = []
     for s in subsets:
         path = s.get("path")
@@ -92,6 +101,27 @@ def dedupe_subsets(subsets: list[dict], verbose: bool = True) -> list[dict]:
         if path is not None and Path(path).exists():
             for f in sorted(Path(path).iterdir()):
                 if not f.is_file() or f.suffix.lower() not in curate.IMG_EXTS:
+                    continue
+                if mode == "none":
+                    uniq += 1
+                    continue
+                owner = None
+                if mode == "content":
+                    ph = curate._phash(f)
+                    if ph is not None:
+                        for old_ph, old_owner in seen_ph:
+                            if curate._hamming(old_ph, ph) <= phash_distance:
+                                owner = old_owner
+                                break
+                    if owner is None:
+                        if ph is not None:
+                            seen_ph.append((ph, s["name"]))
+                        uniq += 1
+                    else:
+                        dup += 1
+                        if verbose:
+                            print(f"[makecfg] ! {s['name']}/{f.name} 与 {owner} 里的图是同一张"
+                                  f"（内容近似，可能是不同编码/重存）——只算一次")
                     continue
                 fp = _fingerprint(f)
                 owner = seen.get(fp)
@@ -113,7 +143,9 @@ def dedupe_subsets(subsets: list[dict], verbose: bool = True) -> list[dict]:
     return kept
 
 
-def collect_subsets(ds, subdirs: list[str] | None, base: Path | None = None) -> list[dict]:
+def collect_subsets(ds, subdirs: list[str] | None, base: Path | None = None,
+                    dedup_mode: str = "fingerprint",
+                    phash_distance: int = 4) -> list[dict]:
     """[{name, path, count}] -- only directories that actually exist and hold images."""
     base = base or ds.root
     if subdirs:
@@ -134,8 +166,8 @@ def collect_subsets(ds, subdirs: list[str] | None, base: Path | None = None) -> 
             n = len([f for f in p.iterdir() if f.suffix.lower() in curate.IMG_EXTS])
             if n:
                 out.append({"name": p.name, "path": p, "count": n})
-    if len(out) > 1:
-        out = dedupe_subsets(out)
+    if len(out) > 1 and dedup_mode != "none":
+        out = dedupe_subsets(out, mode=dedup_mode, phash_distance=phash_distance)
     return out
 
 
@@ -172,11 +204,24 @@ def plan(ds, subsets: list[dict], kind: str = "style", trigger: str = "",
     per_epoch = sum(s["count"] * reps.get(s["name"], 1) for s in subsets) / max(batch * grad_accum, 1)
     exposure = sum(k["exposure"]) / 2
     total_steps = exposure * total / max(batch * grad_accum, 1)
-    ep = epochs or max(2, int(round(total_steps / max(per_epoch, 1))))
-    ep = ep + (ep % 2)          # keep it even so save_every_n_epochs=2 lines up
+    # epochs：自动推导时取偶，让 save_every_n_epochs 正好落在某个 epoch 上；显式给的值
+    # 一律照用 —— 但「为了对齐调过」必须说出来（真实使用里 3 被静默改成 4，用户以为没传进去）。
+    ep_note = ""
+    auto_ep = epochs is None
+    ep = epochs if epochs is not None else max(2, int(round(total_steps / max(per_epoch, 1))))
+    if auto_ep and ep % 2:
+        ep_note = f"epochs 自动推导 {ep} -> {ep + 1}（取偶，让 save_every_n_epochs 对齐）"
+        ep += 1
 
     save_target = 300 if total_steps < 2000 else 500
-    save_every = max(1, int(round(save_target / max(per_epoch, 1))))
+    save_every = max(1, min(ep, int(round(save_target / max(per_epoch, 1)))))
+    # 间隔必须整除 epochs：3 epoch 每 2 存一次，最后一个 checkpoint 永远不会出现。
+    # 宁可降到 1，也不要静默少存一个。
+    if save_every > 1 and ep % save_every:
+        aligned = max([d for d in range(1, save_every + 1) if ep % d == 0] or [1])
+        note2 = f"save_every_n_epochs {save_every} -> {aligned}（必须整除 epochs {ep}）"
+        ep_note = f"{ep_note}；{note2}" if ep_note else note2
+        save_every = aligned
 
     lr_use = lr or (k["lr_high"] if total >= 100 else k["lr"])
     band = k["rank_band"].get(rk)
@@ -201,6 +246,7 @@ def plan(ds, subsets: list[dict], kind: str = "style", trigger: str = "",
         "total_steps": int(per_epoch * ep), "target_exposure": exposure,
         "resolution": resolution, "batch_size": batch, "gradient_accumulation_steps": grad_accum,
         "save_every_n_epochs": save_every, "lr_warn": warn,
+        "epochs_note": ep_note,
     }
 
 
@@ -230,6 +276,8 @@ save_model_as = "safetensors"
 save_precision = "bf16"
 max_train_epochs = {p['max_train_epochs']}
 save_every_n_epochs = {p['save_every_n_epochs']}
+# 优化器/调度器状态只有几十 MB：中断后可以从 state-*.pt 真续训，不用从权重重启丢动量
+save_state = true
 logging_dir = "{cfg_dir.as_posix()}/logs"
 log_with = "tensorboard"
 learning_rate = {p['learning_rate']:g}
@@ -301,11 +349,42 @@ pause
 """
 
 
+def _resume_bat(p: dict, paths: dict, cfg_dir: Path, name: str) -> str:
+    """续训模板：把「中断后怎么接、怎么不覆盖旧权重」写进文件里。
+
+    真实使用里踩的两个坑：① 没开 save_state，中断后只能从权重重启，丢了优化器动量；
+    ② 续训不改 --output_name，新的 checkpoint 与旧的 epoch-1 权重同名，直接盖掉。
+    """
+    out_name = f"{name}_style_lora" if p["kind"] == "style" else f"{name}_lora"
+    return f"""@echo off
+rem generated by animasl -- 续训模板 {name}
+rem
+rem 用法（两种，二选一）：
+rem   1) 真续训（推荐，带优化器/调度器状态，不丢动量）：
+rem      把 <state-XXXXXX.pt> 换成 output_dir 里最新的 state-*.pt
+rem   2) 只带权重（没有 state 时才用，动量会丢）：
+rem      把 --resume 那行换成 --network_weights "<某个 .safetensors>"
+rem
+rem 注意：--max_train_epochs 是**总**轮数（不是"再训几轮"）；
+rem       不改 --output_name 的话，新的 -000001 会把旧 checkpoint 覆盖掉，这里已经改了。
+cd /d "%~dp0"
+call "{paths['venv_activate']}"
+set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python "{paths['trainer_py']}" --config_file "{cfg_dir.as_posix()}/{name}_lora_stage1.toml" ^
+  --resume "<state-XXXXXX.pt>" ^
+  --save_state ^
+  --output_name "{out_name}_resume" ^
+  --max_train_epochs {p['max_train_epochs']}
+pause
+"""
+
+
 def _rationale(p: dict, name: str, cfg_dir: Path) -> str:
     rows = "\n".join(
         f"| {s['name']} | {s['count']} | {p['repeats'].get(s['name'], 1)} | "
         f"{s['count'] * p['repeats'].get(s['name'], 1)} |" for s in p["subsets"])
     warn = f"\n> ⚠️ {p['lr_warn']}\n" if p["lr_warn"] else ""
+    note = f"\n> ℹ️ {p['repeats_note']}\n" if p.get("repeats_note") else ""
     return f"""# {name} 训练配置说明（自动生成）
 
 - 目标类型：**{p['kind_name']}**，有效图片 **{p['count']}** 张
@@ -320,13 +399,14 @@ def _rationale(p: dict, name: str, cfg_dir: Path) -> str:
 | subset | 图片数 | repeats | 有效样本 |
 |---|---:|---:|---:|
 {rows}
-{warn}
+{warn}{note}
 ## 生成后的检查清单
 
 - [ ] 每张 caption 都有触发词且在首位（`anima_wash --trigger`）
 - [ ] 固有属性（发色/瞳色/标志特征）描述一致
 - [ ] 变化因素（服装/姿势/场景/镜头）逐张写出
 - [ ] 没有质量词/审美词堆砌
+- [ ] 中断续训用同目录的 `resume_{name}.bat`（改 `--output_name`，别覆盖旧权重）
 - [ ] 与既有配置相比只改了一个变量（首轮）——调整时按 调参指南 §8 一次一步
 
 生成时间：{time.strftime('%Y-%m-%d %H:%M:%S')}
@@ -345,8 +425,55 @@ def _toml_kv(text: str) -> dict[str, str]:
     return out
 
 
+def _config_rows(stage1_text: str, dataset_text: str) -> dict[str, str]:
+    """把「真正影响训练的东西」摊平成可 diff 的键值表。
+
+    stage1 的扁平 key 之外，dataset toml 的 [[datasets.subsets]] 也必须算进来 ——
+    「10 个桶改成 7 个桶」只体现在这里，不覆盖它就永远 diff 不出东西。
+    """
+    rows = {f"stage1.{k}": v for k, v in _toml_kv(stage1_text).items()}
+    subset = ""
+    for line in (dataset_text or "").splitlines():
+        line = line.strip()
+        if line.startswith("[[datasets.subsets]]"):
+            subset = "?"
+            continue
+        if line.startswith("["):
+            subset = ""
+            continue
+        if not subset or not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "image_dir":
+            # 绝对前缀每次都可能不同，只比最后一段（桶名）
+            bucket = Path(value.strip('"')).name or subset
+            subset = bucket
+            rows[f"dataset.subset[{bucket}].dir"] = bucket
+        else:
+            rows[f"dataset.subset[{subset}].{key}"] = value
+    return rows
+
+
+def _config_diff(old_s1: str, old_ds: str, new_s1: str, new_ds: str) -> list[str]:
+    """逐键 diff 新旧两份配置（stage1 + dataset），新增/移除/改动都列出来。"""
+    old = _config_rows(old_s1, old_ds)
+    new = _config_rows(new_s1, new_ds)
+    out: list[str] = []
+    for key in sorted(set(old) | set(new)):
+        if key not in old:
+            out.append(f"  + {key}: {new[key]}（新增）")
+        elif key not in new:
+            out.append(f"  - {key}: {old[key]}（移除）")
+        elif old[key] != new[key]:
+            out.append(f"  {key}: {old[key]} -> {new[key]}")
+    return out
+
+
 def _preflight(ds, p: dict, cfg_dir: Path, name: str, stage1_text: str,
-               old_stage1: str = "") -> str:
+               dataset_text: str = "", old_stage1: str = "",
+               old_dataset: str = "") -> str:
     """C2：写盘前把「这次配置的依据」落成 preflight.txt —— 图片数、caption 合规率、
     词典外标签、rank/LR/epoch/steps 推导、与上一版配置的差异。
 
@@ -358,6 +485,8 @@ def _preflight(ds, p: dict, cfg_dir: Path, name: str, stage1_text: str,
     lines.append(f"图片      {p['count']} 张")
     for s in p["subsets"]:
         lines.append(f"          {s['name']:<14} {s['count']:>5} 张 × {p['repeats'].get(s['name'], 1)}")
+    if p.get("repeats_note"):
+        lines.append(f"          ℹ️ {p['repeats_note']}")
     health: dict = {}
     unknown: list[str] = []
     zombie: list[str] = []
@@ -376,7 +505,9 @@ def _preflight(ds, p: dict, cfg_dir: Path, name: str, stage1_text: str,
                      f"；出现两次以上 {health.get('trigger_twice', 0)}")
         td = dicts.load(ds.cfg)
         seen: set[str] = set()
-        for f in (ds.images() or ds.raw_images()):
+        # 图桶才是成品落点：images/ 在桶化之后是空的，只读它会把「标签统计」永远数成 0。
+        work = ds.work_images() or ds.images() or ds.raw_images()
+        for f in work:
             txt = f.with_suffix(".txt")
             if not txt.exists():
                 continue
@@ -408,7 +539,8 @@ def _preflight(ds, p: dict, cfg_dir: Path, name: str, stage1_text: str,
               f"LR        {p['learning_rate']:g}"
               + (f"  ⚠️ {p['lr_warn']}" if p["lr_warn"] else "（在 Rank 建议区间内）"),
               f"epochs    {p['max_train_epochs']}（目标曝光 {p['target_exposure']:g}/图）"
-              f" -> ~{p['steps_per_epoch']} steps/epoch，共 ~{p['total_steps']} steps",
+              f" -> ~{p['steps_per_epoch']} steps/epoch，共 ~{p['total_steps']} steps"
+              + (f"  ⚠️ {p['epochs_note']}" if p.get("epochs_note") else ""),
               f"保存      save_every_n_epochs = {p['save_every_n_epochs']}",
               f"分辨率    {p['resolution']}  batch {p['batch_size']}"
               f" × grad-accum {p['gradient_accumulation_steps']}"]
@@ -416,13 +548,18 @@ def _preflight(ds, p: dict, cfg_dir: Path, name: str, stage1_text: str,
         lines += ["", "⚠️ 上面有需要你拍板的项：标签数越界 / 词典里查不到的标签。"
                       "训练前建议先 wash + dict-check 收拾干净。"]
 
-    old_toml = cfg_dir / f"{name}_lora_stage1.toml"
-    if old_stage1 or old_toml.exists():
-        old = _toml_kv(old_stage1 or old_toml.read_text(encoding="utf-8", errors="replace"))
-        new = _toml_kv(stage1_text)
-        diff = [f"  {k}: {old.get(k, '(无)')} -> {new[k]}"
-                for k in sorted(new) if k in old and old[k] != new[k]]
-        lines += ["", "与上一版配置的差异：" + ("（无）" if not diff else "")]
+    # 「十个桶改成七个桶」这种变化只存在于 dataset toml 的 [[datasets.subsets]] 里。
+    # 旧的 _toml_kv 跳过了所有 [ 开头的行，于是永远报「（无）」—— 差异段必须比两个文件。
+    old_s1_path = cfg_dir / f"{name}_lora_stage1.toml"
+    old_ds_path = cfg_dir / f"dataset_{name}.toml"
+    old_s1 = old_stage1 or (old_s1_path.read_text(encoding="utf-8", errors="replace")
+                            if old_s1_path.exists() else "")
+    old_ds = old_dataset or (old_ds_path.read_text(encoding="utf-8", errors="replace")
+                             if old_ds_path.exists() else "")
+    if old_s1 or old_ds:
+        diff = _config_diff(old_s1 or stage1_text, old_ds or dataset_text,
+                            stage1_text, dataset_text)
+        lines += ["", "与上一版配置的差异：" + ("（无）" if not diff else f"{len(diff)} 处")]
         lines += diff
     return "\n".join(lines) + "\n"
 
@@ -455,25 +592,58 @@ def _prune_backup_generations(cfg_dir: Path, keep: int = 1) -> int:
     return removed
 
 
+def _families_repeats(ds, subsets: list[dict]):
+    """diff<k> 桶的 per-桶 repeats 来自 families 阶段（按族实际张数加权）。
+
+    返回 (repeats_dict, 说明文字)；不适用时 (None, "")。只认全部子集都是 diff<数字>、
+    且 families.json 的桶集合与当前子集完全一致的场景 —— 用户手工改过桶名/增删桶时
+    宁可按 makecfg 原有逻辑算，也不要拿过期权重去训。
+    """
+    path = ds.pipe_dir / "families.json"
+    if not path.exists():
+        return None, ""
+    names = [s["name"] for s in subsets]
+    if not names or not all(n.startswith("diff") and n[4:].isdigit() for n in names):
+        return None, ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, ""
+    reps = data.get("repeats") or {}
+    if set(names) != set(reps.keys()):
+        return None, ""
+    out = {n: max(1, int(reps[n])) for n in names}
+    return out, (f"per-桶 repeats 取自 _pipeline/families.json（diff<k> 桶，按族实际张数加权；"
+                 f"想重算就跑 families）")
+
+
 def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "style",
                 subdirs: list[str] | None = None, dim: int | None = None,
                 lr: float | None = None, epochs: int | None = None,
                 resolution: int = 1280, batch: int = 1, grad_accum: int = 1,
                 repeats: dict[str, int] | None = None, apply: bool = False,
                 dataset_dir: str | None = None, force: bool = False,
+                dedup_mode: str = "fingerprint", phash_distance: int = 4,
                 allow_out_of_band: bool = False,
                 keep_backups: int | None = None) -> dict:
     name = name or ds.name
     cfg = ds.cfg
     base = Path(dataset_dir) if dataset_dir else ds.root
 
-    subsets = collect_subsets(ds, subdirs, base)
+    subsets = collect_subsets(ds, subdirs, base, dedup_mode=dedup_mode,
+                              phash_distance=phash_distance)
     subsets = [s for s in subsets if s["count"] > 0]
     if not subsets:
         raise SystemExit(f"[makecfg] {base} 下没有找到含图片的子目录")
     missing = [s["name"] for s in subsets if not s["path"].exists()]
     if missing:
         raise SystemExit(f"[makecfg] 子目录不存在: {missing}")
+
+    repeats_note = ""
+    if repeats is None:
+        fam_reps, repeats_note = _families_repeats(ds, subsets)
+        if fam_reps:
+            repeats = fam_reps
 
     p = plan(ds, subsets, kind=kind, trigger=trigger, dim=dim, lr=lr, epochs=epochs,
              resolution=resolution, batch=batch, grad_accum=grad_accum, repeats=repeats,
@@ -499,17 +669,27 @@ def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "sty
     dataset_toml = _toml_dataset(p, cfg_dir, name)
     bat = _bat(p, paths, cfg_dir, name)
     rationale = _rationale(p, name, cfg_dir)
-    old_stage1 = ""
+    resume = _resume_bat(p, paths, cfg_dir, name)
+    old_stage1 = old_dataset = ""
     old_path = cfg_dir / f"{name}_lora_stage1.toml"
     if old_path.exists():
         old_stage1 = old_path.read_text(encoding="utf-8", errors="replace")
-    preflight = _preflight(ds, p, cfg_dir, name, stage1, old_stage1)
+    old_ds_path = cfg_dir / f"dataset_{name}.toml"
+    if old_ds_path.exists():
+        old_dataset = old_ds_path.read_text(encoding="utf-8", errors="replace")
+    p["repeats_note"] = repeats_note
+    preflight = _preflight(ds, p, cfg_dir, name, stage1, dataset_toml,
+                           old_stage1, old_dataset)
 
     print(f"[makecfg] {name}  {p['kind_name']}  {p['count']} 张  "
           f"rank {p['network_dim']}  lr {p['learning_rate']:g}  "
           f"{p['max_train_epochs']} epoch ≈ {p['total_steps']} steps")
+    if p.get("epochs_note"):
+        print(f"    ⚠️ {p['epochs_note']}")
     for s in p["subsets"]:
         print(f"    {s['name']:<12} {s['count']:>5} 张 × {p['repeats'].get(s['name'], 1)}")
+    if repeats_note:
+        print(f"    ℹ️ {repeats_note}")
     if p["lr_warn"]:
         print(f"    ⚠️ {p['lr_warn']}")
 
@@ -523,6 +703,7 @@ def cmd_makecfg(ds, name: str | None = None, trigger: str = "", kind: str = "sty
         cfg_dir / f"{name}_lora_stage1.toml": stage1,
         cfg_dir / f"dataset_{name}.toml": dataset_toml,
         cfg_dir / f"train_{name}.bat": bat,
+        cfg_dir / f"resume_{name}.bat": resume,
         cfg_dir / "rationale.md": rationale,
     }
     stamp = time.strftime("%H%M%S")

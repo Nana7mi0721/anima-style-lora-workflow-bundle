@@ -1,6 +1,6 @@
 # dsh-anima-style-lora
 
-DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 → 导入 → 去重筛选 → 文字检测修补 → 重排编号 → 打标洗标 → 训练配置三件套）。
+DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 → 导入 → 差分家族整理 → 去重筛选 → 文字检测修补 → 重排编号 → 打标洗标 → 训练配置三件套）。
 
 设计分工：**重活是宿主插件（确定性 Python 工具箱），判断是 skill。**
 训练本身不在本流水线范围内（用 `Anima-Standalone-Trainer` 自己跑）。
@@ -13,7 +13,7 @@ DSH 插件 + skill + agent 预设：**Anima 风格 LoRA 全流程**（下载 →
 | agent 预设 `anima-style-lora`（显示名「Anima风格LoRA全流程」） | 带专属 persona 的 agent 组合；`skill-filesystem` 通过 `customSkillDirs` 挂载本包的 `skills/` |
 | 3 个 skill | `anima-style-lora-pipeline`（总纲）/ `-source`（选源下载）/ `-curate`（筛选 + 文字修补 + 视觉复核） |
 | 设置页（浏览器半侧 + 宿主路由 `/anima-lora/api`） | 在 DSH 设置里直接改全部配置项（含凭据），写进 `<home>/.animasl/animasl.config.json`，下次调用即生效 |
-| Python 工具箱 `python/animasl/` | 19 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
+| Python 工具箱 `python/animasl/` | 20 个阶段的确定性实现，可脱离 DSH 直接用 CLI 跑：`python -m animasl.cli --home E:/LoRA_Train <stage>` |
 
 ## 安装
 
@@ -67,7 +67,7 @@ npm run test:all      # 上面全部（check:patch + params + client + route + p
 `E:/LoRA_Train/.animasl/venv/Scripts/python.exe`，PATH 上的 `python` 缺依赖时会打印
 `SKIP` 并返回 0）。
 
-`test/pipeline-offline.py` 是**唯一一条把 19 个阶段串起来跑**的回归：在 `<home>/datasets`
+`test/pipeline-offline.py` 是**唯一一条把主流程各阶段串起来跑**的回归：在 `<home>/datasets`
 下建 `_pipeoff_*` 临时现场（`_` 前缀，`anima_status` 看不见），用真 CLI 走
 init → import（含"跳过非图"与"拒绝 src=数据集根"）→ rename → thumbs（重排之后仍出图）
 → 第二批 import + rename（验证对照表只追加）→ 图桶布局（`clean/` + `watermark/` + 硬链接副本
@@ -75,7 +75,7 @@ init → import（含"跳过非图"与"拒绝 src=数据集根"）→ rename →
 **人工删掉的标签不复活**、`refreshSource` 才整体重洗、A 源体检告警、`wash_diff.csv` 快照差异）
 → exclude（淘汰 / `undo` 回原桶 / `missing` 补账）→ fix-caption 三种用法 →
 verify → dict-check → makecfg（LR 超区间报错、`allowOutOfBand` 放行、`preflight.txt` 的
-差异段），共 66 条断言，跑完删现场（`--keep` 保留）。它抓到过：`import`/`fetch` 其实没有
+差异段），共 147 条断言，跑完删现场（`--keep` 保留）。`families` / 参数修复各自有离线回归：`test/families-offline.py`（46 项）、`test/wash-fixes-offline.py`（30 项）、`test/curate-fixes-offline.py`（36 项）、`test/net-fixes-offline.py`（31 项，ZIP+Range / 差分取法 / enrich 反查，全 fake 不联网）。它抓到过：`import`/`fetch` 其实没有
 `apply`、wash 会把标签规范成空格形、缩略图落在 `_pipeline/thumbs` 而不是数据集根、
 `exclude --undo` 把图恢复到 `images/` 而不是它原来的桶（`user_deleted.json` 当时没记 `bucket`）。
 
@@ -139,7 +139,7 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 
 插件的 `config`（在 profile 的 `cordis.patch.yml` 里改）：`home` / `pythonDir` / `python` / `mlPython` / `runtimeDir` / `animaLoraDir` / `timeoutMs` / `longTimeoutMs`。
 
-## 十七个阶段
+## 二十个阶段
 
 ### 图桶：根下任何含图的子目录都是数据
 
@@ -150,23 +150,24 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 | stage | 工具参数要点 | 产出 |
 |---|---|---|
 | `init` | `trigger`、`kind`、`force`、`reset`+`yes` | `_pipeline/manifest.json` |
-| `fetch` | `source=yandere\|danbooru\|pawchive\|exhentai`、`tags`/`creator`/`gallery`、`limit`、`cookies`；`dryRun` 预演 | `00_raw/` + `raw_posts.jsonl`（含每帖 `tags[]`） |
+| `fetch` | `source=yandere\|danbooru\|pawchive\|exhentai`、`tags`/`creator`/`gallery`、`limit`、`cookies`；`dryRun` 预演。yandere 差分：`families`、`take`（整数或 `max(2,n//2)`）、`minId`、`since`；pawchive：`archiveMode`（`auto`/`zip`/`http`）、`includeCover` | `00_raw/` + `raw_posts.jsonl`（含每帖 `tags[]`） |
 | `import` | `src=<素材目录或压缩包>`、`move`、`noUnpack`；`dryRun` 预演 | 解包/收编进 `00_raw/` |
-| `enrich` | `limit`、`force`、`noPixiv`；`apply` 才写盘 | 按文件 md5（不中再用文件名里的 pixiv id）去 danbooru 反查原帖，把权威 `tag_string` 补进 `raw_posts.jsonl`（来源 A）+ `enrich_report.csv`（含 `by` 列：md5 / pixiv-source / pixiv-single） |
+| `enrich` | `limit`、`force`、`noPixiv`；`apply` 才写盘 | 按文件 md5（不中再用文件名里的 pixiv id）去 danbooru 反查原帖，把权威 `tag_string` 补进 `raw_posts.jsonl`（来源 A）+ `enrich_report.csv`（含 `by` 列：md5 / pixiv-source / pixiv-single / **yande-url / yande-source**）。yande.re 抓的图 md5 命中率≈0（实测 2/253），会自动改走「yande 帖号 → danbooru `source:` URL」反查 |
+| `families` | `workSet`、`phashDistance`(6)、`ssim`(0.995)、`corr`(0.85)、`rebuild`；`apply` 才移动 | 跨源家族合并（yande `parent_id` 链根 / pawchive `post_id` 声明家族，256² 灰度相关系数并查集）+ 同图去重 + 按族张数建 `diff<k>/` 桶并算 repeats；dry-run 也写 `_pipeline/families_report.csv` + `families.json` |
 | `dedup` | `phashDistance`(4)、`ssim`(0.995)、`includeImages` | `dedup_report.csv`，`apply` 时移入 `_excluded/duplicates/` |
 | `screen` | `minShortSide`(512)、`minBytes`(102400)、`earliest`(2015-01-01) | `screen_report.csv` + `review_queue.csv` |
-| `thumbs` | `maxSide`(1536)、`prune`、`includeImages` | `_pipeline/thumbs/`（视觉子代理只能看这个） |
+| `thumbs` | `maxSide`(1536)、`prune`、`includeImages`、`names`（只做这几张：`0001,0002` / `0001-0012` / `0001*`） | `_pipeline/thumbs/`（视觉子代理只能看这个） |
 | `text` | `warnRatio`(0.08)、`dropRatio`(0.30)、`patchSmall`、`thresholds`、`dilate`(6)、`keepMasks` | `masks/`（修补成功后清掉本次用过的）、`text_report.csv`；修补后自动把 `wash` 标 stale |
 | `text-rollback` | `names`（只恢复这几张，省略则全部） | 从 `_pipeline/orig_text/` 把修补前的原图搬回去。**`text --apply` 是不可逆的**——RF-DETR 会把纯白 censor bar（平坦色块）与裸露皮肤/肢体（抬起的小腿＋黑高跟鞋）误当文字，LaMa 一补就回不去；这是唯一的后路，恢复后自动把 `wash` 标 stale |
-| `rename` | `start`(1)、`digits`(4)、`move` | `images/0001.ext` + `rename_map.csv`（只追加）+ `per_image.json` |
+| `rename` | `start`(1)、`digits`(4)、`move`、`workSet` | 桶内就地重排、跨桶编号连续；`<桶>/0001.ext` + `rename_map.csv`（只追加，带 `bucket` 列）+ `per_image.json` |
 | `wash` | `trigger`、`rules`、`minTags`/`maxTags`、`prefer`(A\|C)、`dropMarks`、`refreshBooru`(只忽略手删名单)、`refreshSource`(最狠：连手删名单都不看)、`keepSnapshots`、`noImages`、`workSet` | 每个图桶里的 `NNNN.txt` + `wash_report.csv` + `review_todo.csv` + `wash_diff.csv`（本次 vs 上次改了哪些）+ `captions_prev/` 快照（留 1 代） |
 | `review-list` / `apply-review` | `payload` | 看图必答字段的往返 |
 | `fix-caption` | `name`(必填)、`add`/`remove`/`set` 三选一 | 只改点名的那一张 caption（写盘前留快照，写盘后出 `wash_diff.csv`） |
-| `exclude` | `names`、`reason`、`note`；`undo` 按账本搬回原桶、`missing` 事后补账、无参数列清单 | 图 + 同名 txt 移进 `_excluded/<reason>/`，并记进手删账本（重跑 `wash` 不复活） |
-| `verify` | `online`、`sample`、`trigger`、`workSet` | `wash_verify.csv`；§3 形态 + §9 内容闸门（BANNED 残留、否定式、质量词、人数一致性、**冲突族**、水印区与修补状态一致性、图-txt 配对、触发词位置） |
-| `dict-check` | 不给 `tags` 就查现有 caption（只按逗号切，多词标签不会被拆） | 终端输出：存在 / 别名可归一 / `post_count=0`（幻觉标签）/ 词典外 + 形近候选或同族高频标签，各带"出现在几张图里" |
+| `exclude` | `names`（也支持 `"@清单文件"` 从文件逐行读）、`reason`、`note`；`undo` 按账本搬回原桶、`missing` 事后补账、无参数列清单 | 图 + 同名 txt 移进 `_excluded/<reason>/`，并记进手删账本（重跑 `wash` 不复活） |
+| `verify` | `online`、`sample`、`trigger`、`workSet` | `wash_verify.csv`（含 `severity/errors/warns` 三列，**冲突族算 warn、不计入「违反硬约束」**）；§3 形态 + §9 内容闸门（BANNED 残留、否定式、质量词、人数一致性、**冲突族**、水印区与修补状态一致性、图-txt 配对、触发词位置） |
+| `dict-check` | 不给 `tags` 就查现有 caption（只按逗号切，多词标签不会被拆） | 终端输出：存在 / 别名可归一 / `post_count=0`（幻觉标签）/ 词典外 + 形近候选或同族高频标签，各带"出现在几张图里"；`safe/sensitive/explicit/nsfw` 等**评级词内置白名单**单列一行，不再报「词典里没有」 |
 | `synonyms` | `apply`、`refresh`、`limit` | 从 danbooru 拉一份**活跃别名表**（实测 41,423 条 / 42 页）存成 `tag_aliases`；默认 dry-run 只报条数，已有表就跳过（`refresh:true` 才重拉）。拉一次存下来，之后纯离线 |
-| `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution`、`allowOutOfBand`、`keepBackups` | 四件套 + `preflight.txt`；自动发现图桶 + 跨桶按内容指纹去重；四件套内容没变就不重写、备份按「代」清理（留 1 代），`preflight.txt` 是报告、原地刷新不备份 |
+| `makecfg` | `kind`(style/character/object/scene/clothing)、`trigger`、`name`、`subdirs`、`dim`、`lr`、`epochs`、`resolution`、`dedupMode`（`fingerprint`/`content`/`none`）、`phashDistance`、`allowOutOfBand`、`keepBackups` | 四件套 + `resume_<name>.bat` + `preflight.txt`；自动发现图桶 + 跨桶去重；四件套内容没变就不重写、备份按「代」清理（留 1 代），`preflight.txt` 是报告、原地刷新不备份 |
 
 **写盘语义按阶段分三类**（传了不支持的参数会在**执行前**报错，错误里列出该阶段支持的参数）：
 
@@ -174,10 +175,21 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 |---|---|---|
 | 写盘是默认行为 | `init`、`thumbs` | **不吃 `apply`**；`init` 靠 `force`/`reset` 控制 |
 | 默认写盘、`dryRun` 反转 | `fetch`、`import` | 预演用 `dryRun:true` |
-| 默认 dry-run、要 `apply:true` | `enrich`、`dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`exclude`、`makecfg` | 不带就只出报告（`enrich` 的 dry-run **仍会发请求**——它就是给你看命中率的） |
+| 默认 dry-run、要 `apply:true` | `enrich`、`families`、`dedup`、`screen`、`text`、`rename`、`wash`、`apply-review`、`fix-caption`、`exclude`、`makecfg` | 不带就只出报告（`enrich` 的 dry-run **仍会发请求**——它就是给你看命中率的） |
 | 只读 | `status`、`review-list`、`verify`、`dict-check` | 没有 `apply`（`synonyms` 的 `apply` 是另一个意思：把拉到的别名表落盘） |
 
-**dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子），数据集用了 `images/` 以外的桶时再多打一行 **图桶**（`图桶: clean 109图/109caption、watermark 33图/33caption`），最后一行是 **占用体检**（见下）。
+**dry-run 不会把阶段标成 done**：没写盘的那一跑在 `manifest.json` 里记成 `preview`，`anima_status` 显示 `▷`，`done=[…]` 里也不会出现它——所以「报告看过了但还没落地」和「已经做完了」不会被混为一谈。`anima_status` 的状态行图例：`✔` 已完成、`▷` 只跑过 dry-run、`↻` 上游改过需重跑、`✘` 失败、`·` 未跑。它现在还会多打一行 **caption 健康度**（标签数 min/avg/max、缺 txt、孤立 txt、空 caption、低于 20 / 高于 45 的计数、触发词缺失或不在首位 + 最多 5 个例子），数据集用了 `images/` 以外的桶时再多打一行 **图桶**（`图桶: clean 109图/109caption、watermark 33图/33caption`），以及 **冲突族**（族→有该族冲突的图片数，只作 warn 提示，不再把双色发/内着并列当硬约束），最后一行是 **占用体检**（见下）。
+
+### 差分家族（families）：同一组差分跨源合并、同图去重、按族建桶
+
+真实数据里同一组差分常在 yande.re 与 pawchive 各有一份，分辨率/编码还不一样，只按 md5 或单张 pHash 合并会漏。`families` 一次做四件事：
+
+1. **声明家族**：yande 用 `parent_id` 链到根；pawchive 用帖子的 `post_id` 当声明家族（同帖的 attachments 天然同族）。
+2. **跨源合并**：256×256 灰度、每块去均值、L2 归一化后算相关系数，`corr`（默认 0.85）以上并查集合并 —— yande 与 pawchive 的同一组差分会被并成一族（实测 51 组）。
+3. **同图去重**：同族内先 pHash ≤ `phashDistance`(6)、再全图 SSIM ≥ `ssim`(0.995)、最后用 `mean / max / 8×8 块` 局部差复核。全图 SSIM 对「只改了一小块」不敏感（16×16 黑块能把 SSIM 推到 0.99529 越过门槛），只看它会误合并。保留体积最大的一份，其余 `apply` 时移入 `_excluded/duplicates-family/`（实测 424 → 283 张）。
+4. **按族实际张数建桶**：族有 k 张就进 `diff<k>/`，`repeats = max(1, round(base/√k))`（k=1 时就是 base），权重随族大小收敛；`families.json` 记录桶与 repeats，`makecfg` 在子集全是 `diff<数字>` 时自动采用它（桶集合对不上就退回普通算法并说明）。
+
+`apply` 才移动文件；dry-run 也写 `_pipeline/families_report.csv` 与 `_pipeline/families.json`。同参数重复跑会复用上次结果，`rebuild:true` 强制重算。
 
 **重复 `init` 不会毁掉进度**：数据集已存在时 `init` 只打印提示就返回；`init --force` 是**就地更新**触发词/类型（阶段记录全部保留），只有 `init --reset --yes` 才会丢掉阶段记录从零重建——`--reset` 不带 `--yes` 会先把「当前已完成：init, wash」列出来让你确认。类型（`--kind`）决定 wash 的整类规则，中途改类型是安全的：`--force` 改完从 `wash` 起重跑即可。
 
@@ -319,7 +331,7 @@ wash   →  caption 的来源 A（booru 标签）+ 来源 C（同名 .txt sideca
 - `screen` 从 `raw_posts.jsonl` 读 `created_at` 判"过老"，`dedup` 读宽高决定保留哪张，`rename` 按 `created_at` 排序编号。
 - **标签一律用 danbooru 下划线原形**（`hakurei_reimu`、`long_hair`），不是空格形：`raw_posts.jsonl` 的 `tags` 是 list（边界无歧义，`wash` 优先读它）；`rename_map.csv` 只能存字符串，`rename` 会写 `tags_full` = 下划线形空格拼接。历史上这里有个坑——CSV 里存空格形多词标签，下游 `.split()` 会把它切成 `hakurei` + `reimu` 两个词，且**不会报错**。
 - 本地 `import` 进来的图只有"从哪来"这一行元数据（`source=import`），**没有 booru 标签**：要么自带 `.txt`，要么用 **`enrich`** 按文件 md5 去 danbooru 反查原帖把权威标签补回来（Pixiv 图、压缩包、别人给的素材都能查）。md5 不中时还会用**文件名里的 pixiv illust id** 再兜一次（`<id>_p<页>` 命名；只认"原文件名同名同页"或"该作品只有一帖且本图是 p0"，**挑不出同一页就不认** —— 多页作品尺寸往往完全一样，硬贴会把 p0 的标签安到 p1 上；不要这个兜底传 `noPixiv:true`）。
-- **别对 `enrich` 的命中率抱幻想**：实测 `E:/LoRA_Train/datasets/redash` 的 72 张图，md5 只命中 **3 张**（全是当初从 danbooru 抓下来的 `.jpg`），43 张查不到、26 张本来就有标签；那 200 张 pixiv 原图里能解析出 illust id 的 46 张，只有 6 张在 danbooru 有帖，其中 3 张还是同一作品的不同页（按上面的规则**拒绝**）。结论：**只发 pixiv 的画师，A 源天生稀薄，B 源（看图）才是主力**。`enrich_report.csv` 的 `by` 列会写清每张是靠 `md5` 还是 `pixiv-source`/`pixiv-single` 命中的。
+- **别对 `enrich` 的命中率抱幻想**：实测 `E:/LoRA_Train/datasets/redash` 的 72 张图，md5 只命中 **3 张**（全是当初从 danbooru 抓下来的 `.jpg`），43 张查不到、26 张本来就有标签；那 200 张 pixiv 原图里能解析出 illust id 的 46 张，只有 6 张在 danbooru 有帖，其中 3 张还是同一作品的不同页（按上面的规则**拒绝**）。结论：**只发 pixiv 的画师，A 源天生稀薄，B 源（看图）才是主力**。`enrich_report.csv` 的 `by` 列会写清每张是靠 `md5` 还是 `pixiv-source`/`pixiv-single` 命中的。**yande.re 抓的图不要指望 md5**：两站字节几乎都重编码过，实测 253 张只重合 2 张；`enrich` 会自动改走「yande 帖号 → danbooru `source:<url>`」反查（`by=yande-url|yande-source`），仍补不上就交给 `families` 按族合并后用同源帖的标签。
 - **`enrich` 要在 `text` 修补之前跑**：修补改像素 ⇒ md5 变了就永远查不到。命中率低时先看这三条：跑过 text 修补、裁剪/重编码过、原图本来没上传 danbooru。danbooru 不支持批量 md5 查询（`md5:a,md5:b` 返回 0），所以是一张一次请求，默认 0.35s 间隔（`pixiv_id` 兜底会让 miss 的图多一次请求）。
 - `wash` 有**两个点名报警器**：① "既无来源标签也无既有 caption"（来源链断了）；② "caption 洗完只剩触发词"（来源标签**有**数据，但被整类规则丢光——单画师图源的典型症状，附丢弃理由计数）。`verify` 的 `too-few-tags` 是第三道闸。
 - **反查回来的是权威全集（常见 45~65 条），比"看图精修过的 caption"长得多**：`wash` 会丢光画师/IP/meta 类，但剩下的仍可能超过指南 §9 的 45 条上限（实测一张 63 条源标签丢完还剩 49）。`enrich` 只把超限张数报出来，**不自动裁剪**——按 §2.2 的槽位优先级（人物/服装/动作 > 构图/背景/光影）用 `fix-caption` 往下删才是对的。
@@ -332,9 +344,11 @@ wash   →  caption 的来源 A（booru 标签）+ 来源 C（同名 .txt sideca
 
 生成物严格不含 Anima 无效参数（`noise_offset`、`min_snr_gamma`），`shuffle_caption` 恒 false（`cache_text_encoder_outputs=true` 时 trainer 强制要求），`network_module` 恒 `networks.lora_anima`。默认 `resolution=[1280,1280]`（与既有 11 个可跑配置一致；8GB OOM 时退 1024）。
 
-每次还会写一份 **`preflight.txt`**（开跑前的体检单）：图片数与各子集 repeats、caption 合规率（标签数 min/avg/max、<20 / >45 计数、触发词不在首位）、**词典外与 `post_count=0` 的标签清单**、rank/LR/epochs→steps/save_every 的推导过程、分辨率与 batch，以及**与上一版配置的逐字段差异**（首版没有旧文件时不输出差异段）。这样"这版配置为什么这么写、跟上次差在哪"不用再翻聊天记录。
+每次还会写一份 **`preflight.txt`**（开跑前的体检单）：图片数与各子集 repeats、caption 合规率（标签数 min/avg/max、<20 / >45 计数、触发词不在首位）、**词典外与 `post_count=0` 的标签清单**、rank/LR/epochs→steps/save_every 的推导过程、分辨率与 batch，以及**与上一版配置的逐字段差异**（首版没有旧文件时不输出差异段）。差异段现在是真逐键 diff 两份 toml（stage1 + dataset 的 `[[datasets.subsets]]`），「10 个桶改成 7 个桶」这种变化能看出来；标签统计也从工作集 caption 现数，不再从空的中间表读出恒 0。这样"这版配置为什么这么写、跟上次差在哪"不用再翻聊天记录。
 
 **LR 超出该 rank 的建议区间会直接报错**（不再静默收紧）：报错文案会给出区间，要么用区间内的值，要么显式 `allowOutOfBand:true`——那时**不改值**、只在 preflight 与终端打一行警告。真实使用里给过 `lr 5e-05 / dim 16`，旧版把它悄悄改成 `8e-05`，用户没看见。
+
+生成物里还有两件为「中断/续训」准备的东西：① `save_state = true` 默认打开（优化器/调度器状态只有几十 MB，中断后能真续训，不用从权重重启丢动量）；② 同目录的 `resume_<name>.bat`：`--resume state-*.pt --save_state --output_name <name>_resume --max_train_epochs <总轮数>`，注释写清「总轮数不是再训几轮」与「不改 output_name 会覆盖旧 checkpoint」。`epochs` 显式给的值现在**一律照用**，只有自动推导取偶、或 `save_every_n_epochs` 必须整除 epochs 而调整时才打印 `epochs_note`（终端 + preflight + rationale 都写）。
 
 `makecfg` 重跑不会堆垃圾：**四件套逐文件比对内容，没变就不重写、不备份**（`rationale.md` 里的「生成时间」不算内容变化），全都一样就打印「配置与现有文件完全一致，未写盘」；真的变了才把旧文件改名成 `<名字>.bak<时分秒>`（`force:true` 则不备份），并且 `.bak` 按**代**清理（默认只留最近 1 代，`keepBackups` / `hygiene.makecfg_backups` 可调）。**`preflight.txt` 是报告**：原地覆盖刷新，不进备份、不占一代 —— 同一份配置反复跑，磁盘上始终只有四件套 + 一份体检单。
 
@@ -383,7 +397,7 @@ train_configs/<name>/  <name>_lora_stage1.toml + dataset_<name>.toml + train_<na
   「post_count=0（幻觉标签）」与「词典里没有」，后者在没有形近候选时给出**同族高频标签**
   （`silver_hair` → `long_hair`/`short_hair`/`black_hair`…，`amber_eyes` → `blue_eyes`/`red_eyes`…），
   比 `silver_chain` 这种形近噪声有用得多。
-- 下载：danbooru 用设置页的「凭据」分组填用户名 + API key（或 `DANBOORU_LOGIN`/`DANBOORU_API_KEY`）；pawchive/exhentai 需要 cookie，且 **pawchive CDN 必须走代理**（直连被 reset）
+- 下载：danbooru 用设置页的「凭据」分组填用户名 + API key（或 `DANBOORU_LOGIN`/`DANBOORU_API_KEY`）；pawchive/exhentai 需要 cookie，且 **pawchive CDN 可能需要代理；若 SSL 全挂就直接用 `archiveMode:zip`**（帖子附件 ZIP 是唯一通道）
 
 跑 `anima_doctor` 可以一次性体检上述每一项（含下面这张表的"凭据配没配"）。
 
@@ -414,7 +428,7 @@ danbooru 在 Cloudflare 后面，而它的规则大致是「**Chrome UA + 非浏
 |---|---|---|---|
 | **yande.re** | **不需要** | 什么都不用 | —（公开 `post.json`，代理只在被 reset 时才用） |
 | **danbooru** | 单标签不用，**多标签要用** | 设置页「凭据」分组填用户名 + API key（或 `DANBOORU_LOGIN` + `DANBOORU_API_KEY`） | 匿名只能查**单标签**且限速极严。`anima_doctor` 里那行 `danbooru.donmai.us HTTP 403` 是 Cloudflare 挑战页，**不代表 API 不可用**（curl 兜底会正常拿到 JSON） |
-| **pawchive.pw** | 公开接口不用 | 受限帖才需要：`cookies` 参数或 `cookies_file` 配置（Netscape `cookies.txt`） | 公开帖照抓；受限帖拿不到。**CDN 域名必须走代理**（直连被 reset） |
+| **pawchive.pw** | 公开接口不用 | 受限帖才需要：`cookies` 参数或 `cookies_file` 配置（Netscape `cookies.txt`） | 公开帖照抓；受限帖拿不到。**CDN 域名可能整体 SSL 失败/被 reset**：`archiveMode:zip` 改为帖子附件 ZIP + HTTP Range 局部读（只读目录与需要的条目，不整包下载），ZIP 内 GBK 文件名会自动还原；浏览器 UA 会被 403，`userAgent` 留空用内置可识别 UA 即可 |
 | **exhentai** | **必须** | 设置页「凭据」分组填 `ipb_member_id` / `ipb_pass_hash` / `igneous`，或 `cookies` 指向 `cookies.txt`（或 `EXHENTAI_*` 环境变量） | 直接报 `[fetch] exhentai 需要 cookies.txt 或 EXHENTAI_* 环境变量`。这条链路只做到"可调用"，第一次用先 `limit:5` 验证拿到的是原图而不是 `-thumb` |
 | **gelbooru** | — | **未实现**（当前只支持上面四个源） | `source` 传 `gelbooru` 会报未知来源 |
 

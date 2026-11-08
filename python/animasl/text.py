@@ -83,6 +83,9 @@ def cmd_text_rollback(ds, names: str = "", apply: bool = False, work_set=None) -
     `_pipeline/orig_text/` 里本来就躺着**修补前的原图**，只是没有回去的路。
     修补成功的那一刻 `images/<stem>.txt` 描述的仍是修补前的图，所以回滚后
     必须让依赖 caption 的阶段重跑（这里 invalidate_from("wash")）。
+
+    工作集 = 图桶（images/、clean/、watermark/ …）优先、00_raw 兜底，跟 rename 的编号
+    范围一致；备份也是按 stem 扁平存的，跨桶重号会张冠李戴（见 curate.cmd_rename）。
     """
     backup_dir = ds.pipe_dir / "orig_text"
     if not backup_dir.exists():
@@ -90,7 +93,8 @@ def cmd_text_rollback(ds, names: str = "", apply: bool = False, work_set=None) -
         return {"count": 0, "restored": 0}
 
     wanted = [n.strip() for n in names.split(",") if n.strip()] if names else []
-    files = ds.work_images(work_set) if work_set else (ds.images() or ds.raw_images())
+    # 工作集优先：桶布局下 images/ 是空的，只认它会让回滚一个备份都对不上
+    files = ds.work_images(work_set) or ds.raw_images()
 
     def _match(img: Path) -> bool:
         if not wanted:
@@ -131,7 +135,7 @@ def cmd_text_rollback(ds, names: str = "", apply: bool = False, work_set=None) -
 def cmd_text(ds, apply: bool = False, rules_over: dict | None = None, dilate: int = 6,
              device: str = "", classes: str = "text,onomatopoeia", limit: int = 0,
              detect_only: bool = False, inpaint_only: bool = False,
-             keep_masks: bool | None = None) -> dict:
+             keep_masks: bool | None = None, work_set=None) -> dict:
     ds.ensure_dirs()
     cfg = ds.cfg
     rules = dict(rules_over or {})
@@ -156,11 +160,12 @@ def cmd_text(ds, apply: bool = False, rules_over: dict | None = None, dilate: in
     backup_dir = ds.pipe_dir / "orig_text"
     masks_dir.mkdir(parents=True, exist_ok=True)
 
-    files = ds.images() or ds.raw_images()
+    # 工作集优先（图桶 = 成品分组；桶布局下 images/ 常常是空的），没有桶才退回 00_raw
+    files = ds.work_images(work_set) or ds.raw_images()
     if limit:
         files = files[:limit]
     if not files:
-        print("[text] 没有图片（images/ 与 00_raw/ 都为空）")
+        print("[text] 没有图片（图桶与 00_raw/ 都为空）")
         return {"count": 0}
 
     print(f"[text] {len(files)} 张图  占比 >{drop:.0%} 剔除 / >{patch_min:.2%} 修补 / "

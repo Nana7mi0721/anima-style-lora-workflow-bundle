@@ -611,6 +611,75 @@ check(_dicts.alias_chain(_td2, "a") == "c2",
       "load() 之后 alias_chain 仍能跟多级链（a→b→c2）")
 _dicts._CACHE.clear()
 
+# --- 复盘回归：A1 workSet / A2 epochs / A3 配置差异 / F 续训 ----------------
+# A1：cli.py 曾漏 import re，--work-set 直传 NameError（ruzhai 复盘 A-1）
+_ns = _cli3.build_parser().parse_args(["wash", "--dataset", "d", "--work-set", "clean，watermark"])
+check(_cli3._work_set(_ns) == ["clean", "watermark"], "A1: cli --work-set 能解析（全角逗号也认）")
+check(_cli3._work_set(_cli3.build_parser().parse_args(["wash", "--dataset", "d"])) is None,
+      "A1: 不传 work-set 时是 None（交给各阶段自动发现图桶）")
+
+# A2：显式 epochs 必须照用；只有自动推导才取偶，而且要说出来
+_p3 = _makecfg3.plan(None, [{"name": "images", "count": 12, "path": Path(".")}], epochs=3,
+                    allow_out_of_band=True)
+check(_p3["max_train_epochs"] == 3, f"A2: 显式 epochs:3 不被静默改偶（实际 {_p3['max_train_epochs']}）")
+check(_p3["epochs_note"] == "", f"A2: 没改动就不写 note（实际 {_p3['epochs_note']!r}）")
+check(_p3["max_train_epochs"] % _p3["save_every_n_epochs"] == 0,
+      f"A2: save_every 必须整除 epochs（{_p3['save_every_n_epochs']} / {_p3['max_train_epochs']}）")
+_p_auto = _makecfg3.plan(None, [{"name": "latest", "count": 2}, {"name": "before", "count": 1}],
+                          allow_out_of_band=True)
+check(_p_auto["max_train_epochs"] == 6 and "自动推导 5 -> 6" in _p_auto["epochs_note"],
+      f"A2: 自动推导取偶时 note 说明原因（{_p_auto['max_train_epochs']} / {_p_auto['epochs_note']!r}）")
+
+# A3：子桶变化必须在差异段里看得见（旧实现只比 stage1 扁平 key，10 桶改 7 桶报「（无）」）
+_old_ds = ('[[datasets.subsets]]\nimage_dir = "E:/x/clean"\nnum_repeats = 2\n'
+           '[[datasets.subsets]]\nimage_dir = "E:/x/before"\nnum_repeats = 1\n')
+_new_ds = ('[[datasets.subsets]]\nimage_dir = "E:/x/clean"\nnum_repeats = 3\n')
+_config_diff = _makecfg3._config_diff("network_dim = 32\n", _old_ds,
+                                      "network_dim = 32\n", _new_ds)
+check(any("dataset.subset[clean].num_repeats" in x and "2 -> 3" in x for x in _config_diff),
+      f"A3: 桶 repeats 变化能 diff 出来（{_config_diff}）")
+check(any("dataset.subset[before].dir" in x and "移除" in x for x in _config_diff),
+      f"A3: 桶被移除能 diff 出来（{_config_diff}）")
+
+# B-3：families 建的 diff<k> 桶，其 repeats 必须真的进 makecfg（否则 families 白算）
+_famroot = tempfile.mkdtemp(prefix="animasl-famrep-")
+
+
+class _FamDS:
+    def __init__(self, root):
+        self.pipe_dir = Path(root) / "_pipeline"
+        self.name = "fam"
+
+
+_famds = _FamDS(_famroot)
+_famds.pipe_dir.mkdir(parents=True)
+(_famds.pipe_dir / "families.json").write_text(
+    json.dumps({"repeats": {"diff5": 3, "diff1": 6}}), encoding="utf-8")
+_fr, _fnote = _makecfg3._families_repeats(
+    _famds, [{"name": "diff5", "count": 5}, {"name": "diff1", "count": 1}])
+check(_fr == {"diff5": 3, "diff1": 6} and "families.json" in _fnote,
+      f"B-3: diff<k> 桶从 families.json 取 per-桶 repeats（{_fr}）")
+(_famds.pipe_dir / "families.json").write_text(
+    json.dumps({"repeats": {"diff5": 3}}), encoding="utf-8")
+check(_makecfg3._families_repeats(
+    _famds, [{"name": "diff5", "count": 5}, {"name": "diff1", "count": 1}])[0] is None,
+      "B-3: families.json 与当前桶集合对不上时不用过期权重")
+check(_makecfg3._families_repeats(
+    _famds, [{"name": "images", "count": 3}])[0] is None,
+      "B-3: 非 diff 桶（普通目录）不读 families.json")
+shutil.rmtree(_famroot, ignore_errors=True)
+
+# F：续训模板 + save_state（中断不丢优化器动量、不覆盖旧 checkpoint）
+_paths = {"dit": "D", "qwen3": "Q", "vae": "V", "output_dir": "O",
+          "trainer_py": "T", "venv_activate": "A"}
+_toml = _makecfg3._toml_stage1(_p3, _paths, Path("cfg"), "t")
+check("save_state = true" in _toml, "F: stage1 默认 save_state = true")
+_resume = _makecfg3._resume_bat(_p3, _paths, Path("cfg"), "t")
+check("--resume" in _resume and "--save_state" in _resume,
+      "F: resume bat 用 --resume + --save_state 续训")
+check("--output_name" in _resume and "_resume" in _resume and "--max_train_epochs" in _resume,
+      "F: resume bat 改 output_name 防覆盖、并写明总轮数")
+
 # --- 收尾 -------------------------------------------------------------------
 
 if KEEP:

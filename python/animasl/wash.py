@@ -483,8 +483,15 @@ def fold_pairs(tags: list[str], rules: dict) -> list[str]:
     return out
 
 
-def add_implied(tags: list[str], rules: dict) -> list[str]:
-    """§7.3 -- more than one hair colour implies multicolored hair."""
+def add_implied(tags: list[str], rules: dict, blocked: set[str] | None = None) -> list[str]:
+    """§7.3 -- more than one hair colour implies multicolored hair.
+
+    `blocked` 是这张图的**人工删除名单**：用户显式删掉 `multicolored hair` 之后，
+    再跑 wash / fix-caption 不该被这条蕴含规则自动补回去（否则「删了又回来」，用户
+    只能反复删；fanzzz 复盘里就有人干脆放弃用 --remove）。其它标签不受影响。
+    """
+    if blocked and "multicolored hair" in blocked:
+        return tags
     hair = {t.split(" hair")[0] for t in tags if t.endswith(" hair") and
             t.split(" hair")[0] in rules["hair_colors"]}
     if len(hair) >= 2 and "multicolored hair" not in tags:
@@ -621,7 +628,10 @@ def canonical_form(tag: str, rules: dict, td) -> str:
 
 def wash_tags(raw_tags: list[str], rules: dict, td, trigger: str = "",
               report: dict | None = None, drop_extra: set[str] | None = None,
-              drop_chars: dict[str, int] | None = None) -> list[str]:
+              drop_chars: dict[str, int] | None = None,
+              manual_removed: set[str] | None = None) -> list[str]:
+    """`manual_removed` = 这张图被人工删掉的标签（调用方从 state 与本轮 removed 并起来）：
+    只用于**拦掉蕴含规则**（§7.3 的 multicolored hair），不阻止图源里真实存在的标签。"""
     rep = report if report is not None else {}
     dropped: list[dict] = rep.setdefault("dropped", [])
     unknown: list[str] = rep.setdefault("unknown", [])
@@ -692,7 +702,7 @@ def wash_tags(raw_tags: list[str], rules: dict, td, trigger: str = "",
     out, implied_dropped = apply_implication(out, td, rules) if td is not None else (out, [])
     for t in implied_dropped:
         dropped.append({"tag": t, "why": "implied-by-child"})
-    out = add_implied(out, rules)
+    out = add_implied(out, rules, manual_removed)
 
     seen = set()
     deduped = []
@@ -806,6 +816,54 @@ def validate(line: str, rules: dict, tag_count: int, td=None) -> list[str]:
     return issues
 
 
+# --------------------------------------------------------------------------
+# issue 分级（verify 用）
+# --------------------------------------------------------------------------
+# 为什么要分级（用户实测）：283 张里 verify 报「116 张违反硬约束」，其中 312 条
+# conflict-hair-color + 62 条 conflict-underwear **全是误报**（多角色/双色发/下着拆族的
+# 三个豁免之外，还有"两个角色各一种发色"这类正常数据）。冲突本来只该是**提示**，
+# 混进硬约束的计数里就把闸门淹了——人只看到"116 张不合格"，真实该修的那几张反而被埋掉。
+#
+# 所以 error **只认白名单**：形态/内容可机械判定、指南 §3/§9 要求"必须为 0"的那些。
+# 其余（冲突族、以后新加的提示）一律 warn：宁可漏报成提示，也别把误报算成硬约束。
+_ERROR_ISSUES = (
+    "multi-line", "uppercase", "leading-comma", "double-space", "underscore-form",
+    "too-few-tags", "too-many-tags", "banned-tag",
+    "bom", "trailing-newline", "trailing-punctuation", "banned-residue",
+    "missing-caption", "trigger-not-first", "trigger-twice", "watermark-residue",
+)
+
+
+def issue_severity(issue: str) -> str:
+    """verify 的单条 issue → `"error"`（违反硬约束）/ `"warn"`（提示）/ `"ok"`。
+
+    带参数的写法（`too-few-tags(18)`、`banned-residue(…)`）按前缀认。
+    """
+    text = str(issue or "").strip()
+    if not text:
+        return "ok"
+    for name in _ERROR_ISSUES:
+        if text == name or text.startswith(name + "("):
+            return "error"
+    return "warn"
+
+
+def _kind_counts(rows: list[dict], key: str) -> dict[str, int]:
+    """把 verify 的行按 issue **前缀**汇总（`banned-tag(watermark)` → `banned-tag`）。
+
+    只用于打印"错在哪一类"，不改判定；key 是行里的 `"errors"` 或 `"warns"` 列。
+    """
+    out: dict[str, int] = {}
+    for r in rows:
+        for issue in str(r.get(key) or "").split("|"):
+            issue = issue.strip()
+            if not issue:
+                continue
+            name = issue.split("(")[0]
+            out[name] = out.get(name, 0) + 1
+    return out
+
+
 # 人数一致性（§9「人数一致性冲突 0」）：`solo` 与多人数/`solo focus` 互斥
 _SOLO = "solo"
 _MULTI_COUNT = ("2girls", "3girls", "4girls", "5girls", "6+girls", "multiple girls",
@@ -898,6 +956,47 @@ def conflict_issues(names: list[str], rules: dict | None = None) -> list[str]:
             continue
         out.append(f"conflict-{group}(" + " vs ".join(hit[:3]) + ")")
     return out
+
+
+def conflict_family(issue: str) -> str:
+    """`conflict-hair-color(a vs b)` → `hair-color`；`count-conflict(…)` → `count`。"""
+    text = str(issue or "").strip()
+    if not text:
+        return ""
+    if text.startswith("count-conflict"):
+        return "count"
+    m = re.match(r"^conflict-([a-z0-9-]+)\(", text)
+    return m.group(1) if m else ""
+
+
+def conflict_counts(ds, work_set=None, trigger: str = "") -> dict[str, int]:
+    """按**冲突族**统计「有几张图存在该族冲突」（族名 → 张数），给 status / conflicts 用。
+
+    检测完全复用 `conflict_issues`（三个豁免都在里面，别在这里重新发明一套）：一张图
+    在同一族里报了冲突就记 1，所以数值是**图片数**而不是"冲突条数"。触发词不是标签，
+    统计前先剔掉（它会以 `@xxx` 的形式混在 caption 里）。
+    """
+    rules = load_rules(ds)
+    trigger = resolve_trigger(ds, trigger)
+    trig_cmp = trigger.strip().lstrip("@").lower() if trigger else ""
+    files = ds.work_images(work_set) or ds.raw_images()
+    counts: dict[str, int] = {}
+    for f in files:
+        txt = f.with_suffix(".txt")
+        if not txt.exists():
+            continue
+        names: list[str] = []
+        for tag in parse_caption(txt.read_text(encoding="utf-8", errors="replace"))[0]:
+            tag = normalize_tag(tag)
+            if not tag:
+                continue
+            if trig_cmp and tag.strip().lstrip("@").lower() == trig_cmp:
+                continue
+            names.append(tag)
+        for fam in {conflict_family(i) for i in conflict_issues(names, rules)}:
+            if fam:
+                counts[fam] = counts.get(fam, 0) + 1
+    return counts
 
 
 def _provenance_prefer(tags: list[str], prov: dict[str, str], prefer: str,
@@ -1146,9 +1245,11 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
                 resurrect_guard += 1
 
         rep: dict = {}
+        # manual_removed=removed：蕴含规则（§7.3 双发色 → multicolored hair）不该把
+        # 这个人删掉的标签再补回来 —— 否则 --remove 之后再洗一次就"复活"。
         merged = wash_tags(list(tags_a) + list(tags_c), rules, td, trigger, rep,
                            drop_extra=wm_drop if f.name in patched else None,
-                           drop_chars=drop_chars)
+                           drop_chars=drop_chars, manual_removed=removed)
         if prefer:
             # 归属：这个标签是图源带的（A）还是既有 caption 带的（C）？两边都有 = 无冲突
             set_a = {normalize_tag(t) for t in tags_a}
@@ -1200,6 +1301,8 @@ def cmd_wash(ds, apply: bool = False, trigger: str = "", rules_over: dict | None
         if include_images:
             state.sync_images(ds, st, work_set=work_set)
         st.save()
+        # 这里**不**传 before：上一次的快照才是"上一次"的事实。快照被保留代数清掉时
+        # 老文本读不到，就按"新出现"记 —— pipeline-offline 的差异表断言依赖这个行为。
         diff_rows = state.caption_diff(ds, prev_snap, work_set=work_set)
         if diff_rows:
             curate.write_csv(ds.pipe_dir / "wash_diff.csv", diff_rows)
@@ -1318,6 +1421,7 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True, trigger: str =
     if isinstance(data, dict):
         data = data.get("images") or data.get("results") or []
     updated = 0
+    before: dict[str, str] = {}          # 写盘前的 caption（给 diff 兜底：快照可能已被清）
     prev_snap = state.latest_snapshot(ds) if apply else None
     if apply:
         state.snapshot_captions(ds, label="apply-review")
@@ -1334,6 +1438,7 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True, trigger: str =
         old = txt.read_text(encoding="utf-8", errors="replace") if txt.exists() else ""
         if not old.strip():
             old = st.caption(picture.name)     # txt 还没生成时回落到状态里的副本
+        before.setdefault(picture.name, old)
         tags, nlp = parse_caption(old)
         add = []
         for key in ("people", "relationship", "composition", "position", "appearance", "scene"):
@@ -1342,11 +1447,12 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True, trigger: str =
                 continue
             add.extend(val if isinstance(val, list) else [val])
         drop = [str(t) for t in (item.get("remove") or [])]
+        gone = {normalize_tag(t) for t in drop}
         if drop:
-            gone = {normalize_tag(t) for t in drop}
             tags = [t for t in tags if normalize_tag(t) not in gone]
         rep: dict = {}
-        merged = wash_tags(tags + add, rules, td, trigger, rep)
+        blocked = gone | {normalize_tag(t) for t in st.manual_removed(picture.name)}
+        merged = wash_tags(tags + add, rules, td, trigger, rep, manual_removed=blocked)
         line = assemble(merged, nlp or item.get("nlp", ""), rules)
         if apply:
             txt.write_text(line, encoding="utf-8", newline="\n")
@@ -1358,7 +1464,7 @@ def cmd_apply_review(ds, payload: str | Path, apply: bool = True, trigger: str =
         updated += 1
     if apply and updated:
         st.save()
-        rows = state.caption_diff(ds, prev_snap)
+        rows = state.caption_diff(ds, prev_snap, names=sorted(before), before=before)
         if rows:
             curate.write_csv(ds.pipe_dir / "wash_diff.csv", rows)
             print("[review] 与上一版的差异：" + state.diff_line(ds, rows, prev_snap)
@@ -1439,8 +1545,10 @@ def cmd_set_caption(ds, name: str = "", add: str = "", remove: str = "", set_tex
     st = state.load(ds)
     batch = len(targets) > 1
     prev_snap = state.latest_snapshot(ds) if apply else None
-    if apply and batch:
-        state.snapshot_captions(ds, label="fix-caption")
+    if apply:
+        # 只备份本次真的要改的那几张（单张也一样）。整库复制在几百张的库上很贵，
+        # 而 captions_prev 默认只留 1 代 —— 整库复制会把上一次的备份整批挤掉。
+        state.snapshot_captions(ds, label="fix-caption", names=targets)
     results: list[dict] = []
     for one in targets:
         try:
@@ -1454,7 +1562,8 @@ def cmd_set_caption(ds, name: str = "", add: str = "", remove: str = "", set_tex
         print("  （dry-run：加 --apply 才写盘）")
     elif good:
         st.save()
-        rows = state.caption_diff(ds, prev_snap)
+        rows = state.caption_diff(ds, prev_snap, names=[r["file"] for r in good],
+                                  before={r["file"]: r.get("old", "") for r in good})
         if rows:
             curate.write_csv(ds.pipe_dir / "wash_diff.csv", rows)
             print("[fix-caption] 与上一版的差异："
@@ -1485,8 +1594,8 @@ def _set_caption_one(ds, name: str, add: str, remove: str, set_text: str, trigge
         if not quiet:
             print(f"[fix-caption] {hit.name}：整条替换（{len(tags)} 个标签）")
     drop = [t.strip() for t in re.split(r"[,，]", remove) if t.strip()]
+    gone = {normalize_tag(t) for t in drop}       # 本轮显式删掉的（含 --add 放行的对照）
     if drop:
-        gone = {normalize_tag(t) for t in drop}
         before = len(tags)
         tags = [t for t in tags if normalize_tag(t) not in gone]
         if not quiet:
@@ -1496,7 +1605,10 @@ def _set_caption_one(ds, name: str, add: str, remove: str, set_text: str, trigge
     if extra and not quiet:
         print(f"[fix-caption] {hit.name}：补 {len(extra)} 个（{', '.join(extra)}）")
     rep: dict = {}
-    merged = wash_tags(tags + extra, rules, td, trigger, rep)
+    # 本轮删掉的 + 以前删过的，都不许被蕴含规则补回来：用户删 multicolored hair 之后，
+    # 再跑 fix-caption 或 wash，都不能因为"双发色 → multicolored hair"把它塞回来。
+    blocked = gone | {normalize_tag(t) for t in st.manual_removed(hit.name)}
+    merged = wash_tags(tags + extra, rules, td, trigger, rep, manual_removed=blocked)
     line = assemble(merged, nlp, rules)
     issues = validate(line, rules, rep.get("tag_count", 0), td)
     print(f"[fix-caption] {hit.name}（{where}）  {len(tags)} -> {rep.get('tag_count', 0)} 个标签")
@@ -1505,21 +1617,32 @@ def _set_caption_one(ds, name: str, add: str, remove: str, set_text: str, trigge
     if issues:
         print(f"  ! 形态约束：{'|'.join(issues)}")
     if not apply:
-        return {"file": hit.name, "before": len(tags), "after": rep.get("tag_count", 0),
-                "issues": len(issues), "applied": False}
-    if not quiet:
-        state.snapshot_captions(ds, label="fix-caption")
+        return {"file": hit.name, "old": old, "before": len(tags),
+                "after": rep.get("tag_count", 0), "issues": len(issues),
+                "applied": False, "caption": line}
+    # 快照在 cmd_set_caption 里按 targets 统一做（这里再复制会把单张操作变成整库备份）
     txt.write_text(line, encoding="utf-8", newline="\n")
     st.record(hit.name, caption=line, caption_source="fix-caption",
               tag_count=rep.get("tag_count", 0), history={"what": "fix-caption"})
     if drop:
         st.note_manual_removed(hit.name, drop)
     if extra:
+        written = {normalize_tag(t) for t in merged}
+        landed = [t for t in extra if normalize_tag(t) in written]
         # 补的标签也算"写进去了"：下轮 wash 若发现它不在 caption 里，说明是人又删的
-        st.record(hit.name, merged_tags=[t for t in extra if normalize_tag(t) in
-                                        {normalize_tag(x) for x in merged}])
-    return {"file": hit.name, "before": len(tags), "after": rep.get("tag_count", 0),
-            "issues": len(issues), "applied": True, "caption": line}
+        st.record(hit.name, merged_tags=landed)
+        # --add 是显式意图：命中了「人工删除名单」就当场放行，否则下次 wash 的蕴含规则
+        # 还会把它挡回去（--remove multicolored hair 之后又 --add 的典型场景）。
+        release = [t for t in st.manual_removed(hit.name)
+                   if normalize_tag(t) in {normalize_tag(x) for x in landed}]
+        if release:
+            st.clear_manual_removed(hit.name, release)
+            if not quiet:
+                print(f"[fix-caption] {hit.name}：--add 命中人工删除名单，已放行 "
+                      + ", ".join(release))
+    return {"file": hit.name, "old": old, "before": len(tags),
+            "after": rep.get("tag_count", 0), "issues": len(issues),
+            "applied": True, "caption": line}
 
 
 def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "",
@@ -1538,6 +1661,7 @@ def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "",
     rows: list[dict] = []
     unknown_all: dict[str, int] = {}
     residue_all: dict[str, int] = {}
+    mark_tags = {normalize_tag(t) for t in rules.get("mark_tags", ())}
     for f in files:
         txt = f.with_suffix(".txt")
         text = txt.read_text(encoding="utf-8", errors="replace") if txt.exists() else ""
@@ -1565,11 +1689,33 @@ def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "",
             if td is not None and lookup_key(tt) not in td and \
                     tt not in rules["descriptor_whitelist"] and not tt.startswith("@"):
                 unknown_all[tt] = unknown_all.get(tt, 0) + 1
-        rows.append({"file": f.name, "tags": len(tags), "issues": "|".join(issues)})
+        # 水印区残留（§8.1）：像素已被去字工具补掉、caption 里却还写着 watermark/signature
+        # 一类 —— 这是幻觉，属于硬约束。
+        if text and f.name in patched:
+            hit = sorted({normalize_tag(t) for t in tags} & mark_tags)
+            if hit:
+                issues.append("watermark-residue(" + ",".join(hit[:3]) + ")")
+        issues = list(dict.fromkeys(issues))
+        errs = [i for i in issues if issue_severity(i) == "error"]
+        warns = [i for i in issues if issue_severity(i) == "warn"]
+        rows.append({"file": f.name, "tags": len(tags),
+                     "severity": "error" if errs else "warn" if warns else "ok",
+                     "issues": "|".join(issues),
+                     "errors": "|".join(errs), "warns": "|".join(warns)})
     curate.write_csv(ds.pipe_dir / "wash_verify.csv", rows)
-    bad = [r for r in rows if r["issues"]]
-    print(f"[verify] {len(rows)} 个 caption，{len(bad)} 个违反硬约束"
+    n_err = sum(1 for r in rows if r["severity"] == "error")
+    n_warn = sum(1 for r in rows if r["severity"] == "warn")
+    # 冲突（conflict-* / count-conflict）只算**提示**：三个豁免之外仍有误报空间，
+    # 不该跟"单行/BOM/触发词"一类形态问题混成同一个"违反硬约束"数字（283 张踩过）。
+    print(f"[verify] {len(rows)} 个 caption：违反硬约束 {n_err}（error），"
+          f"提示 {n_warn}（warn）"
           + (f"；触发词 {trigger}" if trigger else "（数据集无触发词，跳过触发词检查）"))
+    for key, label in (("errors", "error"), ("warns", "warn")):
+        kinds = _kind_counts(rows, key)
+        if kinds:
+            top = sorted(kinds.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+            print(f"[verify] {label} 类型 {len(kinds)} 种："
+                  + ", ".join(f"{k}×{v}" for k, v in top))
     if residue_all:
         top = sorted(residue_all.items(), key=lambda kv: (-kv[1], kv[0]))[:12]
         print(f"[verify] 规则本该丢掉的残留 {len(residue_all)} 种（画师/IP/meta/质量词/否定式/"
@@ -1618,7 +1764,8 @@ def cmd_verify(ds, online: bool = False, sample: int = 0, trigger: str = "",
     if online:
         print("[verify] --online：将用 danbooru search[name_comma] 批量复核（每批 120）")
         _online_verify(ds, sorted(unknown_all))
-    return {"count": len(rows), "issues": len(bad), "unknown_kinds": len(unknown_all),
+    return {"count": len(rows), "files": len(rows), "errors": n_err, "warns": n_warn,
+            "issues": n_err + n_warn, "unknown_kinds": len(unknown_all),
             "residue_kinds": len(residue_all), "trigger": trigger,
             "mark_residue": len(mark_residue), "mark_unlabeled": len(plain)}
 
