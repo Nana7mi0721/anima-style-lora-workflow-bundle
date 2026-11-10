@@ -147,6 +147,8 @@ host 进程 CWD 展开），所以写的是 profile 安装副本的固定位置�
 
 现在：**根下任何含图的子目录都自动算图桶**（跳过 `_`/`.` 前缀与 `00_raw`/`thumbs`/`masks`/`orig_text`；空目录不算），`images/` 排在最前。所有阶段默认扫全部桶，caption 与图**同目录**；只想处理某个子集就传 `workSet:"clean,watermark"`，给错名字会报错并列出自动发现的桶。`makecfg` 另外按内容指纹跨桶去重（硬链接/副本只算一次），整桶都是副本时跳过并说明。
 
+**根目录散图**（直接躺在数据集根下、不属于任何子目录的裸图）**不算图桶**——所以几百张成品如果直接 dump 在根目录，工具同样会 `images=0`、`makecfg` 直接「没有找到任何图片」。现在 `anima_status` / `anima_doctor` / `makecfg` 的 `preflight.txt` 都会先报一行「根目录散图 N 张未识别」，避免再被无视；`00_raw` 与所有图桶都为空时，`rename --apply` 会把这些散图**当作待整理素材直接并入 `images/` 并编号**（dry-run 只预演，同名 `.txt` 边车跟着搬）。有图桶时则只警告、不擅自搬动。
+
 | stage | 工具参数要点 | 产出 |
 |---|---|---|
 | `init` | `trigger`、`kind`、`force`、`reset`+`yes` | `_pipeline/manifest.json` |

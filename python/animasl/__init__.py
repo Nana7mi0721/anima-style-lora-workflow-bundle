@@ -8,4 +8,4 @@ on the machine.  The GPU stages (text detect / inpaint) additionally need
 torch + rfdetr and are guarded by `animasl doctor`.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"

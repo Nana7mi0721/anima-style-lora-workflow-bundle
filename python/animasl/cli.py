@@ -23,6 +23,9 @@ from pathlib import Path
 from . import config as cfgmod
 from . import curate, dicts, enrich, fetch, makecfg, manifest, net, wash
 
+# A4：词典超过这么多天没更新就在 doctor 里报警（danbooru 每月新增上千标签）
+_DICT_STALE_DAYS = 90
+
 
 def _ds(args) -> cfgmod.Dataset:
     cfg = cfgmod.Config.load(home=getattr(args, "home", None))
@@ -993,7 +996,20 @@ def _doctor(home: str | None = None, proxies: bool = False) -> int:
         _proxy_matrix(cfg)
     try:
         td = dicts.load(cfg)
-        print(f"  词典            {td.size()} 个标签")
+        # A4：不只报「OK」，还报**生成日期 / 落后多少天**——旧版只显示「词典 OK」，
+        # 真实使用里本地 tags.json 停在 9 月、缺 8132 条却毫无提示。
+        extra = ""
+        raw_dict = str(cfg.get("tag_dict") or "").strip()
+        src = Path(raw_dict) if raw_dict else None
+        if src is not None and src.is_file():
+            mtime = src.stat().st_mtime
+            age = int((time.time() - mtime) // 86400)
+            extra = (f"；源 {src.name} 更新于 "
+                     f"{time.strftime('%Y-%m-%d', time.localtime(mtime))}（{age} 天前）")
+            if age > _DICT_STALE_DAYS:
+                extra += (f"  ⚠️ 已 {age} 天未更新：danbooru 每月新增上千标签，"
+                          "建议 git pull 词典仓库后重建 tags.json")
+        print(f"  词典            {td.size()} 个标签{extra}")
     except Exception as exc:
         print(f"  词典            加载失败 {exc}")
 
@@ -1041,6 +1057,31 @@ def _doctor(home: str | None = None, proxies: bool = False) -> int:
     else:
         print("  凭据 cookies     未配置（pawchive 公开接口不需要；受限帖 / exhentai 需要；"
               "设置页填 cookies_file，或用 fetch 的 cookies= 临时指定 Netscape cookies.txt）")
+
+    # A5：根目录散图对工具隐形（mignon 复盘：196 张成品躺在根下、status 报 images=0、
+    # makecfg 直接「没有找到任何图片」）。doctor 里直接报「桶结构 + 根目录散图」，
+    # 开工前就能发现，而不是等 makecfg 崩。
+    ds_root = Path(cfg.datasets_dir)
+    if ds_root.is_dir():
+        print("  数据集          桶结构 / 根目录散图")
+        seen_ds = False
+        for entry in sorted(ds_root.iterdir(), key=lambda p: p.name):
+            if not entry.is_dir() or entry.name.startswith(("_", ".")):
+                continue
+            d = cfgmod.Dataset(entry.name, cfg)
+            if not d.exists():
+                continue
+            seen_ds = True
+            counts = d.bucket_counts()
+            desc = "、".join(f"{name} {n}" for name, n in counts.items()) or "（无图桶）"
+            strays = d.stray_images()
+            tail = ""
+            if strays:
+                tail = (f"  ⚠️ 根目录散图 {len(strays)} 张未识别"
+                        "（mv 进图桶，或直接跑 rename 自动并入 images/）")
+            print(f"    {entry.name:<16} {desc}{tail}")
+        if not seen_ds:
+            print("    （还没有已 init 的数据集）")
     return 0
 
 

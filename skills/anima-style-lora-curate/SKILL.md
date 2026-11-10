@@ -165,6 +165,7 @@ anima_stage(stage:"text", dataset:"X", apply:true)             # 检测 + LaMa �
   - `> 8%`（`text_warn_ratio`）→ 送修补；
   - `> 30%`（`text_drop_ratio`）→ 打印警告，交用户决定是否剔除（通常是漫画页/设定表）；
   - 修补后要复检一次（修补区域是否留下糊斑）。
+- **大掩膜（占比 > 10%）不要硬修**（mignon 复盘实测）：LaMa 在掩膜盖住画面本体时（封面大标题、整块对白框压住人物）会把整片区域涂成一团糊，**且不可逆**。8%~30% 这段正好是危险区、`text` 默认会去修补它。正确做法：先 `text`（dry-run / `detectOnly`）看面积占比清单，把 **>10% 的图跳过修补**——`text-rollback` 还原原图，只补文字类标签（`english text` / `speech bubble` / `comic` / `multiple views` / `cover`…），把原画面保留下来。经验阈值一句话：**掩膜占比 >10% = 不修补，只补标签**。
 - **修补后 caption 必须重洗**：自动打标工具描述的是修补前的原图，文字相关的 tag/描述全部作废。流程上 `text` 排在 `rename`/`wash` 之前就是为了这个。
 - **修补是不可逆的，所以它留了退路**：apply 前把原图整份复制到 `_pipeline/orig_text/`（同一文件名只备份第一次，重复跑不叠加），跑完自报 `修补前原图备份 10.8M -> <dir>`。这是整个流程里唯一与图片同量级的副本 —— **`verify` 通过、确认不用回退之后可以整个删掉**，删了就只能从 danbooru 重下原始字节了。**要回退用 `text-rollback`**（`apply:true` 才写盘，`names` 指定某几张），恢复后 `wash` 及之后全部标 stale。
 - **掩膜默认不留**：修补成功后 `text` 会把**本次真的用过的**掩膜删掉（失败/未修补的始终保留），跑完打印 `掩膜已清理 N 个（X）`。要留着事后 `--inpaint-only` 重跑就传 `keepMasks:true`；想让以后默认就留，改配置 `hygiene.keep_masks`（设置页「空间与备份」）。

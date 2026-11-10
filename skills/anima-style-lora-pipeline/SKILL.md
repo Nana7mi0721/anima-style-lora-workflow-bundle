@@ -35,7 +35,7 @@ description: Anima 风格 LoRA 数据集流水线的总纲：阶段顺序与推�
 
 现在的规则：**根下任何含图的子目录都自动算图桶**（跳过 `_`/`.` 前缀与 `00_raw`/`thumbs`/`masks`/`orig_text`；空目录不算），`images/` 排最前；caption 与图**同目录**；所有阶段默认扫全部桶。只想处理某个子集就传 `workSet:"clean,watermark"`——**给错名字会报错并列出自动发现的桶**（不会静默变成空集）。`makecfg` 另按内容指纹跨桶去重（见下节「跨桶去重的指纹」），整桶都是副本时跳过并说明原因。
 
-`text` / `text-rollback` 与 `rename` **也认图桶**：前两者的工作集是 `work_images(workSet) or raw_images()`（图桶优先——桶布局下 `images/` 经常是空的，只扫 `00_raw` 会一张都找不到）；`rename` 在 `00_raw/` 还有待整理的图时把它们搬进 `images/`，`00_raw/` 空了就在**桶内就地重排、不跨桶搬文件**，编号**跨桶连续**（`clean 0001…0109`、`watermark 0110…0142`）——因为 `thumbs/`、`masks/`、`orig_text/` 都按 stem 扁平命名，各桶从 0001 重号会互相踩。`rename_map.csv` 多一列 `bucket`，只想重排某个桶就传 `workSet:"clean"`。
+`text` / `text-rollback` 与 `rename` **也认图桶**：前两者的工作集是 `work_images(workSet) or raw_images()`（图桶优先——桶布局下 `images/` 经常是空的，只扫 `00_raw` 会一张都找不到）；`rename` 在 `00_raw/` 还有待整理的图时把它们搬进 `images/`，`00_raw/` 空了就在**桶内就地重排、不跨桶搬文件**，编号**跨桶连续**（`clean 0001…0109`、`watermark 0110…0142`）——因为 `thumbs/`、`masks/`、`orig_text/` 都按 stem 扁平命名，各桶从 0001 重号会互相踩。`rename_map.csv` 多一列 `bucket`，只想重排某个桶就传 `workSet:"clean"`。**根目录散图**（直接躺在数据集根下、不在任何图桶里的裸图）对 `discover_buckets` 隐形——`anima_status` / `anima_doctor` / `makecfg` 的 preflight 现在都会报「根目录散图 N 张未识别」；`00_raw` 与所有图桶都为空时，`rename` 会把这些散图**当作待整理素材直接并入 `images/`**（dry-run 只预演，`apply` 才搬，同名 `.txt` 边车跟着走）。
 
 ### 差分家族与 `diff<k>` 桶（families）
 
@@ -261,6 +261,7 @@ anima_stage(stage:"families", dataset:"X", apply:true)  # 建 diff<k>/ 桶、整
 | `anima_status` 只报图片数和 caption 数 | 现在还有一行 caption 健康度（标签数 min/avg/max、缺/孤立 txt、<20、>45、触发词位置 + 示例）+ 每个数据集一行（`_`/`.` 前缀目录自动跳过） |
 | `anima_doctor` 180s 超时 | 现在允许 300s；排障时用 `proxies:true` 让它跑一遍「代理 × 客户端」实测矩阵（`requests` vs `curl`，含 socks5 缺依赖的说明） |
 | 142 条成品 caption 放在 `clean/`+`watermark/` 里，`anima_status` 却报 `raw=0 images=0 captions=0`（工具对整批成品视而不见） | 已修：**根下任何含图的子目录都算图桶**，所有阶段默认扫全部桶，caption 与图同目录；`anima_status` 多打一行 `图桶: clean 109图/109caption、watermark 33图/33caption` |
+| 几百张图直接躺在**数据集根目录**（不在任何子目录），`anima_status` 报 `images=0`、`makecfg` 直接「没有找到任何图片」 | 已修（可见性）：`anima_status` / `anima_doctor` / `makecfg preflight` 都会报「根目录散图 N 张未识别」；`00_raw` 与图桶都空时 `rename` 自动把它们并入 `images/`。也可手动 `mv` 进 `images/` 或 `00_raw/` |
 | `wash` 全程 `A=none` 却报 ok，洗出来只是"格式化 + 压父标签" | 已修：wash 每次打印 `标签来源：A+booru N、A=none M`，A=none 占一半以上时**醒目告警**并给两条修法（`enrich` / `fetch --source danbooru --tags <画师名>`） |
 | 合并只有集合层：同族冲突（`pink hair` vs `purple hair`）靠顺序定胜负 | 已修：**冲突族检测**（发色/瞳色/发长/胸围/下着/人数）进 `validate` 与 `verify`；`prefer:"A"\|"C"` 指定留哪边，裁掉的记进报告 |
 | 发现标签数超上限，只能手改 `wash_rules.json` | 已修：`minTags`/`maxTags` 直接是 `wash` 的参数 |

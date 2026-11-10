@@ -487,6 +487,13 @@ def _preflight(ds, p: dict, cfg_dir: Path, name: str, stage1_text: str,
         lines.append(f"          {s['name']:<14} {s['count']:>5} 张 × {p['repeats'].get(s['name'], 1)}")
     if p.get("repeats_note"):
         lines.append(f"          ℹ️ {p['repeats_note']}")
+    # A1：根目录散图对 makecfg 隐形（collect_subsets 只扫子目录）。这里明确报数 + 去处，
+    # 免得「图片 N 张」看不见根下那批散图还以为全齐了。
+    strays = ds.stray_images()
+    if strays:
+        lines.append(f"根目录    ⚠️ 还有 {len(strays)} 张散图不在任何图桶/子集里"
+                     "（makecfg 只扫子目录，未计入上面的图片数）")
+        lines.append("          -> 先 mv 进图桶，或跑 rename（会自动把根目录散图并入 images/）")
     health: dict = {}
     unknown: list[str] = []
     zombie: list[str] = []

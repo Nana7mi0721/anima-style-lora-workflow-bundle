@@ -357,6 +357,23 @@ class Dataset:
             return []
         return sorted(p for p in self.raw_dir.iterdir() if p.is_file() and p.suffix.lower() in exts)
 
+    def stray_images(self, exts=IMG_EXTS) -> list[Path]:
+        """数据集**根目录下**的散图：不是任何图桶、也不是 00_raw 的裸图。
+
+        真实使用（mignon，182 张成品直接躺在根下）里，discover_buckets() 只扫子目录
+        ⇒ 整个数据集在工具侧「不存在」：status 报 images=0，makecfg 直接
+        ``SystemExit("没有找到任何图片")``，只能绕过工具手写脚本跑 6 小时。这里只做
+        **可见性**（status / doctor / makecfg preflight 报数），不改 bucket 语义；用户看到
+        数不对，自己把这些图 mv 进 images/ 或 00_raw/，rename 也会把它们当待整理素材并入。
+        """
+        if not self.root.exists():
+            return []
+        try:
+            return sorted(p for p in self.root.iterdir()
+                          if p.is_file() and p.suffix.lower() in exts)
+        except OSError:
+            return []
+
     # -- 图桶（bucket）：成品图不必都住在 images/ ---------------------------------
     #
     # 真实使用（小叶子miv，146 张）里成品被人工分成了 clean/ 109 + watermark/ 33，

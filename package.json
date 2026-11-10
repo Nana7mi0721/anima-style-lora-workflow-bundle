@@ -1,6 +1,6 @@
 {
   "name": "dsh-anima-style-lora",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "DSH bundle: Anima 风格 LoRA 全流程预设（下载 → 筛选 → 去重/去文字 → 打标洗标 → 训练配置三件套）",

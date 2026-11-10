@@ -1169,11 +1169,22 @@ def cmd_rename(ds, start: int = 1, digits: int = 4, apply: bool = False,
                   f"00_raw/ 里还有 {len(leftover)} 张这次不动")
     else:
         raw = ds.raw_images()
+        strays = ds.stray_images()
         if not raw:
             buckets = ds.discover_buckets()
+            if not buckets and strays:
+                # 根目录散图 = 整个数据集对工具隐形（mignon 复盘最大坑）。这里当作
+                # 待整理素材并入 images/：rename 本来就是「把散图重排成 0001…」的入口，
+                # 边搬边编号，sidecar .txt 也跟着走。--apply 才真搬，dry-run 只预演。
+                raw = strays
+                print(f"[rename] 根目录发现 {len(strays)} 张散图（不在任何图桶里）——"
+                      f"当作待整理素材并入 images/{'（move）' if move else '（复制）'}")
+            elif buckets and strays:
+                print(f"[rename] ⚠️ 根目录另有 {len(strays)} 张散图不属于任何图桶，本次不处理；"
+                      "先 mv 进某个图桶（或 00_raw/），或对整个数据集重跑 rename（不传 workSet）")
     if not raw and not buckets:
-        raise SystemExit("[rename] 00_raw 为空，也没有含图的桶（images/、clean/、watermark/ …）"
-                         "——先下载或导入图片")
+        raise SystemExit("[rename] 00_raw 为空，也没有含图的桶（images/、clean/、watermark/ …），"
+                         "根目录也没有散图——先下载或导入图片")
 
     rows: list[dict] = []
     ranges: list[dict] = []

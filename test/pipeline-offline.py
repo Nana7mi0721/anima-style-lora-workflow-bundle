@@ -680,6 +680,52 @@ check("--resume" in _resume and "--save_state" in _resume,
 check("--output_name" in _resume and "_resume" in _resume and "--max_train_epochs" in _resume,
       "F: resume bat 改 output_name 防覆盖、并写明总轮数")
 
+# --- A1/A4/A5：根目录散图可见性 + rename 自动并入 -------------------------
+_rroot = Path(tempfile.mkdtemp(prefix="animasl-stray-"))
+
+
+class _StrayCfg:
+    datasets_dir = _rroot
+
+
+# (1) stray_images 只认根目录裸图、不把图桶里的图算进去
+_a = _config3.Dataset("a", _StrayCfg())
+_a.ensure_dirs()
+make_png(_a.root / "loose.png")
+make_png(_a.images_dir / "b.png")
+check([p.name for p in _a.stray_images()] == ["loose.png"],
+      f"A1: stray_images 只数根目录裸图（实际 {[p.name for p in _a.stray_images()]}）")
+
+# (2) 根目录散图 + 没有任何图桶/00_raw：rename(apply) 自动并入 images/ 并编号
+_b = _config3.Dataset("b", _StrayCfg())
+_b.ensure_dirs()
+make_png(_b.root / "loose1.png")
+make_png(_b.root / "loose2.png")
+_res = _curate3.cmd_rename(_b, apply=True)
+check((_b.images_dir / "0001.png").exists() and (_b.images_dir / "0002.png").exists()
+      and not (_b.root / "loose1.png").exists(),
+      f"A1: rename 把根目录散图并入 images/（{_res.get('count')} 张）")
+
+# (3) 有图桶时根目录散图只警告、不擅自搬（避免误动用户数据）
+_c = _config3.Dataset("c", _StrayCfg())
+_c.ensure_dirs()
+make_png(_c.images_dir / "keep.png")
+make_png(_c.root / "loose.png")
+import io as _io, contextlib as _cl
+_buf = _io.StringIO()
+with _cl.redirect_stdout(_buf):
+    _curate3.cmd_rename(_c, apply=True)
+check((_c.root / "loose.png").exists() and "根目录另有" in _buf.getvalue(),
+      "A1: 有图桶时根目录散图只警告、不擅自搬")
+
+# (4) preflight 里报「根目录散图」（makecfg 只扫子目录，别让 182 张隐形）
+_pf_dir = Path(tempfile.mkdtemp(prefix="animasl-pf-"))
+_pf = _makecfg3._preflight(_a, _p3, _pf_dir, "a", "network_dim = 32\n")
+check("根目录" in _pf and "1 张散图" in _pf, "A1: makecfg preflight 报根目录散图数")
+
+shutil.rmtree(_rroot, ignore_errors=True)
+shutil.rmtree(_pf_dir, ignore_errors=True)
+
 # --- 收尾 -------------------------------------------------------------------
 
 if KEEP:
